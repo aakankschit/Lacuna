@@ -38,9 +38,12 @@ protocols and sample sizes, are in [docs/benchmarks/](docs/benchmarks/) — read
 ## Install
 
 ```bash
-claude plugin marketplace add aakankschit/Lacuna
+claude plugin marketplace add https://github.com/aakankschit/Lacuna.git
 claude plugin install lacuna@lacuna --scope user
 ```
+
+`claude plugin marketplace add` takes a URL, a local path or a GitHub `owner/repo`, so
+`claude plugin marketplace add aakankschit/Lacuna` is equivalent and clones over HTTPS.
 
 Then, in Claude Code:
 
@@ -52,8 +55,31 @@ Then, in Claude Code:
 (The command is `/lacuna-doctor` rather than `/doctor` because Claude Code already has a `/doctor`
 of its own. If another plugin ever claims `/spend`, `/lacuna:spend` disambiguates.)
 
-Python 3.9+ and the `claude` CLI are the only hard requirements, and only the PDF parsing needs
-anything installed beyond them:
+### Reaching the `lacuna` command from a terminal
+
+Skills and commands find the plugin by themselves. For your own shell, the install path **contains
+the version number** and therefore changes on every update, so resolve it rather than hardcoding it:
+
+```bash
+claude plugin list --json | python3 -c \
+  "import json,sys;[print(p['installPath']) for p in json.load(sys.stdin) if p['id'].split('@')[0]=='lacuna']"
+```
+
+Worth putting in `~/.zshrc` or `~/.bashrc` so it keeps working after an upgrade:
+
+```bash
+lacuna() {
+  local root
+  root=$(claude plugin list --json | python3 -c \
+    "import json,sys;[print(p['installPath']) for p in json.load(sys.stdin) if p['id'].split('@')[0]=='lacuna']")
+  "$root/bin/lacuna" "$@"
+}
+```
+
+### Dependencies
+
+Python 3.9+ and the `claude` CLI are the only hard requirements, and only PDF parsing needs
+anything beyond them:
 
 ```bash
 lacuna doctor --install-pdf          # pymupdf4llm, the default parser (~4 s/document)
@@ -69,16 +95,17 @@ collide. The fallback and equation parsers are opt-in and `doctor` never install
 Nothing here needs a PDF, a parser or an API call except the last command.
 
 ```bash
-LAC=~/.claude/plugins/lacuna/bin/lacuna     # /plugin shows the real path; alias it
+# with the shell function above, or $LAC set to <installPath>/bin/lacuna
+lacuna doctor                                # what is installed, what is missing, how to fix it
+lacuna spend --days 7                        # free: where last week's money actually went
+lacuna config                                # which model is set for each job
 
-$LAC doctor                                  # what is installed, what is missing, how to fix it
-$LAC spend --days 7                          # free: where last week's money actually went
-$LAC config                                  # which model is set for each job
-
-# the shipped example: 3 notes and a small repo, so you can see a real plan for a few cents
-$LAC lit synth --notes examples/notes --repo examples/demo-repo --out /tmp/plan.md \
+# the shipped example lives in the plugin; run it from there
+cd "$(claude plugin list --json | python3 -c \
+  "import json,sys;[print(p['installPath']) for p in json.load(sys.stdin) if p['id'].split('@')[0]=='lacuna']")"
+lacuna lit synth --notes examples/notes --repo examples/demo-repo --out /tmp/plan.md \
     --kind plan --objective "What should we build next?"
-$LAC lit verify --target /tmp/plan.md --repo examples/demo-repo --notes examples/notes
+lacuna lit verify --target /tmp/plan.md --repo examples/demo-repo --notes examples/notes
 ```
 
 That last pair is worth running in order. On the example, `synth` cost $0.30 and `verify` cost

@@ -21,30 +21,33 @@ not among them, so **no plugin can ship a status line**. It has to go in your ow
 
 ## Install
 
-Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
+**Copy the script to a stable location first.** The plugin's own install path contains its version
+number (`~/.claude/plugins/cache/lacuna/lacuna/0.1.0/...`), so it changes on every update and a
+`statusLine` pointing into it silently stops working the next time you upgrade.
+
+```bash
+mkdir -p ~/.claude/bin
+cp "$(claude plugin list --json | python3 -c \
+  "import json,sys;[print(p['installPath']) for p in json.load(sys.stdin) if p['id'].split('@')[0]=='lacuna']")/statusline/statusline.py" \
+  ~/.claude/bin/statusline.py
+```
+
+Then add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 ~/.claude/plugins/lacuna/statusline/statusline.py",
+    "command": "python3 ~/.claude/bin/statusline.py",
     "refreshInterval": 30,
     "padding": 0
   }
 }
 ```
 
-Check the real path first — `/plugin` shows where the marketplace installed it, and that path
-changes when the plugin updates. If you would rather not chase it, copy the file somewhere stable:
-
-```bash
-mkdir -p ~/.claude/bin
-cp <plugin dir>/statusline/statusline.py ~/.claude/bin/statusline.py
-```
-
-and point `command` at `python3 ~/.claude/bin/statusline.py`. The script is deliberately
-self-contained — one file, standard library only — so copying it works. It picks up your
-`pricing.json` from the data directory if you have one.
+The script is deliberately self-contained — one file, standard library only — so copying it works,
+and it still picks up your `pricing.json` from the data directory. Re-run the copy after a plugin
+upgrade to get any changes.
 
 `refreshInterval` is in seconds and has a minimum of 1. At 30 the cache countdown stays useful
 without re-running the script constantly.
