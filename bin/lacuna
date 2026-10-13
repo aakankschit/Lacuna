@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# lacuna: one entry point for every script in this plugin.
+#
+# Skills, commands and any project-specific plugin layered on top call `lacuna`, never a .py path,
+# so file layout can change without breaking them. Needs only python3 from the system; the PDF
+# parser venv is separate and only the `lit` subcommands require it.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="${LACUNA_SYSTEM_PYTHON:-python3}"
+
+usage() {
+  cat <<'USAGE'
+lacuna — find the gaps in a literature and build against them
+
+  lacuna doctor [--install-pdf] [--install-fallback] [--install-equations]
+        Check the environment, create the data directory, report what is missing.
+
+  lacuna spend [--session PATH|ID] [--days N] [--no-color]
+        What this session and recent sessions cost, where the money went, and cache health.
+        Reads only the transcripts already on disk — no API calls, nothing to install.
+
+  lacuna lit read   <pdf|md> [...] [--out DIR] [--brief TEXT] [--model M] [--no-books]
+  lacuna lit synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT]
+  lacuna lit verify --target FILE --repo DIR [--notes DIR]
+  lacuna lit estimate <files> [--per-agent N]      Cost and wall time before you spend anything.
+  lacuna lit split-book <pdf> <out-dir>            Chapter files plus a grep-able index.
+
+  lacuna config [--json]             The effective configuration and where it came from.
+  lacuna pane [FILE|DIR]             Follow a results file in a rendered markdown viewer.
+  lacuna split                       Open a tmux results pane beside this session.
+
+Exit codes: 0 ok, 2 bad input, 3 parse failure, 4 model refused or produced nothing.
+USAGE
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  doctor)   exec "$PY" "$ROOT/scripts/doctor.py" "$@" ;;
+  spend)    exec "$PY" "$ROOT/scripts/cost/spend.py" "$@" ;;
+  config)   exec "$PY" "$ROOT/scripts/lacuna_config.py" "$@" ;;
+  pane)     exec "$PY" "$ROOT/scripts/panes/results_pane.py" "$@" ;;
+  split)    exec "$ROOT/scripts/panes/ccsplit" "$@" ;;
+  lit)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      read|synth|verify) exec "$PY" "$ROOT/scripts/lit/lit_pipeline.py" "$sub" "$@" ;;
+      estimate)          exec "$PY" "$ROOT/scripts/lit/lit_cost.py" "$@" ;;
+      split-book)
+        # needs pymupdf, which lives in the parser venv rather than the system python
+        BOOKPY="$("$PY" -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import lacuna_config; print(lacuna_config.path('python'))")"
+        [ -x "$BOOKPY" ] || BOOKPY="$PY"
+        exec "$BOOKPY" "$ROOT/scripts/lit/split_book.py" "$@" ;;
+      ""|-h|--help)      usage; exit 0 ;;
+      *) echo "lacuna lit: unknown subcommand '$sub'" >&2; usage >&2; exit 2 ;;
+    esac ;;
+  ""|-h|--help|help) usage; exit 0 ;;
+  --version) "$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['version'])" "$ROOT/.claude-plugin/plugin.json" ;;
+  *) echo "lacuna: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,87 @@
+{
+  "_source": "upstream",
+  "_measured": "2026-10-12",
+  "_note": "Measured 2026-10-12 on one machine: slim reader agent (Read/Grep/Write, ~3.7k-token start), 2 papers per reader, 33,461 tokens of paper text in total, 5m cache. usd_per_ktok = run cost per thousand tokens of source text, including startup, re-reads, output and thinking. The cheap tier costs ~5x more per token above 100k context. Replace these rows with your own runs; `lacuna lit estimate` reports which calibration it used.",
+  "paper_tokens": 33461,
+  "haiku": {
+    "low": {
+      "usd_per_ktok": 0.00033,
+      "minutes_per_paper": 0.4,
+      "think_per_paper": 1104
+    },
+    "medium": {
+      "usd_per_ktok": 0.00054,
+      "minutes_per_paper": 0.8,
+      "think_per_paper": 6738
+    },
+    "high": {
+      "usd_per_ktok": 0.00176,
+      "minutes_per_paper": 1.9,
+      "think_per_paper": 24946
+    },
+    "xhigh": {
+      "usd_per_ktok": 0.00367,
+      "minutes_per_paper": 3.0,
+      "think_per_paper": 42428
+    },
+    "max": {
+      "usd_per_ktok": 0.01542,
+      "minutes_per_paper": 6.0,
+      "think_per_paper": 92662
+    }
+  },
+  "sonnet": {
+    "low": {
+      "usd_per_ktok": 0.00519,
+      "minutes_per_paper": 0.3,
+      "think_per_paper": 0
+    },
+    "medium": {
+      "usd_per_ktok": 0.00542,
+      "minutes_per_paper": 0.4,
+      "think_per_paper": 26
+    },
+    "high": {
+      "usd_per_ktok": 0.00659,
+      "minutes_per_paper": 0.6,
+      "think_per_paper": 1186
+    },
+    "xhigh": {
+      "usd_per_ktok": 0.0161,
+      "minutes_per_paper": 1.8,
+      "think_per_paper": 9328
+    },
+    "max": {
+      "usd_per_ktok": 0.06881,
+      "minutes_per_paper": 7.8,
+      "think_per_paper": 64545
+    }
+  },
+  "claude-opus-5": {
+    "low": {
+      "usd_per_ktok": 0.01683,
+      "minutes_per_paper": 0.9,
+      "think_per_paper": 0
+    },
+    "medium": {
+      "usd_per_ktok": 0.01704,
+      "minutes_per_paper": 1.0,
+      "think_per_paper": 21
+    },
+    "high": {
+      "usd_per_ktok": 0.02927,
+      "minutes_per_paper": 2.0,
+      "think_per_paper": 1694
+    },
+    "xhigh": {
+      "usd_per_ktok": 0.03075,
+      "minutes_per_paper": 2.1,
+      "think_per_paper": 2330
+    },
+    "max": {
+      "usd_per_ktok": 0.02202,
+      "minutes_per_paper": 1.5,
+      "think_per_paper": 2033
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "lacuna",
+  "description": "Lacuna \u2014 papers to code. Find the gaps in a literature and build against them, with measured model routing and visible cost.",
+  "owner": {
+    "name": "Aakankschit Nandkeolyar",
+    "url": "https://github.com/aakankschit"
+  },
+  "plugins": [
+    {
+      "name": "lacuna",
+      "source": "."
+    }
+  ]
+}

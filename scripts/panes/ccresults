@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Scrollable, auto-refreshing view of the results document. Prefer `lacuna pane`; this exists so the
+# command inside a tmux pane stays short.
+# With no argument it follows the newest file in the configured results directory.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${LACUNA_SYSTEM_PYTHON:-python3}"
+exec "$PY" "$HERE/results_pane.py" "$@"

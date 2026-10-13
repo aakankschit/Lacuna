@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Claude Code on the left, its results document on the right (tmux).
+# Inside tmux it splits the current window; otherwise it starts a new tmux session.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+PY="${LACUNA_SYSTEM_PYTHON:-python3}"
+
+command -v tmux >/dev/null || { echo "ccsplit needs tmux. Without it, split your terminal by hand and run: $ROOT/bin/lacuna pane <file>" >&2; exit 2; }
+
+results_dir=$("$PY" -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import lacuna_config; print(lacuna_config.path('results'))")
+mkdir -p "$results_dir"
+proj=$(basename "$PWD")
+export CLAUDE_RESULTS_FILE="$results_dir/${proj}-$(date +%Y%m%d-%H%M%S).md"
+
+viewer="$HERE/ccresults $(printf '%q' "$CLAUDE_RESULTS_FILE")"
+if [ -n "${TMUX:-}" ]; then
+  tmux split-window -h -l 45% -c "$PWD" "$viewer"
+  tmux select-pane -L
+  exec claude "$@"
+fi
+sess="cc-${proj//[^A-Za-z0-9]/-}-$(date +%H%M%S)"
+tmux new-session -d -s "$sess" -c "$PWD" -e "CLAUDE_RESULTS_FILE=$CLAUDE_RESULTS_FILE" "claude $(printf '%q ' "$@")"
+tmux set-option -t "$sess" mouse on >/dev/null
+tmux split-window -h -l 45% -t "$sess" -c "$PWD" "$viewer"
+tmux select-pane -t "$sess" -L
+exec tmux attach -t "$sess"

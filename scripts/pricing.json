@@ -1,0 +1,15 @@
+{
+  "_comment": "List prices in USD per million tokens. Keys are matched as substrings of the model id that appears in Claude Code transcripts, longest key first. Order within each model: uncached input, 5-minute cache write, 1-hour cache write, cache read, output. Override for your own account by copying this file to $LACUNA_DATA/pricing.json and editing it; that copy wins and survives plugin updates.",
+  "_retrieved": "2026-10-12",
+  "_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "_caveat": "List price, not your bill. Subscription plans, rate limits, batch discounts and enterprise agreements are not modelled. Every figure this plugin prints is an estimate.",
+  "models": {
+    "opus-5-5":   [4.00,  5.00,  8.00,  0.20, 20.00],
+    "sonnet-5-5": [2.00,  2.50,  4.00,  0.10, 10.00],
+    "haiku-5-5":  [0.10,  0.125, 0.20,  0.01,  0.50],
+    "fable-5-1":  [10.00, 12.50, 20.00, 0.25, 50.00],
+    "opus-5":     [5.00,  6.25, 10.00,  0.50, 25.00],
+    "opus-4-8":   [5.00,  6.25, 10.00,  0.50, 25.00],
+    "haiku-4-5":  [1.00,  1.25,  2.00,  0.10,  5.00]
+  }
+}

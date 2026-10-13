@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # No third-party dependencies: the cost tools and hooks must work on a bare Python.
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Every script imports and answers --help
+        run: |
+          for f in scripts/lacuna_config.py scripts/doctor.py scripts/cost/spend.py \
+                   scripts/lit/lit_pipeline.py scripts/lit/prep_md.py; do
+            python -c "import ast,sys; ast.parse(open('$f').read())" || exit 1
+          done
+          python scripts/lacuna_config.py
+          python scripts/lit/lit_pipeline.py --help > /dev/null
+          ./bin/lacuna --help > /dev/null
+          ./bin/lacuna doctor || true      # exits non-zero when the optional parser is absent, which is correct
+
+      - name: Hooks are silent or valid JSON, never a traceback
+        run: |
+          echo '{"hook_event_name":"SessionStart","source":"startup","session_id":"ci"}' \
+            | python hooks/cache_guard.py | python -c "import json,sys; json.load(sys.stdin)"
+          echo '{"hook_event_name":"SessionStart"}' | python hooks/results_hook.py
+
+      - name: Status line renders without a transcript
+        run: |
+          echo '{"model":{"display_name":"Opus 5"},"workspace":{"current_dir":"/tmp"},"transcript_path":"/nonexistent","session_id":"ci"}' \
+            | python statusline/statusline.py

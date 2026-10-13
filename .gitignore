@@ -1,0 +1,18 @@
+# Nothing stateful belongs in this repo — state lives in $LACUNA_DATA.
+# These entries exist because it is easy to run the tools from inside a checkout.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+venv-docling/
+venv-marker/
+cost-ledger.jsonl
+cache/
+books/
+notes/
+*.unverified.md
+*.filelist.txt
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
