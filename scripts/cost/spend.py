@@ -8,7 +8,7 @@ import argparse, collections, glob, os, sys, time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ccost import ROOT, is_cold, load, project_dir, short, split
+from ccost import ROOT, is_avoidable_cold, load, project_dir, short, split
 
 COLOR = True
 
@@ -55,7 +55,7 @@ def session_report(path):
         + call["u"].get("output_tokens", 0) * __import__("ccost").price(call["model"])[4] / 1e6 for call in calls)
     span = ts(calls[-1]["ts"]) - ts(calls[0]["ts"])
     models = collections.Counter(short(x["model"]) for x in calls)
-    cold = [(t, i, call) for t, i, call, _, _ in turns if is_cold(call) and i > 0]
+    cold = [(t, i, call) for t, i, call, _, _ in turns if is_avoidable_cold(call, i)]
     writes = tot["write5m"] + tot["write1h"]
 
     print(c(177, "■ This session") + dim(f"  {os.path.basename(path)[:8]}  {len(calls)} API calls over {span / 3600:.1f} h  ·  "
@@ -72,7 +72,7 @@ def session_report(path):
     prev = {i: ctx for _, i, _, ctx, _ in turns}
     for t, i, call, ctx, s in sorted(turns, key=lambda x: -x[0])[:4]:
         delta = ctx - prev.get(i - 1, ctx)
-        why = ("cold rewrite" if is_cold(call) and i > 0 else
+        why = ("cold rewrite" if is_avoidable_cold(call, i) else
                f"+{delta / 1000:.0f}k new context" if delta > 15_000 else
                "long output/thinking" if s["output"] > 0.5 * t else "large context re-read")
         tools = ",".join(x.split("__")[-1] for x in call["tools"])[:30]
@@ -103,7 +103,7 @@ def fleet_report(days):
             continue
         kind = "subagent" if "/subagents/" in f else "main"
         proj = f[len(ROOT) + 1:].split("/")[0].split("-")[-1] or "?"
-        for call in load(f):
+        for i, call in enumerate(load(f)):
             if ts(call["ts"]) < since:
                 continue
             s, _ = split(call)
@@ -114,7 +114,7 @@ def fleet_report(days):
             u = call["u"]
             hit["read"] += u.get("cache_read_input_tokens", 0)
             hit["all"] += u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("input_tokens", 0)
-            if kind == "main" and is_cold(call):
+            if kind == "main" and is_avoidable_cold(call, i):
                 cold_n += 1
                 cold_usd += usd
             sessions.add(f)

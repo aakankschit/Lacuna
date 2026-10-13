@@ -61,8 +61,19 @@ def split(c):
 
 
 def is_cold(c):
+    """True when this call paid to write a large cache instead of reading one."""
     u = c["u"]
     return u.get("cache_creation_input_tokens", 0) > 40_000 and u.get("cache_read_input_tokens", 0) < 40_000
+
+
+def is_avoidable_cold(c, index):
+    """True when a cold write could have been avoided.
+
+    A session's FIRST call always writes its cache; that is the price of starting work, not waste.
+    Every later cold write means the cache expired while the session sat idle. Both the session
+    report and the fleet report must use this, or the same transcript gets two different counts.
+    """
+    return index > 0 and is_cold(c)
 
 
 def project_dir(cwd):

@@ -72,9 +72,16 @@ ENV_KEYS = {  # LACUNA_<KEY> -> where it lands
 
 
 def _merge(base, over):
+    """Overlay `over` onto `base`. A null or wrong-typed section is ignored rather than fatal:
+    every script imports this module, so a typo in config.json must not take the whole tool down."""
     for k, v in (over or {}).items():
-        if isinstance(v, dict) and isinstance(base.get(k), dict):
-            _merge(base[k], v)
+        if isinstance(base.get(k), dict):
+            if isinstance(v, dict):
+                _merge(base[k], v)
+            elif v is not None:
+                CONFIG_ERRORS.append(f"config.json: {k!r} should be an object, not "
+                                     f"{type(v).__name__}. Ignoring it.")
+            # v is None -> leave the defaults in place
         else:
             base[k] = v
     return base
@@ -111,7 +118,10 @@ def load():
             for key in body:
                 SOURCES[(section, key)] = "default"
     from_file = _read_json(os.path.join(DATA, "config.json"))
-    for section, body in (from_file or {}).items():
+    if not isinstance(from_file, dict):
+        CONFIG_ERRORS.append("config.json: the top level should be an object. Ignoring the file.")
+        from_file = {}
+    for section, body in from_file.items():
         if isinstance(body, dict):
             for key in body:
                 SOURCES[(section, key)] = "config.json"
@@ -124,7 +134,7 @@ def load():
     # Paths are written by hand in config.json, so "~/books" and "$HOME/books" must work.
     # Without this a tilde becomes a literal directory named "~" and the error is baffling.
     cfg["paths"] = {k: os.path.expanduser(os.path.expandvars(v)) if isinstance(v, str) else v
-                    for k, v in cfg["paths"].items()}
+                    for k, v in (cfg.get("paths") or {}).items()}
     return cfg
 
 
