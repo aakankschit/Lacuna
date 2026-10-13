@@ -102,7 +102,10 @@ def fleet_report(days):
         if os.path.getmtime(f) < since:
             continue
         kind = "subagent" if "/subagents/" in f else "main"
-        proj = f[len(ROOT) + 1:].split("/")[0].split("-")[-1] or "?"
+        # Claude Code encodes a project path as "-Users-me-code-lab-a"; the last two segments
+        # keep "lab-a" and "team-a" apart, which the last segment alone would merge into "a".
+        enc = f[len(ROOT) + 1:].split("/")[0]
+        proj = "-".join([p for p in enc.split("-") if p][-2:]) or "?"
         for i, call in enumerate(load(f)):
             if ts(call["ts"]) < since:
                 continue

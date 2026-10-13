@@ -22,7 +22,7 @@ than assuming it.
 |---|---|---|---|
 | **Estimate** | `lacuna lit estimate papers/*.pdf` | counts tokens locally and prints a cost table — no API calls | **free** |
 | **Read** | `lacuna lit read papers/*.pdf --out notes/` | one cheap agent per document, in parallel; notes cached by content, so a document is never read twice | ~$0.015/doc |
-| **Synthesise** | `lacuna lit synth --notes notes/ --repo . --out plan.md --kind plan` | ranked development proposals against your real files, with an authoritative file list so it cannot invent paths | $0.53 – $1.44 |
+| **Synthesise** | `lacuna lit synth --notes notes/ --repo . --out plan.md --kind plan` | ranked development proposals against your real files, with an authoritative file list and told to grep before naming anything | $0.53 – $1.44 |
 | **Verify** | `lacuna lit verify --target plan.md --repo . --notes notes/` | greps every path, number and attribution; reports only what it could not confirm | $0.02 – $0.09 |
 | **Build** | the `dev-cycle` skill | pin a contract, implement and write tests in parallel with the test author blind to the code, then confront and mutate | varies |
 | **Account** | `/spend` | this session and the last 7 days, split by cache read / cache write / output | **free** |
