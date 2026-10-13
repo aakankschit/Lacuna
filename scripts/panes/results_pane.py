@@ -153,14 +153,22 @@ class Pane:
 
 
 def main():
-    target = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_DIR
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip())
+        return
+    once = "--once" in argv
+    positional = [a for a in argv if not a.startswith("-")]
+    if len(positional) > 1:
+        print(f"ERROR: expected one FILE or DIR, got {len(positional)}: {positional}", file=sys.stderr)
+        sys.exit(2)
+    target = os.path.expanduser(positional[0]) if positional else DEFAULT_DIR
     if not os.path.exists(target):
         if target.endswith(".md"):
             os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         else:
             os.makedirs(target, exist_ok=True)
     pane = Pane(target)
-    once = "--once" in sys.argv
     if once or not sys.stdin.isatty() or not sys.stdout.isatty():
         pane.render()                      # no terminal of its own: print once and exit
         if not once:

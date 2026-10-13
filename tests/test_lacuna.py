@@ -106,7 +106,7 @@ class TestNoteCacheKey(unittest.TestCase):
         import lit_pipeline as L
         with open(os.path.join(ROOT, "scripts", "lit", "lit_pipeline.py")) as f:
             body = f.read()
-        key_expr = body[body.index("key = hashlib.sha256"):body.index("stem = os.path.basename(md)")]
+        key_expr = body[body.index("key = hashlib.sha256"):body.index("jobs.append(")]
         for part in ("content_h", "PROMPT_VERSION", "reader_model", "a.brief", "a.no_books"):
             self.assertIn(part, key_expr, f"{part} must be part of the note cache key")
         self.assertTrue(L.PROMPT_VERSION, "PROMPT_VERSION must be set")
@@ -256,10 +256,29 @@ class TestHooksNeverBreakASession(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "")
 
     def test_cache_guard_survives_garbage_input(self):
-        r = subprocess.run([sys.executable, os.path.join(ROOT, "hooks", "cache_guard.py")],
-                           input="not json", capture_output=True, text=True)
-        self.assertNotEqual(r.returncode, 0)   # it may fail, but must not hang or print a hook action
-        self.assertEqual(r.stdout.strip(), "")
+        """A hook that raises breaks every prompt in the session, so garbage must exit 0 silently."""
+        for bad in ("", "not json", "[]", '{"hook_event_name":"Unknown"}'):
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "hooks", "cache_guard.py")],
+                               input=bad, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, f"input {bad!r} -> exit {r.returncode}: {r.stderr}")
+            self.assertEqual(r.stdout.strip(), "", f"input {bad!r} produced a hook action")
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_cache_guard_survives_a_transcript_line_without_a_timestamp(self):
+        with tempfile.TemporaryDirectory() as d:
+            t = os.path.join(d, "t.jsonl")
+            with open(t, "w") as f:
+                f.write(json.dumps({"type": "assistant", "message": {
+                    "id": "m1", "model": "claude-haiku-5-5",
+                    "usage": {"input_tokens": 1, "output_tokens": 1,
+                              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}) + "\n")
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "hooks", "cache_guard.py")],
+                               input=json.dumps({"hook_event_name": "UserPromptSubmit",
+                                                 "session_id": "s", "transcript_path": t,
+                                                 "prompt": "hi"}),
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
     def test_results_hook_is_silent_outside_the_pane(self):
         r = self._run_hook("results_hook.py", {"hook_event_name": "SessionStart"},
@@ -281,21 +300,57 @@ class TestAfterHook(unittest.TestCase):
                 f"sys.path.insert(0, {os.path.join(ROOT, 'scripts', 'lit')!r})\n"
                 "import lit_pipeline as L\n"
                 "L.after('synth', '/tmp/does-not-matter.md')\n")
-        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              env={**os.environ, "LACUNA_TESTDIR": data_dir})
 
     def test_every_broken_command_is_survivable(self):
         with tempfile.TemporaryDirectory() as d:
             for cmd, expect in [
                 ("/bin/echo filed", "ok"),
-                ("/bin/does-not-exist-anywhere", "could not run"),
+                ("/bin/does-not-exist-anywhere", "127"),        # the shell reports it
                 ("/usr/bin/false", "exit 1"),
                 ("/bin/echo 'two words'", "ok"),
-                ("/bin/echo 'unbalanced", "could not run"),     # shlex raises before exec
+                ("/bin/echo 'unbalanced", "exit"),              # the shell rejects it
                 (["/bin/echo", "list form"], "ok"),
             ]:
                 r = self._after(cmd, d)
                 self.assertEqual(r.returncode, 0, f"{cmd!r} crashed:\n{r.stderr}")
                 self.assertIn(expect, r.stdout, f"{cmd!r} -> {r.stdout!r}")
+                if expect != "ok":
+                    self.assertIn("output is unaffected", r.stdout,
+                                  "a failed hook must say the stage's output survived")
+
+    def test_hook_gets_the_path_last_and_the_shell_expands_variables(self):
+        """The documented contract: the output path is APPENDED, and `~`/`$VAR` expand.
+
+        A command with no arguments of its own therefore sees the path as `$1` — which is the
+        common case and what the docs show. Before this, neither half was true: there was no
+        shell, so `~/bin/hook` could not even be found.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "got.txt")
+            script = os.path.join(d, "hook.sh")
+            with open(script, "w") as f:
+                f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > {marker}\n')
+            os.chmod(script, 0o755)
+
+            # no arguments of its own: the path is $1
+            self._after(script, d)
+            with open(marker) as f:
+                self.assertEqual(f.read().strip().splitlines(), ["/tmp/does-not-matter.md"])
+
+            # with its own arguments: the path is appended last
+            self._after(f'"{script}" --kind plan', d)
+            with open(marker) as f:
+                self.assertEqual(f.read().strip().splitlines(),
+                                 ["--kind", "plan", "/tmp/does-not-matter.md"])
+
+            # a shell variable in the command is expanded rather than passed through literally
+            os.remove(marker)
+            r = self._after('"$LACUNA_TESTDIR/hook.sh"', d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ok", r.stdout, f"$VAR was not expanded: {r.stdout!r}")
+            self.assertTrue(os.path.exists(marker), "the hook named by $VAR never ran")
 
     def test_absent_hook_is_silent(self):
         with tempfile.TemporaryDirectory() as d:

@@ -84,7 +84,8 @@ anything beyond them:
 ```bash
 lacuna doctor --install-pdf          # pymupdf4llm, the default parser (~4 s/document)
 lacuna doctor --install-fallback     # docling, the structured fallback (~73 s/document)
-lacuna doctor --install-equations    # marker, for LaTeX fidelity — several GB of models
+lacuna doctor --install-equations    # marker, for LaTeX fidelity — ~2 GB of models,
+                                     #   and needs llama.cpp on PATH (brew install llama.cpp)
 ```
 
 Each goes in its own virtual environment under the data directory, because their dependency trees
@@ -92,7 +93,8 @@ collide. The fallback and equation parsers are opt-in and `doctor` never install
 
 ## First run
 
-Nothing here needs a PDF, a parser or an API call except the last command.
+Nothing here needs a PDF or a parser. Only the last two commands call a model, for about
+$0.31 together.
 
 ```bash
 # with the shell function above, or $LAC set to <installPath>/bin/lacuna
@@ -108,7 +110,7 @@ lacuna lit synth --notes examples/notes --repo examples/demo-repo --out /tmp/pla
 lacuna lit verify --target /tmp/plan.md --repo examples/demo-repo --notes examples/notes
 ```
 
-That last pair is worth running in order. On the example, `synth` cost $0.30 and `verify` cost
+That last pair is worth running in order. On the example, `synth` cost $0.302 and `verify` cost
 $0.0099 — and `verify` found four over-claims in the plan `synth` had just written, including a
 finding attributed to the wrong source. **`verify` is not optional.** The dominant error is a true
 claim pinned to the wrong document, and a few cents catches it.
@@ -135,8 +137,9 @@ LACUNA_PLANNER=fable lacuna lit synth --notes notes/ --repo . --out plan.md --ki
 lacuna config                      # shows every role and where its value came from
 ```
 
+Permanently, in `~/.lacuna/config.json` (strict JSON — no comments, or the whole file is ignored):
+
 ```json
-// ~/.lacuna/config.json — permanent
 { "models": { "planner": "claude-opus-5", "reader": "haiku" } }
 ```
 
@@ -156,8 +159,11 @@ lacuna lit read papers/*.pdf --out ~/Obsidian/MyVault/Literature/ --brief "..."
 
 **File finished results into an app that is not a folder** (Heptabase, Notion, a tracker)
 
+In `~/.lacuna/config.json`. Your command runs through a shell, so `~` and `$VAR` work, and the
+output path is appended as the final argument — so a command with no arguments of its own
+receives it as `$1`:
+
 ```json
-// ~/.lacuna/config.json — your command runs with the output path as $1
 { "after": { "synth": "~/bin/import-to-notebook --kind plan" } }
 ```
 
@@ -180,9 +186,9 @@ effort buy anything?
 |---|---|
 | Task | extract the **open problems** a paper leaves, including ones the authors do not state |
 | Documents | 2 research papers, 33,461 tokens of text in total |
-| Varied | 3 model tiers × 5 reasoning-effort levels = **30 runs** |
+| Varied | 3 model tiers × 5 reasoning-effort levels, **2 repeats each** = 30 runs |
 | Held constant | same prompt, same note template, same slim agent (Read/Grep/Write) |
-| Judged | outputs anonymised, scored by 2 models from different tiers against a written rubric, averaged; recall measured against a reference list built by hand |
+| Judged | outputs anonymised, scored by 2 models from different tiers against a written rubric; every figure is the mean of 2 repeats × 2 judges. Recall is against a hand-built list of 15 gaps |
 
 **Result 1 — quality barely moves across tiers.**
 
@@ -206,7 +212,7 @@ model, so the cheap tier reads and the pipeline fixes effort at medium — the b
 strong tier's real advantage is *proposals*, not reading, so it is spent on synthesis instead.
 Reading two papers costs 1.8 cents rather than 57, and nothing measured got worse.
 
-**What it does not show.** Two papers, one field, one person's reference list, single runs per cell.
+**What it does not show.** Two papers, one field, one person's reference list of 15 gaps.
 The strong tier's edge on mechanism-level proposals is real in this sample and untested elsewhere.
 Costs are list price, not your bill. [docs/LIMITS.md](docs/LIMITS.md) is the honest version.
 
@@ -258,6 +264,11 @@ a pinned id (`claude-opus-5`) when a study needs reproducibility.
   "budget_warn_usd": 2.0
 }
 ```
+
+`reader`, `digester`, `planner` and `verifier` are read by the pipeline. `coder` and `tester` are
+read by the `dev-cycle` skill, which passes them when it spawns those agents — the agent files
+themselves carry a plain `sonnet` / `opus` default. `budget_warn_usd` makes `lacuna lit estimate`
+flag any combination that would cost more.
 
 Change a role when your material demands it — some models refuse some subject matter in headless
 runs, and pinning the planner to one that does not is a one-line fix rather than a workaround.

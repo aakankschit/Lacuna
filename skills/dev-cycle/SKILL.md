@@ -58,8 +58,16 @@ attributed.
 Run them concurrently — they touch different files in different worktrees. (Unrelated but learned
 the hard way: never run two GPU-bound processes concurrently; it corrupted a parser output.)
 
-Both agents' models come from config (`models.coder`, `models.tester`). To use a different model for
-one run, pass `model:` when spawning the agent rather than editing the agent file.
+**Pass the configured models explicitly.** Agent frontmatter cannot read configuration, so the
+files carry a plain `sonnet` / `opus` default. Read the user's choice and pass it when spawning:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/lacuna config --json | python3 -c \
+  "import json,sys; m=json.load(sys.stdin)['models']; print(m['coder'], m['tester'])"
+```
+
+Then spawn each agent with that `model:`. If the call fails, the frontmatter defaults apply and you
+should say so rather than assume the user's setting took effect.
 
 **Check the agents can actually run code.** Under a restrictive permission mode a headless agent may
 write files but have every `Bash` call refused, so it implements blind and cannot self-verify. Either

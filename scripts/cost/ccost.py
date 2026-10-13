@@ -1,6 +1,6 @@
 """Shared pricing and transcript parsing for Claude Code cost tools.
 
-Prices are list $/MTok and live in scripts/lacuna_config.py; override them for your account in
+Prices are list $/MTok and live in scripts/pricing.json; override them for your account in
 $LACUNA_DATA/pricing.json rather than editing code.
 Transcript JSONL is an internal format, not a documented contract: treat results as estimates.
 """

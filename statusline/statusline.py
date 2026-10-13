@@ -107,7 +107,10 @@ def main():
         left = (pc.get("expires_at") or 0) - time.time()
         if pc.get("expires_at") and left > 0:
             col = 114 if left > 600 else 221
-            l1.append(f"cache {c(col, '●')} {pc.get('ttl', '')} {c(col, dur(left) + ' left')}")
+            ttl = pc.get("ttl", "")
+            # "1h cache · 42m left", never "1h 42m left" — which reads as a single duration
+            l1.append(f"cache {c(col, '●')} " + (f"{ttl} cache · " if ttl else "")
+                      + c(col, dur(left) + " left"))
         else:
             l1.append(c(203, f"cache ○ cold · next prompt re-caches ≈${ctx * w1 / 1e6:.2f}"))
         if ctx >= 150_000:

@@ -93,18 +93,24 @@ def convert(pdf, out, forced=None, equations=False, quiet=False):
             problems[parser] = err
             continue
         bad = validate(md, pages)
-        if bad and parser != order[-1]:
+        if bad:
+            # A parse that fails validation is never accepted, whatever its position in the order.
+            # A bad parse looks like valid markdown; passing it downstream is the failure this
+            # whole step exists to prevent.
             problems[parser] = "; ".join(bad)
             if not quiet:
-                print(f"  {parser} failed validation ({problems[parser]}) -> falling back", file=sys.stderr)
+                nxt = order[order.index(parser) + 1] if parser != order[-1] else None
+                print(f"  {parser} failed validation ({problems[parser]})"
+                      + (f" -> trying {nxt}" if nxt else " -> no parser left"), file=sys.stderr)
             continue
         text = clean(md)
         open(out, "w").write(text)
-        note = f" [validation: {'; '.join(bad)}]" if bad else ""
         if not quiet:
-            print(f"{out}  {len(text):,} chars  ~{len(text) / 2.9:,.0f} tok  via {parser}{note}")
-        return True, bad
-    print(f"ERROR {os.path.basename(pdf)}: no parser produced usable output. "
+            print(f"{out}  {len(text):,} chars  ~{len(text) / 2.9:,.0f} tok  via {parser}")
+        return True, []
+    hint = ("" if "docling" in problems or forced or equations else
+            "  (the docling fallback is not installed: `lacuna doctor --install-fallback`)")
+    print(f"ERROR {os.path.basename(pdf)}: no parser produced usable output.{hint} "
           + " | ".join(f"{k}: {v}" for k, v in problems.items()), file=sys.stderr)
     return False, list(problems)
 

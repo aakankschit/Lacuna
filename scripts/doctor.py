@@ -23,12 +23,13 @@ CONFIG_TEMPLATE = {
 # One venv per parser: their dependency trees genuinely collide. Keys match prep_md.py's VENVS.
 EXTRAS = {
     "pdf":       dict(pkg="pymupdf4llm", mod="pymupdf4llm", venv="venv",
-                      why="the default parser, ~4 s/document", blocking=True),
+                      why="the default parser, ~4 s/document — needed only to read PDFs", blocking=False),
     "fallback":  dict(pkg="docling", mod="docling", venv="venv-docling",
                       why="structured fallback for documents the default parser mangles, ~73 s/document",
                       blocking=False),
     "equations": dict(pkg="marker-pdf", mod="marker", venv="venv-marker",
-                      why="LaTeX-fidelity parser; downloads several GB of models on first use",
+                      why="LaTeX-fidelity parser; ~2 GB of models on first use, and it also needs a "
+                          "llama.cpp binary on PATH (`brew install llama.cpp`) or its import fails",
                       blocking=False),
 }
 rows = []
@@ -113,15 +114,20 @@ def main():
         if venv_has(py, e["mod"]):
             say(OK, f"{e['pkg']}", e["why"])
         else:
+            fix = os.path.join(lacuna_config.ROOT, "bin", "lacuna")
             say(BAD if e["blocking"] else WARN, f"{e['pkg']} not installed",
-                f"{e['why']}\n         fix: lacuna doctor --install-{key}")
+                f"{e['why']}\n         fix: {fix} doctor --install-{key}")
 
-    missing = rows.count(BAD)
-    print(f"\n{len(rows) - missing}/{len(rows)} checks clean" + (f", {missing} blocking" if missing else ""))
+    missing, notes = rows.count(BAD), rows.count(WARN)
+    print(f"\n{len(rows) - missing - notes}/{len(rows)} checks clean"
+          + (f", {notes} optional piece(s) not installed" if notes else "")
+          + (f", {missing} BLOCKING" if missing else ""))
     if missing:
-        print("Fix the MISS lines above. `lacuna spend` works regardless — it only reads transcripts.")
-    else:
-        print("Try:  lacuna spend --days 7      (costs nothing; reads the transcripts you already have)")
+        print("Fix the MISS lines above before anything will work.")
+    elif notes:
+        print("Nothing is blocking. The optional pieces above are only needed to read PDFs;")
+        print("markdown and text input, and every cost tool, work without them.")
+    print("Try:  lacuna spend --days 7      (costs nothing; reads the transcripts you already have)")
     return 1 if missing else 0
 
 

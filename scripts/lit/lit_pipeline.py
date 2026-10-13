@@ -18,7 +18,7 @@ usage:
   lit_pipeline.py synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT]
   lit_pipeline.py verify --target FILE --repo DIR [--notes DIR]
 """
-import argparse, concurrent.futures as cf, hashlib, json, os, shlex, shutil, subprocess, sys, time
+import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -121,13 +121,16 @@ def after(stage, out_path):
     cmd = (lacuna_config.CONFIG.get("after") or {}).get(stage)
     if not cmd:
         return
-    argv = None
+    # Run through a shell so "~", "$VAR" and shell syntax work. The output path is APPENDED as the
+    # final argument: a command with no arguments of its own therefore receives it as "$1".
     try:
-        argv = ([*shlex.split(cmd)] if isinstance(cmd, str) else [*cmd]) + [out_path]
+        if isinstance(cmd, str):
+            argv = ["sh", "-c", cmd + ' "$1"', "sh", out_path]
+        else:
+            argv = [*cmd, out_path]
         r = subprocess.run(argv, capture_output=True, text=True)
     except (OSError, ValueError) as e:
-        what = repr(argv[0]) if argv else repr(cmd)
-        print(f"  after_{stage}: could not run {what} — {e}. The output is unaffected: {out_path}")
+        print(f"  after_{stage}: could not run {cmd!r} — {e}. The output is unaffected: {out_path}")
         return
     if r.returncode == 0:
         print(f"  after_{stage}: ok")
@@ -181,11 +184,15 @@ def need_venv():
 
 
 def to_markdown(path, out_dir, equations=False, parser=None):
+    """See below. Raises SystemExit(2) when the document does not exist."""
     """Parse a PDF to reference-stripped markdown; return the .md path (cached by content hash).
 
     The cache name carries the parser choice, because marker and pymupdf4llm produce different
     markdown from the same PDF and must not collide in the cache.
     """
+    if not os.path.isfile(path):
+        print(f"ERROR: no such document: {path}", file=sys.stderr)
+        sys.exit(EX_INPUT)
     if path.endswith((".md", ".txt")):
         return path
     need_venv()
@@ -223,16 +230,18 @@ def cmd_read(a):
         key = hashlib.sha256("\0".join(
             [content_h, PROMPT_VERSION, reader_model, a.brief, str(not a.no_books)]
         ).encode()).hexdigest()[:12]
-        stem = os.path.basename(md)[:-3]
-        if stem.endswith(f"_{content_h}"):
-            stem = stem[: -(len(content_h) + 1)]
+        # md may be "<name>_<pdf-hash>[_<parser>].md" from the parse cache; the note is just <name>.
+        stem = re.sub(r"_[0-9a-f]{12}(_[a-z0-9]+)?$", "", os.path.basename(md)[:-3])
         jobs.append((md, f"{out_dir}/{stem}.md", f"{CACHE}/notes/{stem}_{key}.md"))
 
     def one(md, out, cached):
         if os.path.exists(cached) and os.path.getsize(cached) > 400:
-            if not os.path.exists(out):
-                shutil.copy(cached, out)
+            shutil.copy(cached, out)      # always refresh: --out may hold another run's note
             return os.path.basename(out), "cached (free)", 0.0
+        # Remove any earlier note first, so "the file exists" can only mean this call wrote it.
+        # Otherwise a refusal on a re-run reports success and caches the stale note under a new key.
+        if os.path.exists(out):
+            os.remove(out)
         prompt = "\n\n".join(x for x in [
             a.brief, books,
             "Read the paper below in full and write its note to the given path, using exactly this template:",
@@ -240,9 +249,10 @@ def cmd_read(a):
         res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, BOOKS_DIR],
                      effort=lacuna_config.effort("reader"), cwd=out_dir)
         ok = os.path.exists(out) and os.path.getsize(out) > 400
+        # source_tokens makes the calibration recipe in docs/extending.md actually runnable
         ledger({"stage": "read", "model": reader_model, "paper": os.path.basename(md), "cost": usd(res),
                 "wall_s": res["wall_s"], "books": not a.no_books, "wrote_note": ok,
-                "is_error": res.get("is_error")})
+                "source_tokens": round(os.path.getsize(md) / 2.9), "is_error": res.get("is_error")})
         if ok:
             shutil.copy(out, cached)
             return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
@@ -263,6 +273,18 @@ def cmd_read(a):
     after("read", out_dir)
 
 
+def need_dir(p, what):
+    if not p or not os.path.isdir(p):
+        print(f"ERROR: {what} {p!r} is not a directory. Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
+
+
+def need_file(p, what):
+    if not p or not os.path.isfile(p):
+        print(f"ERROR: {what} {p!r} does not exist. Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
+
+
 def cmd_synth(a):
     """digest: Sonnet consolidates the notes by theme. plan: Opus (or --model) proposes development work.
 
@@ -270,6 +292,9 @@ def cmd_synth(a):
     chain is cheaper but adds a second chance to garble an attribution, so the plan is always told that
     the notes are authoritative over the digest.
     """
+    need_dir(a.repo, "--repo")
+    if a.digest:
+        need_file(a.digest, "--digest")
     notes = []
     if a.notes:
         if not os.path.isdir(a.notes):
@@ -334,6 +359,10 @@ def cmd_synth(a):
 
 def cmd_verify(a):
     """Cheap grep-based fact check. The verifier reports in its final message; we save that."""
+    need_file(a.target, "--target")
+    need_dir(a.repo, "--repo")
+    if a.notes:
+        need_dir(a.notes, "--notes")
     prompt = "\n\n".join([
         f"Fact-check this document: {a.target}",
         f"Codebase: {a.repo}" + (f"\nSource notes: {a.notes}" if a.notes else ""),
@@ -346,11 +375,15 @@ def cmd_verify(a):
         "Reply exactly 'No unverifiable claims found.' if there are none. Do not comment on the ideas, "
         "do not summarise the document, and do not use any file-writing tool."])
     dirs = [a.repo, os.path.dirname(os.path.abspath(a.target))] + ([a.notes] if a.notes else [])
-    vmodel = lacuna_config.model("verifier")
+    vmodel = a.model or lacuna_config.model("verifier")
     res = claude("verifier", vmodel, prompt, dirs, effort=lacuna_config.effort("verifier"))
     ledger({"stage": "verify", "model": vmodel, "target": os.path.basename(a.target), "cost": usd(res),
             "wall_s": res["wall_s"], "is_error": res.get("is_error")})
     report = str(res.get("result") or "")
+    if res.get("is_error") or not report.strip():
+        print(f"ERROR: the verifier ({vmodel}) returned no usable report. Nothing was written, and "
+              f"{os.path.basename(a.target)} has NOT been fact-checked.\n{report[:400]}", file=sys.stderr)
+        sys.exit(EX_MODEL)
     out = f"{a.target}.unverified.md"
     try:
         open(out, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n{report}\n")
@@ -390,6 +423,7 @@ def main():
     v.add_argument("--target", required=True)
     v.add_argument("--repo", required=True)
     v.add_argument("--notes")
+    v.add_argument("--model", help="override the verifier model for this run")
     a = ap.parse_args()
     {"read": cmd_read, "synth": cmd_synth, "verify": cmd_verify}[a.cmd](a)
 

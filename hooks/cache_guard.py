@@ -62,7 +62,7 @@ def last_call(path):
             continue
         ctx = (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                + u.get("cache_read_input_tokens", 0))
-        ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+        ts = datetime.fromisoformat((e.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
         return ts, ctx, e["message"].get("model", "")
     return None
 
@@ -93,7 +93,10 @@ def emit(obj):
 def main():
     if os.environ.get("LACUNA_GUARD_OFF"):
         return
-    d = json.load(sys.stdin)
+    try:
+        d = json.load(sys.stdin)
+    except ValueError:
+        return                      # not our payload; say nothing
     event, sid = d.get("hook_event_name"), d.get("session_id", "unknown")
     call = last_call(d.get("transcript_path") or "")
 
@@ -140,4 +143,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # A hook that raises breaks every prompt in the session. Nothing this file does is worth
+    # that, so any unexpected failure exits quietly and the session carries on unhelped.
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        sys.exit(0)

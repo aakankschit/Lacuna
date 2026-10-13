@@ -1,6 +1,6 @@
 # Study 1 — model tier × reasoning effort on reading documents
 
-*October 2026 · 3 tiers × 5 effort levels × 2 documents, 30 runs, blind-judged · $55.92*
+*October 2026 · 3 tiers × 5 effort levels × 2 repeats = 30 runs, blind-judged · $55.92*
 
 ## Question
 
@@ -10,9 +10,10 @@ including those the authors do not state — in a form specific enough to become
 
 ## Setup
 
-Each run: one agent, one tier, one effort level, two parsed documents, writing one structured note
-per document. Notes were anonymised and judged by two models from different tiers against a rubric
-scoring recall of open problems (against a reference list built by hand from both documents),
+Each run: one agent, one tier, one effort level, reading both parsed documents and writing one
+structured note per document. Each of the 15 tier × effort cells was run **twice**, giving 30 runs
+and 60 notes; every figure below is the mean of 2 repeats × 2 judges. Notes were anonymised and judged by two models from different tiers against a rubric
+scoring recall of open problems (against a hand-built reference list of **15** gaps),
 proposal viability, and whether a proposal reached mechanism level — naming *how* a thing would
 work, not just that it should be tried.
 
@@ -34,15 +35,18 @@ polish.
 
 ### Effort buys almost nothing
 
-| tier | cost, low → max | thinking tokens |
+| tier | cost, low → max | shape |
 |---|---|---|
-| cheap | **43×** | rises steeply with effort |
-| mid | flat to high, then **13×** at xhigh/max | same |
-| strong | flat | ≤5k at *every* level, including max |
+| cheap | **47×** | rises steeply and monotonically |
+| mid | **13×** | flat to high, then jumps at xhigh/max |
+| strong | **1.3×** | nearly flat overall, and not monotonic: high and xhigh cost ~1.7× medium while max costs *less* than high |
 
-The strong tier declined to spend thinking tokens on this task regardless of the level requested;
-raising effort changed its cost and output almost not at all. The cheap tier, in contrast, will
-happily burn 43× the money for no measured gain in recall or viability.
+(Multipliers computed from the calibration this plugin ships, so `lacuna lit estimate` reproduces
+them. The strong tier declined to spend thinking tokens on this task at any level, never exceeding
+about 5k even at max.)
+
+The cheap tier will happily burn 47× the money for no measured gain in recall or viability, and the
+mid tier 13×. No tier bought measurably better notes at higher effort.
 
 **This is why the shipped pipeline fixes effort at medium everywhere except the verifier.**
 

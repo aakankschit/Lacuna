@@ -16,8 +16,8 @@ Say "on this benchmark" when repeating these numbers. Never "in general".
 
 | Finding | n | Strength |
 |---|---|---|
-| Reading recall is tier-independent | 30 runs, 2 documents, blind-judged | reasonably solid |
-| Reader × synthesiser grid | 20 plans, 3×3 grid plus variants, blind-judged | solid on the synthesiser axis |
+| Reading recall is tier-independent | 30 runs (15 cells × 2 repeats), 2 documents, blind-judged | reasonably solid |
+| Reader × synthesiser grid | 18 plans, 3×3 grid × 2 context conditions, blind-judged | solid on the synthesiser axis |
 | Per-document vs batched reading cost | repeated runs, same documents | solid; it is arithmetic over token counts |
 | Effort is a cost multiplier | 30 runs across 5 effort levels | solid on cost, weaker on quality |
 | Books halve factual errors | **2 cells, one run each** | suggestive only |

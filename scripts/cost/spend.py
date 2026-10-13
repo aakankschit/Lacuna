@@ -139,6 +139,10 @@ def main():
     path = a.session
     if path and not os.path.exists(path):
         path = next(iter(glob.glob(f"{ROOT}/*/{path}*.jsonl")), None)
+        if not path:
+            print(f"ERROR: no transcript matches --session {a.session!r}. Omit --session for this "
+                  f"directory's most recent one.", file=sys.stderr)
+            sys.exit(2)
     if not path:
         cands = glob.glob(os.path.join(project_dir(a.cwd), "*.jsonl"))
         path = max(cands, key=os.path.getmtime) if cands else None

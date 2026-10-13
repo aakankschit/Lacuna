@@ -1,6 +1,6 @@
 # Study 2 — which reader, which synthesiser
 
-*October 2026 · 6 documents, 3×3 tier grid plus variants, 20 plans, blind-judged · $52.25*
+*October 2026 · 6 documents, 3 readers × 3 synthesisers × 2 context conditions = 18 plans, blind-judged · $39.56*
 
 ## Question
 
@@ -15,8 +15,8 @@ then a synthesiser tier read the notes plus the codebase (with an authoritative 
 listing) and wrote a ranked development plan. Plans were anonymised and judged by two models against
 a rubric; every claim in every plan was then re-checked with `grep` against the code and the notes.
 
-Two sets of cells, as a control on where the project context enters: one where the reader got a
-project brief, one where only the synthesiser saw the project.
+Two sets of 9 cells, as a control on where the project context enters: one where the reader got
+a project brief, one where only the synthesiser saw the project. One run per cell, no repeats.
 
 ## Result 1 — the synthesiser is the lever
 
@@ -41,7 +41,8 @@ it. The cheap reader writes flatter notes that stay closer to the source.
 
 ## Result 3 — what the errors actually are
 
-75 findings across the 20 plans, 2.1 per plan:
+**75 raw findings** from two judges across the 18 plans. Averaging the two judges gives 37.5
+findings, or **2.1 per plan**:
 
 | error | count |
 |---|---|
@@ -106,7 +107,7 @@ mathematics and for the cheapest reader, which looks things up most.
 
 ## A validation worth more than any rubric score
 
-All 20 plans independently converged on the same architectural change as the first thing to build —
+All 18 plans independently converged on the same architectural change as the first thing to build —
 and that change is what the project's own unpublished design document, written before the benchmark
 and never shown to any agent, specifies in its first section. The pipeline reproduced a design
 decision an expert had already made, from the literature alone.

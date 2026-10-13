@@ -53,8 +53,8 @@ cleanliness — not on recall.**
 1. Parse with **pymupdf4llm** (4 s, markdown headings and tables, no control characters).
 2. **Validate**: plausible character count for the page count, no control characters, at least some
    headings on a document long enough to have them, and an expected section name present.
-3. If validation fails, re-parse with **docling** (73 s, the only parser at 100% recall on all three
-   documents, richest structure).
+3. If validation fails, re-parse with **docling** (73 s). Three parsers reached 100% recall;
+   docling is the only one of those that also preserves headings and tables.
 4. If both fail, **report the document and write nothing** rather than feed a bad parse downstream.
 5. `--equations` routes to **marker** when equations are the object of study: 34 LaTeX expressions
    per document against ~1 for everything else.

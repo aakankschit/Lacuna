@@ -21,7 +21,7 @@ LAC=${CLAUDE_PLUGIN_ROOT}/bin/lacuna
 # 0. estimate — free, local token count against the calibration. Do this first.
 $LAC lit estimate <pdfs-or-mds> --per-agent 1
 
-# 1. read — one slim cheap-tier agent per document, in parallel. ~$0.015/document, ~60-100 s for any number.
+# 1. read — one slim cheap-tier agent per document, in parallel. ~$0.015/document, ~60-100 s for up to 8 documents (they run 8 at a time, then in waves).
 $LAC lit read <pdfs-or-mds> --out <project>/lit/notes \
     --brief "Project: <one or two lines on what the code does and what it is for>"
 
@@ -66,14 +66,15 @@ Which model fills each role comes from config (`lacuna config` to see it; `model
   and halves mechanism-level proposals, because the digest compresses away the raw material the
   planner generates from. It does improve accuracy, but `verify` fixes that far more cheaply. Use
   `--digest` only when the digest is the thing you want planned against.
-- **Effort is a cost multiplier, not a quality lever.** Up to 43× the cost from low to max for no
+- **Effort is a cost multiplier, not a quality lever.** Up to 47× the cost from low to max for no
   measured gain on reading or synthesis. The pipeline fixes effort at medium, and high only for the
   verifier, where it is cheap and does help.
 - **Notes are cached**, keyed by document content *plus* the reader model, the brief and the prompt
   version — so re-running is free, but changing any of those correctly misses the cache. Six notes
   are ~9k tokens against ~104k for six papers, so every later synthesis is ~11× cheaper.
 - **The synthesiser gets an authoritative file list** (`git ls-files`, or a filtered walk outside a
-  repo) and is told to grep before naming a path. One plan invented a plausible script name.
+  repo) and is told to grep before naming a path. In the 18-plan grid no plan named a file or class
+  that does not exist; an earlier capability test, run without the file list, did invent one.
 - **Verification is cheap and catches the dominant error class.** A cheap pass found, for $0.02, a
   0.1%-vs-1% mix-up, a wrong time breakdown and two over-strong attributions; for $0.085 it
   independently reproduced both blind judges' findings on a plan.

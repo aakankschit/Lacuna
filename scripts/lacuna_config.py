@@ -13,10 +13,10 @@ import json, os
 # Code lives next to this file (read-only, replaced on every plugin update).
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# State lives in the plugin data directory, which survives plugin updates.
-DATA = (os.environ.get("LACUNA_DATA")
-        or os.environ.get("CLAUDE_PLUGIN_DATA")
-        or os.path.expanduser("~/.lacuna"))
+# ONE data directory, whoever is asking. It deliberately does not fall back to CLAUDE_PLUGIN_DATA:
+# hooks get that variable and a shell does not, so the two would read different config files and a
+# setting made in one would be silently ignored by the other.
+DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")
 
 # Claude Code's own transcript directory. Not configurable by us — this is where it writes.
 TRANSCRIPTS = os.path.expanduser("~/.claude/projects")
@@ -80,22 +80,47 @@ def _merge(base, over):
     return base
 
 
-def _read_json(path):
+CONFIG_ERRORS = []
+
+
+def _read_json(path, quiet=True):
+    """Parse a JSON file. A malformed one is recorded rather than silently ignored."""
+    if not os.path.exists(path):
+        return {}
     try:
         with open(path) as f:
             return json.load(f)
-    except (OSError, ValueError):
-        return {}
+    except ValueError as e:
+        CONFIG_ERRORS.append(f"{path}: not valid JSON ({e}). Using defaults for everything in it. "
+                             f"JSON has no comments — a line starting with // will do this.")
+    except OSError as e:
+        CONFIG_ERRORS.append(f"{path}: cannot read ({e}).")
+    return {}
+
+
+SOURCES = {}   # (section, key) -> "default" | "config.json" | "$LACUNA_<NAME>"
 
 
 def load():
-    """The effective configuration, as a plain dict."""
+    """The effective configuration, as a plain dict. Fills SOURCES with each value's origin."""
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
-    _merge(cfg, _read_json(os.path.join(DATA, "config.json")))
+    SOURCES.clear()
+    del CONFIG_ERRORS[:]        # load() may run twice (import, then __main__); do not duplicate
+    for section, body in cfg.items():
+        if isinstance(body, dict):
+            for key in body:
+                SOURCES[(section, key)] = "default"
+    from_file = _read_json(os.path.join(DATA, "config.json"))
+    for section, body in (from_file or {}).items():
+        if isinstance(body, dict):
+            for key in body:
+                SOURCES[(section, key)] = "config.json"
+    _merge(cfg, from_file)
     for env, (section, key) in ENV_KEYS.items():
         v = os.environ.get(f"LACUNA_{env}")
         if v:
             cfg[section][key] = v
+            SOURCES[(section, key)] = f"$LACUNA_{env}"
     # Paths are written by hand in config.json, so "~/books" and "$HOME/books" must work.
     # Without this a tilde becomes a literal directory named "~" and the error is baffling.
     cfg["paths"] = {k: os.path.expanduser(os.path.expandvars(v)) if isinstance(v, str) else v
@@ -160,12 +185,21 @@ if __name__ == "__main__":
     if "--json" in sys.argv:
         print(json.dumps({**cfg, "data_dir": DATA, "prices": {k: list(v) for k, v in prices().items()}}, indent=2))
     else:
+        def src(section, key):
+            s = SOURCES.get((section, key), "default")
+            return "" if s == "default" else f" [{s}]"
+
+        for e in CONFIG_ERRORS:
+            print(f"!  {e}")
         print(f"data dir   {DATA}" + ("" if os.path.isdir(DATA) else "   (missing — run `lacuna doctor`)"))
-        print(f"parser py  {path('python')}"
-              + ("" if os.path.exists(path('python')) else "   (missing — run `lacuna doctor --install-pdf`)"))
-        print(f"books      {path('books')}")
-        print(f"results    {path('results')}")
-        print("roles      " + "  ".join(f"{k}={v}" for k, v in cfg["models"].items()))
+        for name in ("python", "books", "cache", "results", "ledger"):
+            label = {"python": "parser py"}.get(name, name)
+            missing = ("   (missing — run `lacuna doctor --install-pdf`)"
+                       if name == "python" and not os.path.exists(path(name)) else "")
+            print(f"{label:10s} {path(name)}{src('paths', name)}{missing}")
+        print("roles      " + "  ".join(f"{k}={v}{src('models', k)}" for k, v in cfg["models"].items()))
+        print("effort     " + "  ".join(f"{k}={v}{src('effort', k)}" for k, v in cfg["effort"].items()))
         hooks = {k: v for k, v in cfg.get("after", {}).items() if v}
         print("after      " + ("  ".join(f"{k}={v}" for k, v in hooks.items()) if hooks else "(none)"))
-        print("effort     " + "  ".join(f"{k}={v}" for k, v in cfg["effort"].items()))
+        print(f"budget     warn above ${cfg.get('budget_warn_usd', 0):.2f}   idle {cfg.get('idle_minutes')} min")
+        print("\nValues marked [config.json] or [$LACUNA_*] override the built-in default.")

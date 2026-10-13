@@ -16,7 +16,7 @@ change — the section at the end says which parts those are.
 ## 1. The data directory
 
 ```
-$LACUNA_DATA/          default ~/.lacuna, or $CLAUDE_PLUGIN_DATA when installed as a plugin
+$LACUNA_DATA/          default ~/.lacuna — one location, whether called from a hook or a shell
 ├── config.json               your settings (schema below)
 ├── pricing.json              optional: your price table, layered over the shipped one
 ├── calibration.json          cost/time per model × effort, from your own runs
@@ -59,9 +59,17 @@ Each model value is passed verbatim to `claude --model`, so an alias (`haiku`, `
 `fable`) or a pinned id (`claude-opus-5`) both work. Prefer an alias unless you need a specific
 version pinned; prefer a pinned id when you need reproducibility across a study.
 
-Every key also has an environment override for one-off runs and CI: `LACUNA_READER`,
-`LACUNA_PLANNER`, `LACUNA_PYTHON`, `LACUNA_BOOKS`, and so on. Environment beats
-file beats default.
+Some keys have an environment override for one-off runs and CI. Environment beats file beats
+default, and `lacuna config` marks which layer each value came from. The full list:
+
+| | |
+|---|---|
+| models | `LACUNA_READER`, `LACUNA_DIGESTER`, `LACUNA_PLANNER`, `LACUNA_VERIFIER`, `LACUNA_CODER`, `LACUNA_TESTER` |
+| paths | `LACUNA_PYTHON`, `LACUNA_BOOKS`, `LACUNA_CACHE`, `LACUNA_RESULTS`, `LACUNA_LEDGER` |
+| data directory | `LACUNA_DATA` (the one place everything else lives under) |
+| cache guard | `LACUNA_IDLE_MIN`, `LACUNA_MIN_CTX`, `LACUNA_GUARD_OFF=1` |
+
+`effort.*`, `after.*` and `budget_warn_usd` are **file-only** — there is no environment override.
 
 ## 3. `after.*` — run your own command when a stage finishes
 

@@ -6,21 +6,35 @@ anything. A book with no embedded TOC cannot be split this way and is reported r
 """
 import json, os, re, sys, textwrap
 
+
+def die2(msg):
+    """Bad input."""
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def die3(msg):
+    """A dependency or a parse is missing."""
+    print(msg, file=sys.stderr)
+    sys.exit(3)
+
+
+if len(sys.argv) != 3:
+    die2(__doc__.strip().splitlines()[2])
+
 try:
     import pymupdf
 except ImportError:
-    sys.exit("ERROR: split-book needs pymupdf, which comes with the default parser.\n"
-             "Run `lacuna doctor --install-pdf`, then run split-book again.")
-if len(sys.argv) != 3:
-    sys.exit(__doc__.strip().splitlines()[2])
+    die3("ERROR: split-book needs pymupdf, which comes with the default parser.\n"
+         "Run `lacuna doctor --install-pdf`, then run split-book again.")
 pdf, outdir = sys.argv[1], sys.argv[2]
 if not os.path.exists(pdf):
-    sys.exit(f"ERROR: no such file: {pdf}")
+    die2(f"ERROR: no such file: {pdf}")
 os.makedirs(outdir, exist_ok=True)
 doc = pymupdf.open(pdf)
 toc = [(lvl, title, page) for lvl, title, page in doc.get_toc() if lvl == 1]
 if not toc:
-    sys.exit(f"ERROR: {os.path.basename(pdf)} has no top-level table of contents, so it cannot be "
+    die2(f"ERROR: {os.path.basename(pdf)} has no top-level table of contents, so it cannot be "
              f"split by chapter. Parse it as one document instead: `lacuna lit read {pdf}`.")
 rows = []
 for i, (_, title, start) in enumerate(toc):

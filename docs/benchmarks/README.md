@@ -5,8 +5,8 @@ Four studies, run October 2026, that produced the defaults this plugin ships. Re
 
 | Study | What it measured | n | Spend |
 |---|---|---|---|
-| [lit-reading.md](lit-reading.md) | model tier × reasoning effort on extracting open problems | 30 runs, 2 documents | $55.92 |
-| [lit-synthesis.md](lit-synthesis.md) | reader tier × synthesiser tier, and whether reference books help | 20 plans | $52.25 |
+| [lit-reading.md](lit-reading.md) | model tier × reasoning effort on extracting open problems | 30 runs (15 cells × 2 repeats) | $55.92 |
+| [lit-synthesis.md](lit-synthesis.md) | reader tier × synthesiser tier, and whether reference books help | 18 plans | $39.56 |
 | [code-writing.md](code-writing.md) | three tiers implementing one specification, blind-reviewed | 3 runs, 1 task | $2.33 |
 | [pdf-parsers.md](pdf-parsers.md) | 9 PDF-to-markdown parsers on fact recall, speed and token cost | 9 × 3 documents | — |
 
@@ -37,7 +37,7 @@ the same numbers for your own corpus:
 
 ```bash
 lacuna lit read <your documents> --out notes/ --brief "<your project>"   # reader cost per document
-lacuna lit synth --notes notes/ --repo <your repo> --out plan.md         # synthesis cost
+lacuna lit synth --notes notes/ --repo <your repo> --out plan.md --kind plan   # synthesis cost
 lacuna lit verify --target plan.md --repo <your repo> --notes notes/     # error rate per plan
 ```
 
