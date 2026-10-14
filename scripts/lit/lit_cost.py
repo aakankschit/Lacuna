@@ -45,6 +45,7 @@ def pdf_text(path):
                             path], capture_output=True, text=True)
         if r.returncode == 0:
             return r.stdout
+        die2(f"ERROR: cannot read {os.path.basename(path)}: corrupt, encrypted, or not a PDF. `lacuna lit read` would fail on it too.")
     if shutil.which("pdftotext"):
         return subprocess.run(["pdftotext", path, "-"], capture_output=True, text=True).stdout
     die3("ERROR: estimating a PDF needs either the parser venv (`lacuna doctor --install-pdf`) "

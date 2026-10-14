@@ -140,8 +140,9 @@ against $2.08), which no routing comparison here had been counting.
 
 ## What this does not show
 
-- **One task, one run per model.** An algorithm-mirroring task in Python. Nothing here generalises
-  to UI code, data plumbing or refactoring, and a second run could reorder the tiers.
+- **Two tasks, one run per model each.** An algorithm-mirroring task and a CLI flag, both in Python.
+  Nothing here generalises to UI code, data plumbing or refactoring, and a second run could reorder
+  the tiers.
 - The judges agreed closely on verdicts and on the main defect, and that defect was then confirmed
   mechanically — but they are models, scoring with a rubric.
 - **Two bugs in the author's own hidden test surfaced during grading**, both fixed before these

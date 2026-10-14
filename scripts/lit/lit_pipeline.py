@@ -36,7 +36,7 @@ PROMPT_VERSION = "1"
 
 # Bump when prep_md's clean() or validate() changes: the parsed-markdown cache is keyed on this,
 # so without it a change to parsing never reaches a document that has already been parsed.
-PARSE_VERSION = "2"
+PARSE_VERSION = "3"
 
 EX_OK, EX_INPUT, EX_PARSE, EX_MODEL = 0, 2, 3, 4   # exit codes, so callers can branch
 
@@ -235,8 +235,10 @@ def cmd_read(a):
     books = "" if a.no_books else books_block()
     # The cache key must cover every input that changes what the note says. A boolean "books on"
     # is not enough: adding or removing a book changed nothing, so the old note came back as
-    # "cached (free)" still citing a book that was no longer there.
-    books_fp = hashlib.sha256(books.encode()).hexdigest()[:8]
+    # "cached (free)" still citing a book that was no longer there. Nor is the list of books:
+    # a book re-split into new chapters is a different book, so the indexes themselves count.
+    indexes = "".join(open(t, "rb").read().decode(errors="ignore") for t in re.findall(r"- index: (\S+)", books))
+    books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]
     reader_effort = lacuna_config.effort("reader")
     jobs = []
     for src in a.papers:
@@ -248,7 +250,7 @@ def cmd_read(a):
             [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
         # md may be "<name>_<pdf-hash>[_<parser>].md" from the parse cache; the note is just <name>.
-        stem = re.sub(r"_[0-9a-f]{12}(_p\d+)?(_[a-z0-9]+)?$", "", os.path.basename(md)[:-3])
+        stem = re.sub(r"_[0-9a-f]{12}(_p\d+)?(_[a-z0-9]+)?$", "", os.path.splitext(os.path.basename(md))[0])
         jobs.append((md, f"{out_dir}/{stem}.md", f"{CACHE}/notes/{stem}_{key}.md"))
 
     def one(md, out, cached):
@@ -265,7 +267,7 @@ def cmd_read(a):
             NOTE_TEMPLATE, f"Paper:\n- {md} -> {out}", "Keep the note under 1,100 words."] if x)
         res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, BOOKS_DIR],
                      effort=lacuna_config.effort("reader"), cwd=out_dir)
-        ok = usable_output(out, 400, "note")
+        ok = usable_output(out, 400, "note", must_contain=("## Claim",))
         # source_tokens makes the calibration recipe in docs/extending.md actually runnable
         # effort and source_tokens are both required by the recalibration recipe in
         # docs/extending.md, which is per model x effort.
@@ -276,6 +278,8 @@ def cmd_read(a):
         if ok:
             shutil.copy(out, cached)
             return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
+        if os.path.exists(out):
+            os.remove(out)      # an apology left in --out would be read as a note by the next synth
         why = str(res.get("result"))[:120] if res.get("is_error") else "agent produced no note file"
         return os.path.basename(out), f"FAILED ${usd(res):.4f} — {why}", usd(res)
 
@@ -296,22 +300,31 @@ def cmd_read(a):
 # Phrases a model writes when it could not do the job. A file of apologies passes any size check,
 # which is how a blocked run came to report success and fire the user's after.* hook.
 REFUSAL_MARKERS = (
-    "blocked", "not completed", "cannot complete", "could not complete", "unable to complete",
+    "not completed", "cannot complete", "could not complete", "unable to complete",
     "i can't help", "i cannot help", "i'm unable to", "i am unable to", "no files were found",
-    "unable to read", "could not read any", "cannot access", "i don't have access",
+    "unable to read", "could not read any", "i don't have access",
 )
 
 
-def usable_output(path, min_bytes, what):
+def usable_output(path, min_bytes, what, must_contain=()):
     """True when a stage produced real output, not a short file or an explanation of failure.
 
     Size alone is not evidence: a model that cannot do the job writes a fluent paragraph saying so.
+    Structure is the strongest evidence: a note that lacks the template's headings is not a note,
+    whatever it says. The phrases are the ones an apology uses; bare words are not safe, since
+    "blocked" once discarded a paid note whose claim was about blocked sampling.
     """
     if not os.path.exists(path) or os.path.getsize(path) < min_bytes:
         return False
     with open(path, errors="ignore") as f:
-        head = f.read(1200).lower()
-    hit = next((m for m in REFUSAL_MARKERS if m in head), None)
+        head = f.read(1200)
+    missing = next((m for m in must_contain if m not in head), None)
+    if missing:
+        print(f"  ! the {what} has no {missing!r} section — treating it as a failed run, not output", file=sys.stderr)
+        return False
+    hit = next((m for m in REFUSAL_MARKERS if m in head.lower()), None)
+    if "BLOCKED" in head[:400]:      # a status marker in capitals, as a blocked agent writes it
+        hit = "BLOCKED"
     if hit:
         print(f"  ! the {what} opens with {hit!r} — treating it as a failed run, not output",
               file=sys.stderr)

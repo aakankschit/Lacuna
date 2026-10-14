@@ -114,13 +114,12 @@ def main():
             # "1h cache · 42m left", never "1h 42m left" — which reads as a single duration
             l1.append(f"cache {c(col, '●')} " + (f"{ttl} cache · " if ttl else "")
                       + c(col, dur(left) + " left"))
-        elif pc:
-            # We know the cache state and it has expired.
+        elif pc.get("expires_at"):
+            # We were given an expiry time and it has passed: the cache is cold.
             l1.append(c(203, f"cache ○ cold · next prompt re-caches ≈${ctx * w1 / 1e6:.2f}"))
-        # No prompt_cache at all: Claude Code has not reported one yet (it omits the field before
-        # a process's first request, e.g. straight after a resume). Say nothing rather than
-        # announce a cold cache that may well be warm — the docs promise an absent segment, and a
-        # red dollar figure on a warm cache is worse than no figure.
+        # No expiry time (the field is absent before a process's first request, and null when the
+        # last response had no cache tokens): say nothing rather than announce a cold cache that
+        # may well be warm. A red dollar figure on a warm cache is worse than no figure.
         if ctx >= 150_000:
             l1.append(c(221, "→ /compact or handoff at next break"))
     else:

@@ -1,7 +1,7 @@
 """PDF -> reference-stripped, line-wrapped markdown for agent reading, with validation and fallback.
 
 Default parser is pymupdf4llm (~4 s/document, markdown headings and tables, no control characters).
-If the parse fails validation, retry with docling (~73 s/document, 100% fact recall in the
+If the parse fails validation, retry with docling (~1 min/document, 100% fact recall in the
 parser bake-off; see docs/benchmarks/pdf-parsers.md). A parse that fails both is reported rather than passed downstream: a bad parse can look
 like valid markdown, so silence is not success.
 
@@ -16,11 +16,14 @@ sys.path.insert(0, os.path.dirname(HERE))
 import lacuna_config
 
 DATA = lacuna_config.DATA
-# Leading junk covers ACS's "■ REFERENCES", numbered headings, and bold/heading markers.
-REF = re.compile(r"\n[#*\s■□●▪•]*\**\s*(?:\d+[.)]\s*)?(References|Bibliography|"
-                 r"References and Notes|Literature Cited)\**[:\s]*\n", re.I)
-# Any heading. Used to find where the citation block ends, so material a journal places AFTER the
-# references (acknowledgements, data availability, Extended Data legends) is not lost with them.
+# A reference-list heading. The leading junk covers numbered headings, bold markers and ACS's
+# "■ REFERENCES", which pymupdf4llm renders as "# ■<sup>**REFERENCES**</sup>" — hence the tags.
+REF = re.compile(r"\n[#*\s■□●▪•]*(?:<[^>\n]*>)*\**\s*(?:\d+[.)]\s*)?(References|Bibliography|"
+                 r"References and Notes|Literature Cited)\**(?:<[^>\n]*>)*[:\s]*\n", re.I)
+# One citation entry: a numbered paragraph that carries a year. Measured on three journal papers,
+# the list cannot be cut as a block: a "Publisher's Note" box lands between entries 2 and 3, Nature
+# puts a second list before Methods, and acknowledgements and Extended Data legends follow the last.
+ENTRY = re.compile(r"\s*(?:[-*]\s+)?(?:\(\d{1,4}\)|\[\d{1,4}\]|\d{1,4}[.)])\s.*\b(?:1[89]|20)\d{2}\b", re.S)
 HEADING = re.compile(r"\n#{1,4}\s+\S")
 CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 # each parser runs in its own venv so their dependencies never collide
@@ -72,16 +75,16 @@ def pdf_stats(pdf):
 def parse(pdf, parser):
     py = VENVS.get(parser)
     if not py or not os.path.exists(py):
-        return None, f"{parser}: venv missing ({py})"
+        return None, f"venv missing ({py})"
     r = subprocess.run([py, "-I", "-c", SCRIPTS[parser], pdf], capture_output=True, text=True,
                        stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         # Keep enough to see the exception type and its message. 160 characters reliably cut the
         # cause off the front of a traceback and left only the final frame.
         err = (r.stderr or "").strip()
-        lines = [l for l in err.splitlines()
-                 if l.strip() and not l.lstrip().startswith(("File \"", "  "))]
-        return None, f"{parser}: " + (" | ".join(lines[-3:]) if lines else err[-400:])
+        lines = [l for l in err.splitlines()      # drop the indented source and caret lines
+                 if l.strip() and not l.startswith((" ", "\t")) and not l.lstrip().startswith('File "')]
+        return None, " | ".join(lines[-3:]) if lines else err[-400:]
     return r.stdout, None
 
 
@@ -99,8 +102,10 @@ def validate(md, pages, raw_chars=0):
     if raw_chars > 2000 and len(md) < raw_chars * KEEP_FRACTION:
         bad.append(f"kept only {len(md) / raw_chars:.0%} of the document's {raw_chars:,} "
                    f"characters ({len(md):,}) — the parse is truncated")
-    elif not raw_chars and len(md) < 1200 * max(pages, 1) * 0.25:
-        bad.append(f"only {len(md):,} chars for {pages} pages")   # no baseline available
+    # The floor stays even with a baseline: pymupdf's own count is also tiny for a mostly scanned
+    # document, and a one-page text layer must not pass the other eleven pages as read.
+    if len(md) < 1200 * max(pages, 1) * 0.25:
+        bad.append(f"only {len(md):,} chars for {pages} pages")
     n_ctrl = len(CTRL.findall(md))
     if n_ctrl > CTRL_BUDGET:
         bad.append(f"{n_ctrl} control characters")
@@ -111,27 +116,34 @@ def validate(md, pages, raw_chars=0):
     return bad
 
 
-def clean(md):
-    """Strip trailing reference lists, control characters, and rewrap.
+def body(tail):
+    """Everything after a References heading, minus the citation entries.
 
-    Only a reference list in the last part of the document is cut, and only the citation block
-    itself. Journal formats put a second reference list before Methods, and put acknowledgements,
-    data-availability notes and Extended Data legends *after* the references — cutting from the
-    last heading to the end dropped 18% of one real paper, legends included.
+    An author-year list has no numbered entries to recognise; it is cut to the next heading, which
+    keeps whatever section follows it.
     """
-    # Only the LAST "References" heading is the real citation list; an earlier one is usually a
-    # contents-page entry. Cut from there to the NEXT heading rather than to the end of the file:
-    # journals put acknowledgements, data availability and Extended Data legends after the
-    # citations, and cutting to the end dropped 18% of one real paper, legends included.
-    found = list(REF.finditer(md))
-    if found:
-        last = found[-1]
-        tail = md[last.end():]
-        resume = HEADING.search(tail)
-        md = md[:last.start()] + (tail[resume.start():] if resume else "")
+    paras = re.split(r"\n\s*\n", tail)
+    kept = [p for p in paras if not ENTRY.match(p)]
+    if len(kept) == len(paras):
+        m = HEADING.search("\n" + tail)
+        return tail[max(0, m.start() - 1):] if m else ""
+    return "\n\n".join(kept)
+
+
+def clean(md):
+    """Strip citation entries, control characters, and rewrap.
+
+    From the first References heading on, every numbered paragraph with a year in it goes; prose,
+    headings and legends stay. Cutting the list as a block was measured wrong both ways: to the
+    end of the file it dropped 18% of one paper, legends included; to the next heading it kept
+    all but two entries of another, because the parser puts a heading inside the list.
+    """
+    first = next(REF.finditer(md), None)
+    if first:
+        md = md[:first.start()] + "\n" + body(md[first.end():])
     md = CTRL.sub("", md)
-    return "\n".join(l for ln in md.splitlines()
-                     for l in (textwrap.wrap(ln, 300, break_long_words=False) or [""]))
+    return "\n".join(l for ln in md.splitlines()           # a table row stays one line, however wide
+                     for l in ([ln] if ln.lstrip().startswith("|") else textwrap.wrap(ln, 300, break_long_words=False) or [""]))
 
 
 def convert(pdf, out, forced=None, equations=False, quiet=False):

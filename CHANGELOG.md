@@ -5,8 +5,50 @@ price table makes every cost figure wrong without looking wrong.
 
 ## Unreleased
 
-Audited by two independent Opus 5.5 agents, one executing every documented command against the
-code, one writing tests for the untested surface. ~120 claims checked, 37 defects fixed.
+**Review of the seven unreviewed commits** (2026-10-13), against the real papers and with two
+independent reviewers. Found and fixed, in order of harm:
+
+- **Reference stripping did not work on the default parser.** The ACS heading the commit claimed
+  to cover is rendered by pymupdf4llm as `# ■<sup>**REFERENCES**</sup>`, which the regex missed, so
+  one paper's whole bibliography (9% of its tokens) went to every reader; and "cut to the next
+  heading" stopped after two entries of another paper because the parser puts a "Publisher's Note"
+  box inside the list. Citations are now stripped entry by entry, from the first References heading
+  on, and everything that is not a numbered entry with a year stays. Measured on three papers:
+  every entry gone, every legend and acknowledgement kept. `PARSE_VERSION` is 3, and a test now
+  fails if the parser changes without a bump (it was changed once without one).
+- **A note was discarded over an ordinary word.** The refusal check matched "blocked" and "cannot
+  access" anywhere in a note; a paid note about blocked sampling was thrown away and re-paid on
+  every retry. A note is now judged by its structure (the template's `## Claim` heading), the
+  phrase list is only what an apology says, and the one bare word kept is `BLOCKED` in capitals.
+- **A rejected note stayed in `--out`**, where the next `synth` read it as literature. It is removed.
+- **A mostly scanned PDF passed validation** because the per-page floor was dropped whenever the
+  PDF had any text at all, so the OCR fallback never ran. Both checks apply now.
+- **`split-book` chose level 1 by counting entries**, so an e-book with Cover, Copyright, Contents
+  and Preface bookmarks still got 140-page chapters. The level is chosen by how coarse its largest
+  chapter is.
+- **The cache guard raised at import** on a hand-edited `idle_minutes`, breaking every prompt; and
+  its compaction check treated any undated line as a recent compaction, switching itself off.
+- **`lacuna config` crashed** on the string `budget_warn_usd` that `lit estimate` had been taught
+  to tolerate. A null `effort` crashed `read`. A `.txt` document got a note named `paper..md`.
+- The status line called a `prompt_cache` with no expiry time "cold"; `lit estimate` told a user
+  with a corrupt PDF to install the parser they had; the parse-error filter could never match
+  what it meant to drop; table rows wider than 300 characters were split in two.
+- The note cache key now covers the contents of the book indexes offered, not only their paths,
+  so a re-split book is a different book.
+- The default `tester` is `sonnet`: the skill and the benchmark both say the strong tier's edge as
+  test author did not replicate, and the default disagreed with both.
+- Documentation corrected where it still asserted what the commits retracted: the marker
+  concurrency rule and its cause, what validation checks, llama.cpp's role, docling's timing, the
+  dev-cycle headless recipe (it named a file that does not ship), the second task's sample size.
+
+**The suite.** Four files and 193 tests, 2,978 lines, became three files by level and 65 tests,
+about 1,700 lines, with one fake `claude` in `tests/support.py`. The old suite let 24 of 117
+injected defects through, among them twelve audit fixes with no test; the new one is held to
+`tools/mutate.py`, 126 defects, every one killed. `TESTING.md` is the strategy.
+
+**Earlier in this cycle.** Audited by two independent Opus 5.5 agents, one executing every
+documented command against the code, one writing tests for the untested surface. ~120 claims
+checked, 37 defects fixed.
 
 **Behaviour changes worth knowing about:**
 

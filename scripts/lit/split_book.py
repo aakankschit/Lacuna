@@ -46,21 +46,28 @@ def entries_at(level):
     return [(t, p) for lvl, t, p in full_toc if lvl == level and 0 < p <= doc.page_count]
 
 
-# Pick the shallowest level that actually divides the book: the first with at least 5 entries,
-# otherwise whichever level has the most. A book organised in Parts has two or three level-1
-# entries over hundreds of pages — splitting there gives 240-page "chapters" and a toc.md that
-# names none of the real ones.
-USEFUL = 5
-counts = {lvl: len(entries_at(lvl)) for lvl in (1, 2, 3) if entries_at(lvl)}
-level = next((lvl for lvl in sorted(counts) if counts[lvl] >= USEFUL),
-             max(counts, key=lambda lvl: (counts[lvl], -lvl)) if counts else 1)
+def largest_chapter(level):
+    """Pages in the longest run between consecutive entries at this level; the last runs to the end."""
+    starts = sorted({p for _, p in entries_at(level)})
+    return max(b - a for a, b in zip(starts, starts[1:] + [doc.page_count + 1]))
+
+
+# Pick the shallowest level whose largest chapter is under a quarter of the book, else the level
+# with the smallest largest chapter. Counting entries does not work: a book organised in Parts has
+# three level-1 entries over hundreds of pages, and an e-book has Cover, Copyright, Contents and
+# Preface at level 1 beside them — either way toc.md would name none of the real chapters.
+COARSE = 0.25
+largest = {lvl: largest_chapter(lvl) for lvl in (1, 2, 3) if entries_at(lvl)}
+level = next((lvl for lvl in sorted(largest) if largest[lvl] <= COARSE * doc.page_count),
+             min(largest, key=lambda lvl: (largest[lvl], lvl)) if largest else 1)
 toc = entries_at(level)
 if not toc:
     die2(f"ERROR: {os.path.basename(pdf)} has a table of contents, but none of its entries point "
          f"at a valid page. Parse it as one document instead.")
 if level > 1:
-    print(f"  splitting at TOC level {level}: level 1 had {len(entries_at(1))} entries for "
-          f"{doc.page_count} pages, which is too coarse to be useful.", file=sys.stderr)
+    print(f"  splitting at TOC level {level}: level 1 "
+          + (f"would give a {largest[1]}-page chapter" if 1 in largest else "has no usable entries")
+          + f" in a {doc.page_count}-page book.", file=sys.stderr)
 
 # Bookmarks are not guaranteed to be sorted, and two chapters may claim the same start page.
 toc.sort(key=lambda tp: tp[1])
@@ -73,9 +80,6 @@ for title, start in toc:
         continue
     deduped.append((title, start))
 toc = deduped
-if len(toc) < 5 and doc.page_count > 150:
-    print(f"  ! only {len(toc)} entries for {doc.page_count} pages — the chapters will be large. "
-          f"Check toc.md names what you expect before relying on it.", file=sys.stderr)
 rows = []
 for i, (title, start) in enumerate(toc):
     end = toc[i + 1][1] - 1 if i + 1 < len(toc) else doc.page_count
@@ -91,6 +95,10 @@ for i, (title, start) in enumerate(toc):
         print(f"  ! {title!r} (pp. {start}-{end}) extracted almost no text — the PDF may have no "
               f"text layer there, or its bookmarks may be out of page order", file=sys.stderr)
     rows.append({"file": fn, "title": title, "pages": [start, end], "chars": len(text), "tok": round(len(text) / 2.9)})
+widest = max(r["pages"][1] - r["pages"][0] + 1 for r in rows)
+if widest > COARSE * doc.page_count:
+    print(f"  ! the largest chapter covers {widest} of {doc.page_count} pages — check that toc.md "
+          f"names what you expect before relying on it", file=sys.stderr)
 with open(f"{outdir}/index.json", "w") as f:
     json.dump(rows, f, indent=1)
 

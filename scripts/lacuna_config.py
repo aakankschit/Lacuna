@@ -30,7 +30,7 @@ DEFAULTS = {
         "planner":  "claude-opus-5",  # turns notes into ranked proposals. The one place a strong model pays.
         "verifier": "haiku",          # grep-only fact check. Cheap, and catches the dominant error class.
         "coder":    "sonnet",         # implements a pinned contract
-        "tester":   "claude-opus-5",  # writes tests blind to the implementation
+        "tester":   "sonnet",         # writes tests blind to the implementation; the strong tier's edge here did not replicate
     },
     # Effort is a cost multiplier, not a quality lever (up to 43x for no measured gain).
     # Raise it only for the verifier, where it is cheap and does help.
@@ -147,7 +147,7 @@ def model(role):
 
 
 def effort(role):
-    return CONFIG["effort"].get(role, "medium")
+    return CONFIG["effort"].get(role) or "medium"
 
 
 def path(name):
@@ -210,6 +210,10 @@ if __name__ == "__main__":
             s = SOURCES.get((section, key), "default")
             return "" if s == "default" else f" [{s}]"
 
+        def _fmt_usd(v):   # config.json is hand-edited; a string here must not crash this report
+            return f"${v:.2f}" if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                else f"{v!r} (not a number, so the budget check is off)"
+
         for e in CONFIG_ERRORS:
             print(f"!  {e}")
         print(f"data dir   {DATA}" + ("" if os.path.isdir(DATA) else "   (missing — run `lacuna doctor`)"))
@@ -222,5 +226,5 @@ if __name__ == "__main__":
         print("effort     " + "  ".join(f"{k}={v}{src('effort', k)}" for k, v in cfg["effort"].items()))
         hooks = {k: v for k, v in cfg.get("after", {}).items() if v}
         print("after      " + ("  ".join(f"{k}={v}" for k, v in hooks.items()) if hooks else "(none)"))
-        print(f"budget     warn above ${cfg.get('budget_warn_usd', 0):.2f}   idle {cfg.get('idle_minutes')} min")
+        print(f"budget     warn above {_fmt_usd(cfg.get('budget_warn_usd'))}   idle {cfg.get('idle_minutes')} min")
         print("\nValues marked [config.json] or [$LACUNA_*] override the built-in default.")

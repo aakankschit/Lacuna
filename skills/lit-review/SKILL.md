@@ -71,8 +71,9 @@ Which model fills each role comes from config (`lacuna config` to see it; `model
 - **Effort is a cost multiplier, not a quality lever.** Up to 47× the cost from low to max for no
   measured gain on reading or synthesis. The pipeline fixes effort at medium, and high only for the
   verifier, where it is cheap and does help.
-- **Notes are cached**, keyed by document content *plus* the reader model, the brief and the prompt
-  version — so re-running is free, but changing any of those correctly misses the cache. Six notes
+- **Notes are cached**, keyed by document content *plus* the reader model and effort, the brief, the
+  prompt version and the books offered — so re-running is free, but changing any of those correctly
+  misses the cache. Six notes
   are ~9k tokens against ~104k for six papers, so every later synthesis is ~11× cheaper.
 - **The synthesiser gets an authoritative file list** (`git ls-files`, or a filtered walk outside a
   repo) and is told to grep before naming a path. In the 18-plan grid no plan named a file or class
@@ -84,7 +85,7 @@ Which model fills each role comes from config (`lacuna config` to see it; `model
 ## PDF parsing
 
 `read` parses with **pymupdf4llm** (~4 s/document), validates the output, and falls back to
-**docling** (~73 s/document) if validation fails. A document that fails both is reported, not passed
+**docling** (~1 min/document, with OCR) if validation fails. A document that fails both is reported, not passed
 downstream — there is deliberately no plain-text fallback. `--equations` routes to **marker** when LaTeX fidelity matters (~34 expressions/document against
 ~1 elsewhere, at 91–130 s and +14% raw tokens). It needs ~3 GB of venv and models.
 

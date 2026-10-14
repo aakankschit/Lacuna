@@ -2,7 +2,7 @@
 name: test-author
 description: Writes adversarial tests from a pinned contract, deliberately without seeing the implementation. Use whenever a silent divergence would be expensive — algorithm changes, numerical code, anything mirroring an existing class.
 tools: Read, Grep, Glob, Write, Edit, Bash
-model: opus
+model: sonnet
 effort: medium
 ---
 

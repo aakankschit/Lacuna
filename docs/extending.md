@@ -23,7 +23,7 @@ $LACUNA_DATA/          default ~/.lacuna — one location, whether called from a
 ├── cost-ledger.jsonl         one line per pipeline stage: stage, model, cost, wall time, outcome
 ├── cache/
 │   ├── md/                   parsed documents, keyed by content hash
-│   └── notes/                notes, keyed by content + model + brief + prompt version
+│   └── notes/                notes, keyed by content + model + effort + brief + prompt version + books
 ├── books/<name>/             chapter files plus toc.md, from `lacuna lit split-book`
 └── cache_guard/              per-session hook state
 ```
@@ -44,7 +44,7 @@ so adding your own is harmless but has no effect.
     "planner":  "claude-opus-5",
     "verifier": "haiku",
     "coder":    "sonnet",
-    "tester":   "claude-opus-5"
+    "tester":   "sonnet"
   },
   "effort":  { "reader": "medium", "digester": "medium", "planner": "medium",
                "verifier": "high", "coder": "medium", "tester": "medium" },
@@ -139,8 +139,8 @@ import; Lacuna stays ignorant of the app.
 `paths.cache` is movable, but a notes app is the wrong destination for it, and the reason is
 specific rather than stylistic.
 
-The cache key is a hash of the **inputs** — document content, prompt version, reader model, brief —
-and never of the note's text. On a hit, the cached file is returned as-is. So if you edit a cached
+The cache key is a hash of the **inputs** — document content, prompt version, reader model and
+effort, brief, the book indexes offered — and never of the note's text. On a hit, the cached file is returned as-is. So if you edit a cached
 note in your vault, which is the whole point of having it in a vault, Lacuna will go on serving your
 edited text as the model's output indefinitely: nothing invalidates it, because no input changed.
 You lose the distinction between what the reader wrote and what you wrote, silently and permanently.
@@ -173,6 +173,7 @@ would change the prompt version and correctly invalidate every cached note you a
 
 The shipped `calibration.json` is marked `"_source": "upstream"` and `lacuna lit estimate` says so every
 time it uses it. Those numbers come from someone else's documents on someone else's machine. After a
-dozen of your own runs, rebuild it from `cost-ledger.jsonl`: group by stage and model, take
-`cost / source tokens` and `wall_s`, and replace the rows. Estimates stop being fiction at that
-point.
+dozen of your own runs, rebuild it from `cost-ledger.jsonl`: keep the `read` rows with
+`wrote_note: true`, group them by `model` and `effort`, take `cost / source_tokens * 1000` as
+`usd_per_ktok` and `wall_s / 60` as `minutes_per_paper`, replace the rows, and set `_source` to
+anything but `upstream`. Estimates stop being fiction at that point.

@@ -56,7 +56,7 @@ possible failure mode, because it looks like a saving.
 | Cache | Key covers |
 |---|---|
 | `cache/md` (parsed documents) | PDF bytes, parser choice, `PARSE_VERSION` |
-| `cache/notes` (literature notes) | parsed content, `PROMPT_VERSION`, reader model, reader effort, brief, a fingerprint of the books offered |
+| `cache/notes` (literature notes) | parsed content, `PROMPT_VERSION`, reader model, reader effort, brief, the book indexes offered (their paths and their contents) |
 
 **Bump `PARSE_VERSION` when `clean()` or `validate()` changes. Bump `PROMPT_VERSION` when the
 reader prompt or note template changes.** Otherwise users are served output generated under
@@ -75,7 +75,7 @@ PDF → reference-stripped markdown. Parses, **validates**, falls back, and refu
 is the point: a bad parse looks like perfectly good markdown, so silence is not success. Parsers
 live in separate virtualenvs under `$LACUNA_DATA` because their dependency trees collide.
 
-**Never run two GPU parsers concurrently** — see `docs/benchmarks/pdf-parsers.md`.
+**Never run two marker processes concurrently**: they share model servers, and 22% of a document's text went missing while the output still passed validation. See `docs/benchmarks/pdf-parsers.md`.
 
 ### `scripts/lit/split_book.py`
 Long PDF → per-chapter text files plus `toc.md`, the index a reading agent greps. Must strip
@@ -115,28 +115,12 @@ a pinned id such as `claude-opus-5` is rejected.
 
 ## Testing
 
-| Suite | What it covers |
-|---|---|
-| `tests/test_lacuna.py` | configuration, pricing, cache keys, hooks, the CLI contract |
-| `tests/test_coverage.py` | per-module behaviour: spend, prep_md, split_book, doctor, statusline |
-| `tests/test_integration.py` | whole flows end to end against a fake `claude`: the full read→synth→verify journey, the money guarantees (bad input never reaches a model; a refusal is never filed as output), cache behaviour, `after.*` hooks, and that the cost tools work with nothing installed |
-
-**No test may call a model.** Tests that drive the pipeline put a fake `claude` first on a
-restricted `PATH` and assert it resolved to the fake before running. That is what lets a test prove
-bad input exits *before* any money is spent, and that a cache hit really is free.
-
-`tools/check.sh` runs the whole suite on every Python on the machine in a scrubbed environment
-(`env -i`, a temporary `HOME`, `PATH=/usr/bin:/bin`, so no `rich` and no `tmux`). **Run it before
-pushing.** It exists because the suite was once red on every macOS CI job for one reason: a single
-test counted optional pieces, so its result depended on the host.
-
-**Tests must not depend on what happens to be installed** — not `rich`, not `tmux`, not a parser,
-not the user's own transcripts or home directory. A test whose result changes with the machine is
-worse than no test: it goes red in CI for reasons nobody can reproduce.
-
-Every test should be able to name the wrong implementation it would catch. The suites have been
-mutation-tested; keep that true by injecting the defect you are guarding against and confirming
-the test fails.
+Three suites by level, `tests/test_unit.py`, `tests/test_modules.py` and `tests/test_pipeline.py`,
+with one fake `claude` in `tests/support.py`, and a mutation list in `tools/mutate.py` that every
+test has to justify itself against. **No test may call a model.** [TESTING.md](../TESTING.md) is the
+strategy: what belongs at each level, what belongs at none, and how a test earns or loses its place.
+`tools/check.sh` runs the suite on every Python on the machine in a scrubbed environment; run it,
+and `tools/mutate.py`, before pushing.
 
 ## Where defects keep appearing
 
@@ -149,3 +133,5 @@ Measured, from four independent audits:
    by a `.gitignore` rule for days while working perfectly in the author's checkout.
 5. **Documentation asserting behaviour nobody executed.** Roughly one claim in three was wrong when
    first checked by running it.
+6. **A defect fixed without a test.** Twelve audit fixes had none at the 2026-10-13 review; the suite
+   would have let each regress. The revert of a fix is its mutant (`tools/mutate.py`).
