@@ -154,6 +154,17 @@ def path(name):
     return CONFIG["paths"].get(name) or DEFAULTS["paths"][name]
 
 
+# `claude --model` accepts bare aliases, and so does config.json, but a price table is keyed by
+# concrete ids — so "sonnet" matched nothing and every cost involving an alias silently came out
+# as zero or "unpriced". Map each alias to the version it currently resolves to.
+ALIASES = {"haiku": "haiku-5-5", "sonnet": "sonnet-5-5", "opus": "opus-5-5", "fable": "fable-5-1"}
+
+
+def resolve(model):
+    """A concrete model id for pricing. Passes anything already concrete straight through."""
+    return ALIASES.get((model or "").strip(), model)
+
+
 def _price_table(doc):
     """The {model: 5-tuple} map out of a pricing file, ignoring _comment-style metadata."""
     out = {}

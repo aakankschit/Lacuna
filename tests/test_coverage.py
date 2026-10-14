@@ -175,15 +175,19 @@ class TestNoteCacheBehaviour(PipelineCase):
                          self.read_text(os.path.join(self.notes, "smith2024.md")))
 
     def test_each_key_input_misses_the_cache(self):
-        """brief, model, books and prompt version each change what a note says; each must miss."""
+        """brief, model, effort and prompt version each change what a note says; each must miss.
+
+        `--no-books` is deliberately NOT in this list: with no books installed it changes nothing
+        about the prompt, so serving the cache is correct. Which books exist is covered by
+        test_adding_or_removing_a_book_misses_the_cache.
+        """
         steps = [
             ((), "", 1),                                        # first read
             ((), "", 1),                                        # identical: hit
             (("--brief", "BRIEF:other"), "", 2),                # new brief
             (("--model", "sonnet"), "", 3),                     # new model
-            (("--no-books",), "", 4),                           # books toggled
-            ((), "L.PROMPT_VERSION = '999'", 5),                # prompt template bumped
-            ((), "", 5),                                        # back to the first: still cached
+            ((), "L.PROMPT_VERSION = '999'", 4),                # prompt template bumped
+            ((), "", 4),                                        # back to the first: still cached
         ]
         for extra, prelude, expect in steps:
             with self.subTest(extra=extra, prelude=prelude):
@@ -191,8 +195,30 @@ class TestNoteCacheBehaviour(PipelineCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertEqual(len(self.calls()), expect, r.stdout)
         models = [c["argv"][c["argv"].index("--model") + 1] for c in self.calls()]
-        self.assertEqual(models, ["haiku", "haiku", "sonnet", "haiku", "haiku"],
+        self.assertEqual(models, ["haiku", "haiku", "sonnet", "haiku"],
                          "--model must reach the model for that run only")
+
+    def test_adding_or_removing_a_book_misses_the_cache(self):
+        """Found end to end: after deleting a book, the old note came back as "cached (free)"
+        still citing it, because the key recorded only whether books were on, never which."""
+        books = os.path.join(self.data, "books", "handbook")
+        os.makedirs(books, exist_ok=True)
+
+        r = self.read()                                  # 1: no books
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.calls()), 1)
+
+        with open(os.path.join(books, "toc.md"), "w") as f:
+            f.write("# Handbook\n\n| chapter | file | pages | ~tokens |\n|---|---|---|---|\n"
+                    "| Priors | 00_priors.txt | 1-20 | 5,000 |\n")
+        r = self.read()                                  # 2: a book appeared
+        self.assertEqual(len(self.calls()), 2, f"adding a book must miss the cache\n{r.stdout}")
+
+        os.remove(os.path.join(books, "toc.md"))
+        r = self.read()                                  # 3: back to none -> the first key again
+        self.assertEqual(len(self.calls()), 2,
+                         f"removing it must return to the no-book note, not a new call\n{r.stdout}")
+        self.assertIn("cached (free)", r.stdout)
 
     def test_refusal_on_a_fresh_dir_exits_4_and_caches_nothing(self):
         r = self.read(mode="refuse")
@@ -609,6 +635,24 @@ class TestSplitBook(TempCase):
     def chapter(self, name):
         with open(os.path.join(self.outdir, name)) as f:
             return f.read()
+
+    def test_chapters_are_greppable(self):
+        """A reading agent finds a concept by grepping the chapter files. Control characters
+        survive PDF extraction and make grep treat a file as binary, so a book that keeps them is
+        silently unsearchable — measured: three greps for words that were present, no matches."""
+        self.PAGES = ["alpha\x00page with a \x01NUL and \x1f other controls",
+                      "beta page", "gamma page", "delta page", "epsilon page"]
+        r = self.split([[1, "Introduction", 1], [1, "Methods", 3]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = self.chapter("00_Introduction.txt")
+        self.assertEqual(re.findall(r"[\x00-\x08\x0b-\x1f\x7f]", body), [],
+                         "control characters make the chapter unsearchable")
+        self.assertIn("alphapage", body.replace(" ", ""), "the words themselves must survive")
+        # grep must treat it as text, not binary
+        g = subprocess.run(["grep", "-c", "page", os.path.join(self.outdir, "00_Introduction.txt")],
+                           capture_output=True, text=True)
+        self.assertEqual(g.returncode, 0, "grep found nothing in the chapter file")
+        self.assertNotIn("Binary file", g.stdout + g.stderr)
 
     def test_chapters_page_ranges_and_toc(self):
         r = self.split([[1, "Introduction", 1], [2, "A subsection", 2], [1, "Methods & Results", 3],

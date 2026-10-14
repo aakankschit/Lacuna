@@ -6,6 +6,10 @@ anything. A book with no embedded TOC cannot be split this way and is reported r
 """
 import json, os, re, sys, textwrap
 
+# Control characters survive PDF extraction and make `grep` treat a file as binary, which silently
+# turns a book into something a reading agent cannot search at all. Same set prep_md.py strips.
+CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
 
 def die2(msg):
     """Bad input."""
@@ -36,14 +40,22 @@ toc = [(lvl, title, page) for lvl, title, page in doc.get_toc() if lvl == 1]
 if not toc:
     die2(f"ERROR: {os.path.basename(pdf)} has no top-level table of contents, so it cannot be "
              f"split by chapter. Parse it as one document instead: `lacuna lit read {pdf}`.")
+if len(toc) < 5 and doc.page_count > 150:
+    print(f"  ! only {len(toc)} top-level entries for {doc.page_count} pages — the chapters will be "
+          f"huge. This splits on the top TOC level only; check toc.md names what you expect.",
+          file=sys.stderr)
 rows = []
 for i, (_, title, start) in enumerate(toc):
     end = toc[i + 1][2] - 1 if i + 1 < len(toc) else doc.page_count
     text = "\n".join(doc[p].get_text() for p in range(start - 1, end))
+    text = CTRL.sub("", text)
     text = "\n".join(l for ln in text.splitlines() for l in (textwrap.wrap(ln, 300) or [""]))
     fn = f"{i:02d}_{re.sub(r'[^A-Za-z0-9]+', '_', title)[:40].strip('_')}.txt"
     with open(f"{outdir}/{fn}", "w") as f:
         f.write(f"# {title} (pp. {start}-{end})\n\n{text}")
+    if len(text.strip()) < 200:
+        print(f"  ! {title!r} (pp. {start}-{end}) extracted almost no text — the PDF may have no "
+              f"text layer there, or its bookmarks may be out of page order", file=sys.stderr)
     rows.append({"file": fn, "title": title, "pages": [start, end], "chars": len(text), "tok": round(len(text) / 2.9)})
 with open(f"{outdir}/index.json", "w") as f:
     json.dump(rows, f, indent=1)

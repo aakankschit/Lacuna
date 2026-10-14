@@ -107,7 +107,8 @@ class TestNoteCacheKey(unittest.TestCase):
         with open(os.path.join(ROOT, "scripts", "lit", "lit_pipeline.py")) as f:
             body = f.read()
         key_expr = body[body.index("key = hashlib.sha256"):body.index("jobs.append(")]
-        for part in ("content_h", "PROMPT_VERSION", "reader_model", "a.brief", "a.no_books"):
+        for part in ("content_h", "PROMPT_VERSION", "reader_model", "reader_effort",
+                     "a.brief", "books_fp"):
             self.assertIn(part, key_expr, f"{part} must be part of the note cache key")
         self.assertTrue(L.PROMPT_VERSION, "PROMPT_VERSION must be set")
 

@@ -79,6 +79,13 @@ def main():
     if not files:
         die2("ERROR: no .md, .txt or .pdf documents found in those paths.")
     toks = [tokens(f) for f in files]
+    # A PDF that yields no text is broken, encrypted or a scan; pricing it at $0.00 and exiting 0
+    # tells the user the run is free. A small .md or .txt is simply small, and is left alone.
+    empty = [f for f, t in zip(files, toks) if f.endswith(".pdf") and t < 20]
+    if empty:
+        die2("ERROR: no extractable text in: " + ", ".join(os.path.basename(f) for f in empty)
+             + "\nAn estimate of $0.00 would be meaningless — the file is corrupt, encrypted, or a "
+               "scan with no text layer. `lacuna lit read` would fail on it too.")
     k = max(1, a.per_agent)
     total = sum(toks)
     groups = [toks[i:i + k] for i in range(0, len(toks), k)]
@@ -107,8 +114,8 @@ def main():
         print(f"{m:15s} " + " ".join(cells))
     new_ctx = IDEATION["notes_tok"] * len(files) + IDEATION["context_tok"]
     planner = lacuna_config.model("planner")
-    pr = lacuna_config.prices()
-    _, _, w1h, _, out_price = next((v for k, v in pr.items() if k in planner), (0, 0, 0, 0, 0))
+    pr, concrete = lacuna_config.prices(), lacuna_config.resolve(planner)
+    _, _, w1h, _, out_price = next((v for k, v in pr.items() if k in concrete), (0, 0, 0, 0, 0))
     if not out_price:
         print(f"\n! no price for the planner model {planner!r} in the price table; cannot estimate the "
               f"synthesis step. Add it to {os.path.join(lacuna_config.DATA, 'pricing.json')}.")

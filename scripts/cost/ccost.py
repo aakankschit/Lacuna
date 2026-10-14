@@ -15,6 +15,7 @@ FALLBACK = PRICE.get("opus-5-5") or next(iter(PRICE.values()))
 
 
 def price(model):
+    model = lacuna_config.resolve(model)
     return next((v for k, v in PRICE.items() if k in (model or "")), FALLBACK)
 
 

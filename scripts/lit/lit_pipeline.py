@@ -225,6 +225,11 @@ def cmd_read(a):
     os.makedirs(f"{CACHE}/notes", exist_ok=True)
     reader_model = a.model or lacuna_config.model("reader")
     books = "" if a.no_books else books_block()
+    # The cache key must cover every input that changes what the note says. A boolean "books on"
+    # is not enough: adding or removing a book changed nothing, so the old note came back as
+    # "cached (free)" still citing a book that was no longer there.
+    books_fp = hashlib.sha256(books.encode()).hexdigest()[:8]
+    reader_effort = lacuna_config.effort("reader")
     jobs = []
     for src in a.papers:
         md = to_markdown(src, out_dir, equations=a.equations, parser=a.parser)
@@ -232,7 +237,7 @@ def cmd_read(a):
         content_h = hashlib.sha256(body).hexdigest()[:12]
         # The cache key covers everything that changes what the note says, not just the document.
         key = hashlib.sha256("\0".join(
-            [content_h, PROMPT_VERSION, reader_model, a.brief, str(not a.no_books)]
+            [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
         # md may be "<name>_<pdf-hash>[_<parser>].md" from the parse cache; the note is just <name>.
         stem = re.sub(r"_[0-9a-f]{12}(_[a-z0-9]+)?$", "", os.path.basename(md)[:-3])
@@ -327,6 +332,10 @@ def cmd_synth(a):
         need_file(a.digest, "--digest")
     # The agent runs with cwd set to the output directory, so relative inputs would resolve
     # against the wrong place and it would silently read nothing.
+    if os.path.isdir(a.out):
+        print(f"ERROR: --out {a.out!r} is a directory; give the path of the file to write.",
+              file=sys.stderr)
+        sys.exit(EX_INPUT)
     a.repo = os.path.abspath(a.repo)
     a.out = os.path.abspath(a.out)
     if a.notes:
