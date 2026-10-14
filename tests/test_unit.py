@@ -7,12 +7,12 @@ CLI, a hook, the pipeline) belongs in test_modules.py or test_pipeline.py. See T
 
 Run: python3 -m unittest discover -s tests
 """
-import json, os, re, shutil, subprocess, sys, tempfile, unittest
+import io, json, os, re, shutil, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from support import ROOT, read, write
-import lacuna_config, ccost, prep_md
+import lacuna_config, ccost, prep_md, split_book
 import lit_pipeline as L
 
 
@@ -128,10 +128,29 @@ class TestParse(unittest.TestCase):
             "no headings": (self.GOOD.replace("#", ""), 4, 0, "heading"),
             "no section word": ("# A Title\n\n## Something\n\n" + "word " * 4000, 4, 0, "section"),
         }
+        # A font with no Unicode map: readable headings over a body of unmapped glyphs, as long as
+        # the PDF's own count (which includes them). It passed, and a reader was paid to read it.
+        for name, glyph in (("U+FFFD", "\ufffd"), ("Private Use", "\ue012"), ("docling", "GLYPH<c=3,font=/AB+Minion> ")):
+            md = "".join(f"## {h}\n\n" + (glyph * 60 + " ") * 40 + "\n\n" for h in ("Abstract", "Introduction", "Methods", "Results"))
+            cases[f"unmapped glyphs ({name})"] = (md, 12, len(md), "unreadable")
         for name, (md, pages, raw_chars, word) in cases.items():
             with self.subTest(name):
                 bad = prep_md.validate(md, pages, raw_chars)
                 self.assertTrue(any(word in b for b in bad), f"{name}: {bad}")
+        # ...and the other direction: other scripts are letters, and digits, symbols, equations and
+        # a Word bullet font in Private Use are not a reason to refuse a paper.
+        bullets = "\uf0b7 " * 60
+        readable = {
+            "Chinese": "本文研究了蛋白质结构预测的方法，并在三个数据集上进行了评估。" * 40 + bullets,
+            "Russian": "Мы исследуем метод выборки и оцениваем его на трёх наборах данных. " * 30 + bullets,
+            "equations": ("We minimise $\\mathcal{L}(\\theta) = \\sum_i \\| y_i - f_\\theta(x_i) \\|^2$ over 𝜃 ∈ ℝ^d, "
+                          "so ∇𝓛 = 0 at 1.5 × 10^-3; \uf061\uf062 ≤ ∑ ∫ ∂ ± √. ") * 30,
+            "numeric tables": "| 0.123 | 0.456 | 0.789 | 1.234 | 5.678 |\n" * 200 + bullets,
+        }
+        for name, text in readable.items():
+            with self.subTest(name):
+                md = "".join(f"## {h}\n\n{text}\n\n" for h in ("Abstract", "Introduction", "Methods", "Results"))
+                self.assertEqual(prep_md.validate(md, 4, len(md)), [], name)
         self.assertEqual(prep_md.validate(self.GOOD + "\x01\x02\x03", 4), [],
                          "a handful of control characters is cosmetic (clean() strips them); rejecting "
                          "a 75k-char parse over one stray byte made --equations exit 3")
@@ -143,7 +162,9 @@ class TestParse(unittest.TestCase):
         after = ("### **Publisher's Note**\n\nneutral\n\n3. Brown 2018.\n\n### Acknowledgements\n\nThanks.\n\n"
                  "**Extended Data Fig. 1 |** legend\n")
         for heading in ("# ■<sup>**REFERENCES**</sup>", "## ■ REFERENCES", "**References**", "### **References**",
-                        "## 5. References", "Bibliography", "References and Notes"):
+                        "## 5. References", "Bibliography", "References and Notes", "## Notes and references",
+                        "## REFERENCES CITED", "## Works Cited", "**Literature Cited**", "## Reference", "### Reference List",
+                        "## List of References"):
             with self.subTest(heading):
                 out = prep_md.clean("# P\n\n## Methods\n\n1. Dock, 2020 style.\n\nbody\n\n" + heading + refs + after)
                 for gone in ("Smith", "Jones", "Brown"):
@@ -155,6 +176,77 @@ class TestParse(unittest.TestCase):
         self.assertIn("kept", out)
         out = prep_md.clean("# P\n\nWe list all the references\nbelow.\n\nmore body\n")
         self.assertIn("more body", out, "the word at the end of a prose line is not a heading")
+        for heading in ("## References to prior work", "## Literature review", "## Literature", "## Notes",
+                        "## Reference genomes", "Cited works"):
+            with self.subTest(heading):
+                out = prep_md.clean(f"# P\n\n{heading}\n\n1. Smith, J. Title. J. Chem. 12, 1–5 (2019).\n\n"
+                                    "Earlier work (Smith, 2019) showed it.\n")
+                self.assertIn("Smith, J. Title", out, f"{heading!r} is a section, not a reference list")
+                self.assertIn("Earlier work", out)
+
+    def test_what_follows_a_reference_list_is_judged_by_shape(self):
+        """Every numbered paragraph with a year-like number after the first References heading was
+        deleted: Methods steps ("lysed in 2000 uL"), and, after an author-year list, everything up to
+        the next `#` heading, so an appendix headed in bold went too. Entries go by the shape of a
+        citation; any heading may end the list; and real entries after one still go."""
+        fill = "Ordinary prose about the method and its evaluation. " * 6
+        cases = {
+            "Methods after references": (
+                "## References\n\n1. Jumper, J. et al. Highly accurate protein structure prediction. Nature 596, 583–589 (2021).\n\n"
+                "2. Senior, A. W., Evans, R. & Jumper, J. Improved prediction. Nature 577, 706–710 (2020).\n\n"
+                "## Methods\n\n1. Cells were incubated at 37 C and lysed in 2000 uL of buffer.\n\n"
+                "2. Spectra were recorded between 1800 and 2100 cm-1.\n\n3) Samples collected in 2019 were split.\n\n"
+                "4. Cells (2 × 10^5, 96-well plates) were cultured as before (Smith et al., 2019).\n\n"
+                "51. Mirdita, M. et al. ColabFold. Nat. Methods 19, 679–682 (2022).\n\n",   # Methods references
+                ["Senior, A. W.", "Mirdita"], ["2000 uL", "1800 and 2100", "collected in 2019", "Smith et al., 2019"]),
+            "bold appendix after an author-year list": (
+                "## References\n\nSmith J (2020) A study. Nature 581:1-5.\n\n"
+                "Tom Brown, Benjamin Mann, et al. Language models are few-shot learners. In NeurIPS, 2020.\n\n"
+                "Diederik P Kingma and Jimmy Ba. Adam: a method for stochastic optimization. In ICLR, 2015.\n\n"
+                "**Appendix A. Derivation of the update rule**\n\n"
+                "The update follows Kingma and Ba (2015) with step size eta = 0.01.\n\n",
+                ["Smith J (2020)", "few-shot", "Adam: a method"], ["Appendix A", "eta = 0.01"]),
+            "entries after a stray heading": (
+                "## References\n\n1. Smith, J. A. Title. J. Chem. 12, 1–5 (2019).\n\n## Nature | Vol 596\n\n"
+                "2. Doe, R.; Roe, P. Title. J. Am. Chem. Soc. 2020, 142, 1234−1240.\n\n"
+                "[3] A. Vaswani, N. Shazeer, and N. Parmar, “Attention is all you need,” in Proc. NeurIPS, 2017, pp. 5998–6008.\n\n"
+                "4. Smith JA, Doe R, Roe P. A trial. N Engl J Med. 2020;382(5):411-420.\n\n"
+                "5. The UniProt Consortium. UniProt in 2021. Nucleic Acids Res. 49, D480–D489 (2021).\n\n",
+                ["Smith, J. A.", "Doe, R.;", "Vaswani", "Smith JA", "UniProt"], ["Nature | Vol 596"]),
+        }
+        for name, (tail, gone, kept) in cases.items():
+            with self.subTest(name):
+                out = prep_md.clean(f"# P\n\n## Abstract\n\n{fill}\n\n" + tail)
+                for g in gone:
+                    self.assertNotIn(g, out)
+                for k in kept + ["Ordinary prose"]:
+                    self.assertIn(k, out)
+        out = prep_md.clean("# Annual report\n\nContents\n\nSummary\n\nFindings\n\nReferences\n\n"
+                            f"## Summary\n\n{fill}\n\n## Findings\n\n1. By 2030 the programme must double its enrolment.\n\n"
+                            "2. In 2024, 41% of sites reported a shortage.\n\n## References\n\n1. Agency X. Report 2023.\n")
+        self.assertIn("By 2030", out, "a contents list naming References is not a reference list")
+        self.assertIn("In 2024, 41%", out)
+        self.assertNotIn("Agency X", out, "the real list at the end still goes")
+
+    def test_cleaning_is_validated_and_keeps_references_rather_than_body(self):
+        """validate() judged only the raw parse. A cut that takes more than references can be, or
+        that leaves a text validate() would refuse, keeps the references instead: they cost tokens,
+        a lost section costs the paper."""
+        refs = "## References\n\n" + "".join(f"{i}. Smith, J. Title {i}. Nature {i}, 1–5 (2020).\n\n" for i in range(1, 60))
+        for name, md, pages in (
+                ("most of the parse", "# P\n\n## Abstract\n\n" + "word " * 300 + "\n\n" + refs, 1),
+                ("under the floor once cut", "# P\n\n## Abstract\n\n" + "word " * 200 + "\n\n" + refs[:900], 4)):
+            with self.subTest(name):
+                self.assertEqual(prep_md.validate(md, pages), [], "the fixture must pass as parsed")
+                text, why = prep_md.finish(md, pages)
+                self.assertIn("Smith, J. Title 1.", text, "the references stay")
+                self.assertIn("stripping references would remove", why)
+        text, why = prep_md.finish(self.GOOD + "\n\n" + refs[:900], 4)
+        self.assertIsNone(why)
+        self.assertNotIn("Smith, J.", text, "an ordinary paper is still stripped")
+        md = "# P\n\n## Abstract\n\n" + "word " * 300 + "\n\n" + refs
+        self.convert({"pymupdf4llm": md}, pages=1, quiet=False)
+        self.assertIn("falling back", self.stderr, "lit_pipeline relays only lines that say so")
 
     def test_control_characters_removed_and_long_lines_wrapped(self):
         out = prep_md.clean("# P\n\n" + ("abcdefghi " * 100) + "\x01\x02\n")
@@ -169,11 +261,15 @@ class TestParse(unittest.TestCase):
         patterns that leaves it alone never reaches an already-parsed document (it happened once).
         When this fails: bump PARSE_VERSION in lit_pipeline.py and record the new fingerprint here."""
         import hashlib, inspect
-        parts = [inspect.getsource(prep_md.validate), inspect.getsource(prep_md.clean), inspect.getsource(prep_md.body),
-                 prep_md.REF.pattern, prep_md.ENTRY.pattern, prep_md.HEADING.pattern, prep_md.CTRL.pattern,
-                 str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET)]
+        parts = [inspect.getsource(f) for f in (prep_md.validate, prep_md.unreadable, prep_md.clean, prep_md.body,
+                                                 prep_md.heading, prep_md.citation, prep_md.author_year, prep_md.finish)]
+        parts += [r.pattern for r in (prep_md.REF, prep_md.ENTRY, prep_md.NUMBER, prep_md.YEAR, prep_md.AUTHOR, prep_md.VENUE,
+                                      prep_md.CITED_YEAR, prep_md.LEGEND, prep_md.HEADING, prep_md.SECTION, prep_md.CTRL,
+                                      prep_md.JUNK)]
+        parts += [str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET), str(prep_md.JUNK_SHARE), str(prep_md.STRIP_LIMIT),
+                  str(prep_md.UNMEASURED_FLOOR)]
         fingerprint = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-        recorded = {"3": "8fc42ad5f8c4f200"}
+        recorded = {"4": "e837b51bbd46d754"}
         self.assertEqual(recorded.get(L.PARSE_VERSION), fingerprint,
                          f"the parser changed: bump PARSE_VERSION and record {fingerprint!r} for it")
 
@@ -190,8 +286,9 @@ class TestParse(unittest.TestCase):
         self.assertNotIn("File \"", err)
         self.assertNotIn("^^^", err, "indented source and caret lines are noise")
 
-    def convert(self, outputs, pages=4, **kw):
-        """Run convert() with parsers stubbed: (ok, parsers called, text written or None)."""
+    def convert(self, outputs, pages=4, stats_error=None, quiet=True, **kw):
+        """Run convert() with parsers stubbed: (ok, parsers called, text written or None); what it
+        said on stderr is left in self.stderr. `stats_error` is what pdf_stats() raises."""
         called, out = [], os.path.join(self.tmp, "out.md")
         if os.path.exists(out):
             os.remove(out)
@@ -200,10 +297,18 @@ class TestParse(unittest.TestCase):
             called.append(parser)
             md = outputs.get(parser)
             return (md, None) if md is not None else (None, f"{parser}: venv missing")
-        with mock.patch.object(prep_md, "parse", fake_parse), \
-                mock.patch.object(prep_md, "pdf_stats", lambda pdf: (pages, 0)), \
-                mock.patch("sys.stderr"), mock.patch("sys.stdout"):
-            ok, _ = prep_md.convert("x.pdf", out, quiet=True, **kw)
+
+        def fake_stats(pdf):
+            if stats_error:
+                raise stats_error
+            return pages, 0
+        err = io.StringIO()
+        try:
+            with mock.patch.object(prep_md, "parse", fake_parse), mock.patch.object(prep_md, "pdf_stats", fake_stats), \
+                    mock.patch("sys.stderr", err), mock.patch("sys.stdout"):
+                ok, _ = prep_md.convert("x.pdf", out, quiet=quiet, **kw)
+        finally:
+            self.stderr = err.getvalue()
         return ok, called, (read(out) if os.path.exists(out) else None)
 
     def test_parser_order_fallback_and_refusal(self):
@@ -221,16 +326,87 @@ class TestParse(unittest.TestCase):
         for name, outputs, kw in [("none available", {}, {}),
                                   ("all invalid", {"pymupdf4llm": self.BAD, "docling": self.BAD}, {}),
                                   ("forced invalid", {"docling": self.BAD}, {"forced": "docling"}),
-                                  ("equations invalid", {"marker": self.BAD}, {"equations": True})]:
+                                  ("equations invalid", {"marker": self.BAD}, {"equations": True}),
+                                  # pymupdf could not open the PDF to count it: one page of twenty
+                                  # passed as the whole paper, with the truncation check silently off
+                                  ("PDF not measurable", {"pymupdf4llm": self.GOOD, "docling": self.GOOD},
+                                   {"stats_error": prep_md.Unmeasured("pymupdf.FileDataError: cannot open")})]:
             with self.subTest(name):
                 ok, _, text = self.convert(outputs, pages=20, **kw)
                 self.assertFalse(ok, f"{name}: a parse that failed validation was accepted")
                 self.assertIsNone(text, f"{name}: the bad parse was written")
+                if "stats_error" in kw:
+                    self.assertIn("could not count the PDF's own pages", self.stderr, "and it says why")
+        # ...but with no pymupdf installed at all nothing can count it: `doctor --install-equations`
+        # makes only the marker venv, and --equations must still work there, saying the check is off,
+        # under the checks that need no page count.
+        none = prep_md.NoPymupdf("no default parser venv at /x")
+        ok, _, text = self.convert({"marker": self.GOOD}, equations=True, stats_error=none)
+        self.assertTrue(ok, self.stderr)
+        self.assertIn("truncation check is off", self.stderr)
+        one_page = "# A Paper\n\n## Abstract\n\n" + "word " * 280
+        ok, _, text = self.convert({"marker": one_page}, equations=True, stats_error=none)
+        self.assertFalse(ok, "a page of text is not a paper when nothing can say how long the PDF is")
+        self.assertIn("no pymupdf to count", self.stderr)
+
+    def test_pdf_stats_tells_a_missing_pymupdf_from_a_pdf_it_cannot_read(self):
+        """The first is a setup (only the marker venv); the second is evidence against the PDF."""
+        def stats(returncode=0, stdout="", stderr="", venv=sys.executable):
+            run = mock.Mock(return_value=mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr))
+            with mock.patch.object(prep_md.subprocess, "run", run), mock.patch.dict(prep_md.VENVS, {"pymupdf4llm": venv}):
+                return prep_md.pdf_stats("x.pdf")
+        self.assertEqual(stats(stdout="12 34567\n"), (12, 34567))
+        for name, kw in (("no venv", {"venv": os.path.join(self.tmp, "no-venv", "python")}),
+                         ("venv without pymupdf", {"stdout": "no pymupdf\n"})):
+            with self.subTest(name), self.assertRaises(prep_md.NoPymupdf):
+                stats(**kw)
+        with self.assertRaises(prep_md.Unmeasured) as cm:
+            stats(returncode=1, stderr="Traceback ...\npymupdf.FileDataError: Failed to open file 'x.pdf'.\n")
+        self.assertNotIsInstance(cm.exception, prep_md.NoPymupdf)
+        self.assertIn("FileDataError", str(cm.exception))
         # A write that dies part-way (here, on a character it cannot encode; in life, a kill or a full
         # disk) must leave no file: the pipeline serves whatever is at that path as a finished parse.
         with self.assertRaises(UnicodeEncodeError):
             self.convert({"pymupdf4llm": self.GOOD + "\ud800"})
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "out.md")), "a partial parse was left in the cache")
+
+
+class TestBookPlan(unittest.TestCase):
+    """Which pages go in which chapter file. A page in no file is a page no reader can find."""
+
+    def chapters(self, toc, pages):
+        with mock.patch("sys.stderr"):
+            return split_book.plan(toc, pages)
+
+    def test_every_page_lands_in_one_chapter(self):
+        """Split at level 2, a book lost its level-1 List of Symbols and filed its Appendix under
+        the last chapter; pages before the first bookmark were dropped at any level."""
+        toc = [[1, "List of Symbols", 1], [1, "Part I", 5]] + [[2, f"Chapter {c}", 5 + (c - 1) * 19] for c in range(1, 6)]
+        toc += [[1, "Part II", 100]] + [[2, f"Chapter {c}", 100 + (c - 6) * 18] for c in range(6, 11)]
+        toc += [[1, "Appendix A", 191]]
+        sections = toc[:-1] + [[1, "Appendix A", 191], [2, "A.1 Integrals", 195]]
+        for name, book, pages, first, last in (
+                ("level 2 beside level-1 leaves", toc, 200, ("List of Symbols", 1, 4), ("Appendix A", 191, 200)),
+                ("a level-1 appendix with sections", sections, 200, ("List of Symbols", 1, 4), ("A.1 Integrals", 195, 200)),
+                ("first bookmark on page 15", [[1, "Chapter 1", 15], [1, "Chapter 2", 40]], 60,
+                 ("Before the first bookmark", 1, 14), ("Chapter 2", 40, 60))):
+            with self.subTest(name):
+                level, chapters = self.chapters(book, pages)
+                self.assertEqual((chapters[0], chapters[-1]), (first, last))
+                covered = [p for _, a, b in chapters for p in range(a, b + 1)]
+                self.assertEqual(covered, list(range(1, pages + 1)), "every page once, in order")
+        level, chapters = self.chapters(toc, 200)
+        self.assertEqual(level, 2)
+        self.assertIn(("Chapter 10", 172, 190), chapters, "the appendix is not filed under the last chapter")
+        self.assertNotIn("Part I", [t for t, _, _ in chapters], "a Part that starts with its first chapter is not a chapter")
+        self.assertIn(("Appendix A", 191, 194), self.chapters(sections, 200)[1], "its pages before A.1 are its own")
+
+    def test_titles_are_one_clean_line(self):
+        """A NUL in a bookmark title went into toc.md and its chapter's first line, and `rg` then
+        skipped the chapter as binary."""
+        self.assertEqual(split_book.one_line("Chapter 1\x00"), "Chapter 1")
+        self.assertEqual(split_book.one_line("Chapter 2\rKernels\n\tand priors"), "Chapter 2 Kernels and priors")
+        self.assertEqual(split_book.one_line(None), "")
 
 
 class TestPipelineHelpers(unittest.TestCase):
@@ -513,6 +689,22 @@ class TestRefusalPosition(unittest.TestCase):
             ("> [!warning] PARTIAL: two of three notes unreadable", "in a callout"),
             ("Status: INCOMPLETE — no literature was readable", "behind a Status: label"),
             ("# Development plan — next iteration (PARTIAL / BLOCKED)\n\n## Read this first", "a real planner's title"),
+            # VERDICT3 N6: each of these was filed, exit 0, with the hook fired.
+            ("# Development plan\n\n> [!WARNING]\n> PARTIAL: literature notes unreadable", "a callout tag on its own line"),
+            ("---\ntitle: Plan\ntags: [lit]\n---\n\nPARTIAL: literature notes unreadable", "after YAML frontmatter"),
+            ("```\nINCOMPLETE: the notes could not be read\n```", "in a code fence"),
+            ("# Development plan\n\nI couldn't open any of the literature notes, so no proposals follow.", "couldn't open"),
+            ("# Development plan\n\nI was unable to access the notes, so what follows is generic.", "was unable to access"),
+            ("# A note (x)\n\n## Claim\nI\u2019m sorry, but I can\u2019t help with summarising this paper.",
+             "I'm sorry, but, curly apostrophes, under a heading with no blank line"),
+            ("Unfortunately, I was not able to read the paper: every page is symbol noise.", "was not able to"),
+            ("> [!NOTE]\n> I don't have access to the notes directory.", "no access, in a callout"),
+            ("Both notes are binary garbage. I could not read either of them.", "after one short sentence"),
+            ("Unfortunately,\nI could not read any of the notes.", "wrapped over two lines"),
+            ("Sorry, unfortunately, I could not read any of the notes.", "two lead-ins"),
+            ("No files were found at the given path.", "a verifier that resolved nothing"),
+            ("I could not check any claims because the document is not in the codebase.\n- `runs/real/plan.md` -> not found.",
+             "a real verifier's reply, its finding below the apology"),
         ]:
             with self.subTest(label):
                 self.assertTrue(self.refusal(text), f"{label} must be recognised as an apology")
@@ -532,6 +724,22 @@ class TestRefusalPosition(unittest.TestCase):
             ("# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim", "a hyphenated title"),
             ("# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA", "a bracketed title"),
             ("# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim", "a title in capitals"),
+            # VERDICT3 N10a: findings that open with the words, each discarded after it was paid for.
+            ("# A note (Lee 2025)\n\n## Claim\n\nNot completed follow-up in 37 of 412 patients biased the estimate.",
+             "a Claim opening 'Not completed follow-up'"),
+            ("# A note (Lee 2025)\n\n## Claim\nNot completed follow-up in 37 of 412 patients biased the estimate.",
+             "the same, with no blank line under the heading"),
+            ("No files were found matching `src/ghost.py` -> the repo has src/a.py only", "a verify finding"),
+            ("I could not verify the following claims:\n\n- `0.83` -> not in any note", "a verify report's first line"),
+            ("# A note (x)\n\n## Claim\nI could not read Table 3 (the scan is blurred); the rest shows X improves Y "
+             "by 12% (Section 4).", "a caveat about a numbered part"),
+            ("# A note (Lee 2025)\n\n## Claim\n\nWe could not complete follow-up for 37 of 412 patients, which biases "
+             "the estimate (Table 2).", "the paper's authors, as 'we'"),
+            ("# A note (Vaswani 2017)\n\n## Claim\nUnable to process long sequences in parallel, recurrent models are "
+             "slow to train (Section 1).", "a participial phrase with no subject"),
+            ("# Digest\n\nThe three papers agree that warm starts cut sampler burn-in by about 40% on the benchmarks "
+             "they share (Table 2). I could not read the supplementary tables, so per-benchmark figures are omitted.",
+             "a caveat after a long first sentence of content"),
         ]:
             with self.subTest(label):
                 self.assertIsNone(self.refusal(text), f"{label} must not be discarded")
@@ -755,28 +963,168 @@ class TestStatusMarkerEdges(unittest.TestCase):
         import lit_pipeline
         self.declared = lit_pipeline.declared_failure
 
-    def test_a_marker_reporting_none_is_a_clean_result(self):
-        for text in ("# Blocked: none. All dependencies are in the tree.",
-                     "Blocked: none. All dependencies are in the tree.",
-                     "# Plan — PARTIAL: 0", "INCOMPLETE: nil"):
-            with self.subTest(text[:40]):
-                self.assertIsNone(self.declared(text), "a count of none is not a declared failure")
+    # The rows are the 0.3.1 fix review's table (F = must fail, P = must pass; the ids are its own),
+    # each a shape a real model could write. Each is judged as the opening of a plan and as a reply.
+    BODY = "\n\n## 1. A real proposal\n\n" + "Substantive plan content naming src/widget/sampler.py. " * 60
 
-    def test_a_standalone_marker_in_a_title_is_a_failure(self):
-        for text in ("# Development plan (BLOCKED)", "# Development plan — BLOCKED",
-                     "# Development plan: BLOCKED", "# Development plan (PARTIAL / BLOCKED)",
-                     "Status: INCOMPLETE — no literature was readable"):
-            with self.subTest(text[:40]):
-                self.assertTrue(self.declared(text), text)
+    def judged(self, text):
+        return L.refusal((text + self.BODY)[:1200]), L.reply_failure(text)
 
-    def test_a_marker_inside_a_technique_name_is_not_a_failure(self):
-        """These are real papers. Discarding them is the false positive this keeps swinging into."""
-        for text in ("# PARTIAL LEAST SQUARES for batch correction\n\n## 1. Replace PCA",
-                     "# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim",
-                     "# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim",
-                     "# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA"):
+    def test_a_status_word_set_off_in_the_opening_is_a_failure(self):
+        for text, cid in [
+            ('# Development plan (BLOCKED)', 'F01'),
+            ('# Development plan — BLOCKED', 'F02'),
+            ('# Development plan: BLOCKED', 'F03'),
+            ('# Development plan [BLOCKED]', 'F04'),
+            ('# Development plan **BLOCKED**', 'F05'),
+            ('# Development plan — BLOCKED.', 'F06'),
+            ('# Development plan (PARTIAL)', 'F07'),
+            ('# Development plan — PARTIAL', 'F08'),
+            ('Status: INCOMPLETE', 'F09'),
+            ('# Development plan (Blocked)', 'F10'),
+            ('# Development plan (blocked)', 'F11'),
+            ('# Development plan — Blocked', 'F12'),
+            ('# Development plan – BLOCKED', 'F13'),
+            ('# Development plan - BLOCKED', 'F14'),
+            ('# Development plan (BLOCKED).', 'F15'),
+            ('# Development plan 🚫 BLOCKED', 'F16'),
+            ('# 🚫 Development plan — BLOCKED 🚫', 'F17'),
+            ('# Development plan (*BLOCKED*)', 'F18'),
+            ('Development plan (BLOCKED)\n==========================', 'F19'),
+            ('# Development plan (BLOCKED) #', 'F20'),
+            ('# Development plan (BLOCKED: notes unreadable)', 'F21'),
+            ('# Development plan — BLOCKED by missing notes', 'F22'),
+            ('# Development plan (BLOCKED — see below)', 'F23'),
+            ('# Development plan (BLOCKED - see below)', 'F24'),
+            ('# Development plan: BLOCKED by unreadable notes', 'F25'),
+            ('# Development plan: INCOMPLETE: notes unreadable', 'F26'),
+            ('INCOMPLETE: notes unreadable', 'F27'),
+            ('BLOCKED by missing notes', 'F28'),
+            ('BLOCKED, notes unreadable', 'F29'),
+            ('[BLOCKED] Notes could not be read', 'F30'),
+            ('(BLOCKED) Notes could not be read', 'F31'),
+            ('**BLOCKED** — notes unreadable', 'F32'),
+            ('BLOCKED.', 'F33'),
+            ('INCOMPLETE: none of the literature notes could be read', 'F34'),
+            ('BLOCKED: none of the notes are readable', 'F35'),
+            ('PARTIAL: 0 of 5 notes were readable', 'F36'),
+            ('# Development plan — BLOCKED: none of the notes could be read', 'F37'),
+            ('# Development plan (FAILED)', 'F38'),
+            ('FAILED: the notes could not be read', 'F39'),
+            ('Status: Blocked — the notes are binary', 'F40'),
+            ('**Status:** BLOCKED by unreadable notes', 'F41'),
+            ('# Development plan (BLOCKED; notes unreadable)', 'F42'),
+            ('# Development plan (BLOCKED / PARTIAL)', 'F43'),
+            ('# Development plan — Status: BLOCKED', 'F44'),
+            ('> [!WARNING] BLOCKED', 'F45'),
+            ('# Development plan (status: blocked)', 'F46'),
+            ('# BLOCKED Development plan', 'F47'),
+            ('# Development plan (INCOMPLETE — notes unreadable)', 'F48'),
+            ('# Development plan (PARTIAL - 2 of 5 notes readable)', 'F49'),
+            ('# Development plan (PARTIAL, 2 of 5 notes readable)', 'F50'),
+            ('# Development plan (PARTIAL 2/5 notes)', 'F51'),
+            ('# Development plan (BLOCKED pending readable notes)', 'F52'),
+            ('# Development plan — BLOCKED until the notes are re-read', 'F53'),
+            ('# Development Plan: Blocked — Notes Unreadable', 'F54'),
+            ('# DEVELOPMENT PLAN (BLOCKED)', 'F55'),
+            ('# DEVELOPMENT PLAN — BLOCKED BY UNREADABLE NOTES', 'F56'),
+            ('# Development plan (PARTIAL / BLOCKED)', 'F57'),
+            ('INCOMPLETE: 0 of 12 claims could be checked; the repository is empty', 'F58'),
+            ('# Development plan: Incomplete', 'F59'),
+            ('# Development plan — BLOCKED (notes unreadable)', 'F60'),
+            ('## BLOCKED', 'F61'),
+            ('Development plan — BLOCKED', 'F62'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                doc, reply = self.judged(text)
+                self.assertTrue(doc and reply, f"{cid} {text!r}: document {doc!r}, reply {reply!r}")
+        self.assertEqual(self.declared("**Partial**: the notes were unreadable"), "PARTIAL", "the word, normalised")
+        self.assertEqual(self.declared("# Development plan (FAILED)"), "FAILED")
+
+    def test_a_status_reporting_none_is_a_clean_result(self):
+        """"none" must be the whole value: "INCOMPLETE: none of the files could be opened" is a reason."""
+        for text, cid in [
+            ('Blocked: none.', 'P06'),
+            ('BLOCKED: none', 'P08'),
+            ('PARTIAL: none', 'P09'),
+            ('Blocked: nothing. All dependencies are in the tree.', 'P11'),
+            ('Blocked: N/A', 'P12'),
+            ('Blocked: *none*', 'P13'),
+            ('Blocked — none', 'P14'),
+            ('Blocked: no', 'P15'),
+            ('Blocked: (none)', 'P16'),
+            ('# Development plan\n\n## Status\n\nBlocked: none.', 'P25'),
+            ('PARTIAL: 0', 'P31'),
+            ('Blocked: None — everything needed is in the repo', 'P32'),
+            ('Blocked: **none**', 'P36'),
+            ('Blocked: `none`', 'P37'),
+            ('Blocked: 0 items', 'P38'),
+            ('BLOCKED: no', 'P40'),
+            ('# Blocked: none. All dependencies are in the tree.', 'H1'),
+            ('# Plan — PARTIAL: 0', 'H2'),
+            ('INCOMPLETE: nil', 'H3'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
+
+    def test_a_reply_is_searched_for_the_word_it_was_told_to_use(self):
+        """Every agent is told to reply INCOMPLETE when it could not read its sources. A real planner
+        put it on line 3, under two lines of prose, and only the first line was read (VERDICT3 N6)."""
+        reply_failure = L.reply_failure
+        for text in ("Both literature notes are binary garbage -\nno text survives.\nINCOMPLETE: notes unreadable",
+                     "/x/plan.md.partial\n\n`INCOMPLETE: two notes are empty`",
+                     "Done. I could not open any of the notes, so the plan rests on the repo alone."):
             with self.subTest(text[:40]):
-                self.assertIsNone(self.declared(text), text)
+                self.assertTrue(reply_failure(text), text)
+        for text in ("/x/notes/a.md",
+                     "Wrote /x/notes/a.md.\n\nPages 3-12 were garbled; the note says which numbers are missing.",
+                     "Wrote the plan.\nBLOCKED: proposal 3 waits for the CUDA build.",
+                     "Wrote it.\nINCOMPLETE-data methods are covered in proposal 2.",
+                     "- `src/a.py` -> exists\n- INCOMPLETE: data for site B -> the note has it (Table 3)"):
+            with self.subTest(text[:40]):
+                self.assertIsNone(reply_failure(text), text)
+
+    def test_a_status_word_in_a_name_is_not_a_failure(self):
+        """Real titles: a technique, a finding, a code constant. Discarding them is the false positive
+        this check keeps swinging into, and each one is a paid result thrown away."""
+        for text, cid in [
+            ('# PARTIAL LEAST SQUARES for batch correction', 'P01'),
+            ('# BLOCKED GIBBS SAMPLING (Smith 2020)', 'P02'),
+            ('# INCOMPLETE-DATA METHODS (Rubin 1976)', 'P03'),
+            ('# Development plan (PARTIAL LEAST SQUARES)', 'P04'),
+            ('# Development plan (Partial least squares)', 'P05'),
+            ('Status: no blockers', 'P07'),
+            ('# Development plan\n\nTwo proposals follow.\n\n## Blocked items', 'P10'),
+            ('# Development plan: handling INCOMPLETE, noisy labels', 'P17'),
+            ('# Development plan: when are the data INCOMPLETE?', 'P18'),
+            ('# Arithmetic is INCOMPLETE (Gödel 1931)', 'P19'),
+            ('# PARTIAL / FULL pooling for hierarchical models', 'P20'),
+            ('# Development plan: adopt PARTIAL pooling', 'P21'),
+            ('# PLS (PARTIAL LEAST SQUARES) regression', 'P22'),
+            ('# Why phase III trials FAILED (Smith 2020)', 'P23'),
+            ('# FAILED, PARTIAL and COMPLETE responses in oncology (Lee 2019)', 'P24'),
+            ('# Development plan (v2; PARTIAL rollout)', 'P26'),
+            ('Blocked items: none', 'P27'),
+            ('# Development plan — no blockers', 'P28'),
+            ('# PARTIAL-observation MDPs (Kaelbling 1998)', 'P29'),
+            ('# BLOCKED Gibbs (Smith 2020)', 'P30'),
+            ('# BLOCKED-Gibbs vs. collapsed samplers', 'P33'),
+            ('# ON THE INCOMPLETE BETA FUNCTION (Pearson 1934)', 'P34'),
+            ('# Missing data: complete vs. INCOMPLETE (Little 2002)', 'P35'),
+            ('# Development plan (no blockers; PARTIAL LEAST SQUARES first)', 'P39'),
+            ('# Development plan: from FAILED runs to a working sampler', 'P41'),
+            ('# Status of the sampler: PARTIAL', 'P42'),
+            ('# Development plan: retry jobs stuck in `FAILED`', 'A2 code'),
+            ('# Development plan: handle `JobState.PARTIAL` in the scheduler', 'A2 code'),
+            ('# Development plan (the `BLOCKED` state machine)', 'A2 code'),
+            ('# Development plan: emit `INCOMPLETE` when a batch is cut short', 'A2 code'),
+            ('# `FAILED` jobs and how to retry them', 'code at the start'),
+            ('# Missing data INCOMPLETE (Little 2002)', 'A2 inline'),
+            ('# **Blocked** Gibbs sampling (Smith 2020)', 'a bold name'),
+            ('# Plan\n\n- Port the scorer to CUDA (BLOCKED)\n- Add a --json flag', 'a tag on a proposal'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
 
 
 class TestHolds(unittest.TestCase):

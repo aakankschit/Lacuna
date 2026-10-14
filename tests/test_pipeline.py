@@ -754,7 +754,9 @@ class TestMoneyGuarantees(Pipeline):
         self.assertNotIn("STATUS", self.calls()[-1]["prompt"], "no status file, no instruction to grep one")
 
     def test_a_refusal_is_never_filed_as_a_note(self):
-        for mode in ("refuse", "apology", "prose"):
+        """"incomplete" is VERDICT3 N5: a reader given unreadable text wrote a template-shaped note, and
+        it was cached. It is told the INCOMPLETE rule now, and its reply is read."""
+        for mode in ("refuse", "apology", "prose", "incomplete"):
             with self.subTest(mode):
                 r = self.read(mode=mode)
                 self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
@@ -763,12 +765,27 @@ class TestMoneyGuarantees(Pipeline):
                 self.assertFalse(self.ledger()[-1]["wrote_note"])
                 if mode != "refuse":
                     self.assertNotIn("produced no note file", r.stdout, "it did write one; the content was rejected")
+                if mode == "incomplete":
+                    self.assertIn("INCOMPLETE: the sources could not be read", r.stdout, "say what the reader said")
         # the subtle one: success was once inferred from a file an earlier run had left in --out
         self.assertEqual(self.read("--brief", "BRIEF:one").returncode, 0)
         r = self.read("--brief", "BRIEF:two", mode="refuse")
         self.assertEqual(r.returncode, 4, "a refusal must fail even when an older note is present")
         self.assertNotIn("1/1 notes written", r.stdout)
         self.assertEqual(len(self.cached_notes()), 1, "the stale note must not be cached under the new key")
+        # A note cached before the check learned a shape was served free forever (VERDICT3 N10b): a hit
+        # is judged by today's check, and one that fails it is read again, and paid for, not served.
+        (cached,) = self.cached_notes()
+        cached = os.path.join(self.data, "cache", "notes", cached)
+        write(cached, "# A note (alpha.md)\n\n## Claim\nI\u2019m unable to complete this: I could not read any of "
+                      "the paper.\n\n## Key results\n" + "Nothing. " * 80)
+        calls = len(self.calls())
+        r = self.lacuna("lit", "read", self.alpha, "--out", self.p("elsewhere"), "--brief", "BRIEF:one")
+        self.assertEqual((r.returncode, len(self.calls())), (0, calls + 1), r.stdout + r.stderr)
+        self.assertNotIn("cached (free)", r.stdout)
+        self.assertIn("removed from the cache", r.stderr, "say why a hit was paid for")
+        self.assertNotIn("unable to complete", read(cached), "the failed note must not stay cached")
+        self.assertNotIn("unable to complete", read(self.p("elsewhere", "alpha.md")))
 
     def test_a_failed_synth_files_nothing_and_leaves_the_last_plan_alone(self):
         """synth judged success by the file at --out, so over an earlier plan a refusal exited 0 and
@@ -816,8 +833,9 @@ class TestMoneyGuarantees(Pipeline):
         self.config({"after": {"verify": hook}})
         plan, report = self.p("plan.md"), self.p("plan.md.unverified.md")
         write(plan, "# Plan\n" + "content " * 200)
-        for mode, reply in [("refuse", None), ("garbage", None),
+        for mode, reply in [("refuse", None), ("garbage", None), ("incomplete", None),
                             ("reply", "I cannot help with that request."),
+                            ("reply", "INCOMPLETE: none of the files in the codebase could be opened"),
                             ("reply", "I could not check any claims because the document is not in the codebase.\n"
                                       "- `runs/real/plan.md` -> not found.")]:
             with self.subTest(mode, reply=reply):

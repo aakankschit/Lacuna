@@ -108,8 +108,9 @@ From a bake-off of 9 parsers over 3 papers (`docs/benchmarks/pdf-parsers.md`):
 ## Books and long references
 
 `lacuna lit split-book <pdf> <books-dir>/<name>` splits a long document into chapter files plus a
-grep-able `toc.md`. Any book under the configured books directory is offered to readers, which grep
-the index and read only the lines they need. `--no-books` skips them.
+grep-able `toc.md`. A book split into a directory of its own directly inside the configured books
+directory is offered to readers, which grep the index and read only the lines they need; split-book
+warns when it is not. `--no-books` skips them.
 
 **Books do not generate ideas; they prevent mistakes.** In the ablation, idea yield was identical
 with and without them, but errors roughly halved (4.0 → 1.5 per plan for the cheap reader) and

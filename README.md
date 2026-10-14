@@ -151,6 +151,9 @@ lacuna lit read papers/*.pdf --out notes/      # books are offered automatically
 lacuna lit read papers/*.pdf --out notes/ --no-books    # or skip them
 ```
 
+A book is offered only from a directory of its own directly inside the books directory
+(`lacuna config` shows where that is); `split-book` says so when the directory you give is elsewhere.
+
 **Write notes straight into Obsidian** (any vault is just a folder of markdown)
 
 ```bash
