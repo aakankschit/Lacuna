@@ -435,6 +435,52 @@ class TestOwnership(Pipeline):
         self.assertEqual(r.returncode, 0, f"a report after.synth edited was refused as edited:\n{r.stderr}")
         self.assertEqual(self.synth(plan, "--objective", "and again").returncode, 0)
 
+    def test_a_plan_or_report_changed_during_the_run_is_never_replaced(self):
+        """--out was checked before the model call and replaced after it, so an edit made while the
+        model ran was lost on a successful run. Neither the edit nor the paid result may be."""
+        hook, marker = self.hook("after")
+        self.config({"after": {"synth": hook, "verify": hook}})
+        os.makedirs(self.notes)
+        write(os.path.join(self.notes, "n.md"), "# n\n" + "content " * 200)
+        plan = self.p("vault", "plan.md")
+        self.assertEqual(self.synth(plan).returncode, 0)
+        first = read(plan)
+        os.remove(marker)
+        edited = first + "EDITED WHILE THE MODEL RAN\n"
+        r = self.synth(plan, FAKE_EDIT=plan)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(read(plan), edited, "the edit made during the run was lost")
+        self.assertIn("# Development plan", read(plan + ".new.md"), "the paid result was lost")
+        self.assertIn(f"This run's plan is in {plan}.new.md", r.stderr)
+        self.assertFalse(os.path.exists(marker), "a result not filed where it was asked for is not handed to the hook")
+        r = self.synth(plan, "--overwrite", FAKE_EDIT=plan)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(read(plan), edited + "EDITED WHILE THE MODEL RAN\n")
+        self.assertTrue(os.path.exists(plan + ".new-2.md"), "the second result replaced the first")
+        fresh = self.p("vault", "fresh.md")
+        self.assertEqual(self.synth(fresh, FAKE_EDIT=fresh).returncode, 2, "--out created during the run")
+        self.assertEqual(read(fresh), "EDITED WHILE THE MODEL RAN\n")
+        write(plan + ".rejected", "set aside by an earlier run\n")
+        r = self.synth(plan, "--overwrite", mode="refuse", FAKE_EDIT=plan)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("EDITED WHILE", read(plan + ".rejected-2"), "a failed run must move a changed --out aside")
+        self.assertEqual(read(plan + ".rejected"), "set aside by an earlier run\n", "and never over an earlier one")
+
+        target = write(self.p("vault", "t.md"), "# T\n" + "content " * 200)
+        report = target + ".unverified.md"
+        self.assertEqual(self.verify(target).returncode, 0)
+        first = read(report)
+        os.remove(marker)
+        r = self.verify(target, FAKE_EDIT=report)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(read(report), first + "EDITED WHILE THE MODEL RAN\n")
+        self.assertIn("# Unverified claims in t.md", read(report + ".new.md"))
+        self.assertFalse(os.path.exists(marker))
+        write(target, read(target) + "A new proposal.\n")      # the report no longer describes it
+        r = self.verify(target, "--overwrite", mode="refuse", FAKE_EDIT=report)
+        self.assertEqual(r.returncode, 4)
+        self.assertTrue(os.path.exists(report), "a report edited during a failed run was deleted")
+
     def test_deleting_or_damaging_the_record_makes_every_stage_ask(self):
         """extending.md says deleting .lacuna.json is safe: Lacuna then asks before replacing
         anything. verify did not ask, and replaced a report annotated by hand. And a damaged record

@@ -587,6 +587,20 @@ def free_name(base, ext=""):
     return f"{base}-{n}{ext}" if n > 1 else f"{base}{ext}"
 
 
+def file_state(path):
+    """What is at `path`: its sha256, "" for something that is not a regular file, None for nothing."""
+    if not os.path.lexists(path):
+        return None
+    return _sha(path) if os.path.isfile(path) else ""
+
+
+def changed_since(path, before):
+    """True when `path` is not what it was when the run started (`before`, from file_state). A plan
+    or report changed during a run is the user's, or someone else's; one deleted meanwhile is not."""
+    now = file_state(path)
+    return now is not None and now != before
+
+
 def _sha(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -906,8 +920,8 @@ def cmd_synth(a):
         sys.exit(EX_INPUT)
     a.repo = os.path.abspath(a.repo)
     a.out = os.path.abspath(a.out)
-    need_short_names([a.out, f"{a.out}.filelist.txt", f"{a.out}.partial", f"{a.out}.rejected"],
-                     "Choose a shorter --out.")
+    need_short_names([a.out, f"{a.out}.filelist.txt", f"{a.out}.partial", f"{a.out}.rejected-99",
+                      f"{a.out}.new-99.md"], "Choose a shorter --out.")
     # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
     # plan was once replaced without a word: the ownership rule covered read's notes only.
     why = not_ours(a.out, stage="synth")
@@ -1006,7 +1020,7 @@ def cmd_synth(a):
                                also=f" and do not write {part}")])
     dirs = [a.repo, out_dir] + ([a.notes] if a.notes else []) + \
            ([os.path.dirname(os.path.abspath(a.digest))] if a.digest else [])
-    before = _sha(a.out) if os.path.isfile(a.out) else None
+    before = file_state(a.out)
     res = claude("synth", model, prompt, dirs, effort=lacuna_config.effort(role), cwd=out_dir)
     ok = usable_output(part, 800, a.kind)
     # A model that could not read its sources may say so in its reply and still leave a document
@@ -1024,19 +1038,30 @@ def cmd_synth(a):
         for f in (part, tree_path):
             if os.path.exists(f):
                 os.remove(f)
-        if os.path.isfile(a.out) and _sha(a.out) != before:
+        if changed_since(a.out, before):
             # --out changed during the run: the model wrote it rather than the .partial it was
             # given, or someone edited it meanwhile. Either way it is not an earlier run's plan,
-            # and the next command must not read it as one; moved aside, never deleted.
-            os.replace(a.out, f"{a.out}.rejected")
+            # and the next command must not read it as one; moved aside, never deleted, and never
+            # over what an earlier run moved aside.
+            rejected = free_name(f"{a.out}.rejected")
+            os.replace(a.out, rejected)
             forget(a.out)
             kept = (f"{a.out} changed during this run (the model wrote it directly, or it was edited), so it "
-                    f"is not a checked plan. It was moved to {a.out}.rejected for you to inspect.")
+                    f"is not a checked plan. It was moved to {rejected} for you to inspect.")
         else:
             kept = (f"{a.out} was left as it was, and holds an earlier run's output, not this one's."
                     if os.path.exists(a.out) else "Nothing was written.")
         print(f"ERROR: {model} wrote no usable output. {kept}\n{str(res.get('result'))[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
+    if changed_since(a.out, before):
+        # Edited while the model ran (or written by something else): checked before the call, it
+        # was replaced on success all the same, and the edit was lost (B11). Keep both.
+        new = free_name(f"{a.out}.new", ".md")
+        os.replace(part, new)
+        record(new, stage="synth")
+        print(f"ERROR: {a.out} changed while this run was in progress, so it was left as it is. This run's "
+              f"{a.kind} is in {new}: compare the two, and move it over {a.out} to use it.", file=sys.stderr)
+        sys.exit(EX_INPUT)
     if os.path.islink(a.out):
         os.remove(a.out)     # only with --overwrite; replacing the link, not writing through it
     os.replace(part, a.out)
@@ -1055,7 +1080,7 @@ def cmd_verify(a):
     if a.notes:
         a.notes = os.path.abspath(a.notes)
     out = f"{a.target}.unverified.md"
-    need_short_names([out], "Rename --target, or copy it under a shorter name.")
+    need_short_names([out, f"{out}.new-99.md"], "Rename --target, or copy it under a shorter name.")
     why = not_ours(out, stage="verify")       # a report annotated by hand is the user's
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "
@@ -1077,6 +1102,7 @@ def cmd_verify(a):
         INCOMPLETE_RULE.format(what="the document or the codebase", also="")])
     dirs = [a.repo, os.path.dirname(os.path.abspath(a.target))] + ([a.notes] if a.notes else [])
     vmodel = a.model or lacuna_config.model("verifier")
+    before = file_state(out)
     res = claude("verifier", vmodel, prompt, dirs, effort=lacuna_config.effort("verifier"))
     ledger({"stage": "verify", "model": vmodel, "effort": lacuna_config.effort("verifier"),
             "target": os.path.basename(a.target), "cost": usd(res),
@@ -1084,13 +1110,17 @@ def cmd_verify(a):
     report = str(res.get("result") or "")
 
     def failed(why):
-        # An earlier report may stay only while the document is still the version it checked.
+        # An earlier report may stay only while the document is still the version it checked. One
+        # edited while the verifier ran is the user's now, and is never removed (B11).
         stale = os.path.exists(out) and checked not in open(out, errors="ignore").read(400)
-        if stale:
+        removed = stale and not changed_since(out, before)
+        if removed:
             os.remove(out)
         print(f"ERROR: the verifier ({vmodel}) {why}. Nothing was written, and "
               f"{os.path.basename(a.target)} has NOT been fact-checked."
-              + (" The earlier report described another version of it and was removed." if stale else "")
+              + (" The earlier report described another version of it and was removed." if removed else
+                 f" {out} describes another version of it, and was left as it is because it changed during "
+                 f"this run." if stale else "")
               + f"\n{report[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
 
@@ -1099,17 +1129,25 @@ def cmd_verify(a):
     hit = refusal(report)     # a reply that checked nothing arrives with is_error: false
     if hit:
         failed(f"replied with {hit!r} rather than a report")
+    # A report edited while the verifier ran is never replaced; this run's goes beside it (B11).
+    clash = changed_since(out, before)
+    dst = free_name(f"{out}.new", ".md") if clash else out
     try:
-        if os.path.islink(out):
-            os.remove(out)     # only with --overwrite; never write through a link
-        open(out, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n"
+        if os.path.islink(dst):
+            os.remove(dst)     # only with --overwrite; never write through a link
+        open(dst, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n"
                              f"_Checked the version with {checked}._\n\n{report}\n")
-        record(out, a.target, stage="verify")
-        where = out
+        record(dst, a.target, stage="verify")
+        where = dst
     except OSError:
         where = "(not saved; printed below)"
     print(f"verify: ${usd(res):.4f}, {res['wall_s']}s -> {where}\n")
     print(report[:3000])
+    if clash:
+        print(f"ERROR: {out} changed while this run was in progress, so it was left as it is. This run's "
+              + (f"report is in {dst}: compare the two, and move it over {out} to use it." if where == dst
+                 else "report is printed above."), file=sys.stderr)
+        sys.exit(EX_INPUT)
     if where != "(not saved; printed below)":
         after("verify", out)
 

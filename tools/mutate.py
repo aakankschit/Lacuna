@@ -228,14 +228,22 @@ MUTANTS = [
     # B12: with the record deleted, a report annotated by hand was "ours" because of its name
     ("unrecorded-report-replaced", PIPE, '    why = not_ours(out, stage="verify")',
      '    why = not_ours(out, stage="verify") if os.path.exists(os.path.join(os.path.dirname(out), OWNERS)) else None'),
-    ("clobbered-out-kept", PIPE, "        if os.path.isfile(a.out) and _sha(a.out) != before:", "        if False:"),
+    ("clobbered-out-kept", PIPE, "        if changed_since(a.out, before):\n            # --out changed during the run: the model",
+     "        if False:\n            # --out changed during the run: the model"),
     ("hook-edit-not-rerecorded", PIPE, "    before = as_recorded(d)\n", "    before = {}\n"),
     # B10: a hook that edits every file in the directory changes earlier runs' files too
     ("hook-rerecords-only-its-output", PIPE, "    before = as_recorded(d)\n",
      "    before = {k: v for k, v in as_recorded(d).items() if os.path.isdir(out_path) or k == name_key(out_path)}\n"),
     ("hook-adopts-user-edits", PIPE, '                    and os.path.isfile(p) and _sha(p) == e["sha256"]:',
      "                    and os.path.isfile(p):"),
-    ("clobbered-out-deleted", PIPE, '            os.replace(a.out, f"{a.out}.rejected")', "            os.remove(a.out)"),
+    ("clobbered-out-deleted", PIPE, "            os.replace(a.out, rejected)", "            os.remove(a.out)"),
+    # B11: --out or the report changed while the model ran; the edit was replaced on success
+    ("changed-out-replaced-on-success", PIPE, "    if changed_since(a.out, before):\n        # Edited while the model ran",
+     "    if False:\n        # Edited while the model ran"),
+    ("changed-report-replaced-on-success", PIPE, "    clash = changed_since(out, before)", "    clash = False"),
+    ("changed-report-removed-on-failure", PIPE, "        removed = stale and not changed_since(out, before)",
+     "        removed = stale"),
+    ("set-aside-replaces-earlier", PIPE, "    while os.path.lexists(", "    while False and os.path.lexists("),
     # B28: a damaged record was silently rewritten with only this run's entries
     ("damaged-record-silently-replaced", PIPE, "    if damaged:\n        kept = free_name(", "    if False:\n        kept = free_name("),
     ("refusal-silent-about-damage", PIPE, 'was kept as {kept[-1]})" if kept else "")', 'was kept as {kept[-1]})" if False else "")'),
