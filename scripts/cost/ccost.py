@@ -24,6 +24,18 @@ def short(model):
     return re.sub(r"^claude-|-\d{8}$", "", model or "?")
 
 
+TOKEN_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+
+
+def _count(v):
+    """A token count: a finite non-negative number, else 0 (a null, a string, a bool, NaN)."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and 0 <= v < float("inf") else 0
+
+
+def _text(v):
+    return v if isinstance(v, str) else None
+
+
 def load(path):
     """API calls in order, deduplicated by message id: dicts with id, model, usage, ts, tools, side
     (a sidechain call, on another thread than the main conversation) and earlier (the attempts
@@ -48,14 +60,17 @@ def load(path):
             u, mid = m.get("usage"), m.get("id")
             if not isinstance(u, dict) or not mid or m.get("model") == "<synthetic>":
                 continue
-            u = {k: (v if v is not None else 0) for k, v in u.items()}   # a null count is 0, not a crash
+            u = {k: (_count(v) if k in TOKEN_KEYS else v) for k, v in u.items()}   # a null or odd count is 0, not a crash
             if mid not in calls:
                 order.append(mid)
-            tools = [c.get("name") for c in m.get("content") or [] if isinstance(c, dict) and c.get("type") == "tool_use"]
+            content = m.get("content") if isinstance(m.get("content"), list) else []
+            tools = [c.get("name") for c in content if isinstance(c, dict) and c.get("type") == "tool_use"
+                     and isinstance(c.get("name"), str)]
+            model = _text(m.get("model"))
             its = u.get("iterations") if isinstance(u.get("iterations"), list) else []
-            calls[mid] = dict(id=mid, model=m.get("model"), u=u, ts=d.get("timestamp") or "",
+            calls[mid] = dict(id=mid, model=model, u=u, ts=_text(d.get("timestamp")) or "",
                               side=bool(d.get("isSidechain")),
-                              earlier=[(i, i.get("model") or m.get("model")) for i in its[:-1] if isinstance(i, dict)],
+                              earlier=[(i, _text(i.get("model")) or model) for i in its[:-1] if isinstance(i, dict)],
                               tools=calls.get(mid, {}).get("tools", []) + tools)
     return [calls[i] for i in order]
 
@@ -86,8 +101,11 @@ def earlier_split(c):
 
 def split_usage(u, model):
     pi, p5, p1, pr, po = price(model)
-    cc = u.get("cache_creation") or {}
+    cc = u.get("cache_creation")
+    cc = cc if isinstance(cc, dict) else {}
     w5, w1 = cc.get("ephemeral_5m_input_tokens"), cc.get("ephemeral_1h_input_tokens")
+    w5 = _count(w5) if w5 is not None else None
+    w1 = _count(w1) if w1 is not None else None
     if w5 is None and w1 is None:
         w5, w1 = 0, u.get("cache_creation_input_tokens", 0)  # no breakdown: assume 1h
     s = dict(uncached=u.get("input_tokens", 0) * pi, write5m=(w5 or 0) * p5, write1h=(w1 or 0) * p1,
@@ -98,9 +116,12 @@ def split_usage(u, model):
 
 
 def ts(s):
+    """Unix time of a transcript timestamp; 0 when it is missing, not a string, or unparseable."""
+    if not isinstance(s, str):
+        return 0
     try:
-        return datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
-    except ValueError:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError, OSError):
         return 0
 
 

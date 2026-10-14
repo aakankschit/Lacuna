@@ -19,7 +19,7 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 STARTUP, HAIKU_TIER = 3_700, 100_000
 TOP_KEYS = {"schema", "documents", "total_tokens", "per_agent", "readers", "largest_reader_tokens",
             "long_context_surcharge", "calibration", "budget_warn_usd", "estimates", "any_over_budget",
-            "cheapest_over_budget", "synthesis", "prices_retrieved", "warnings"}
+            "cheapest_over_budget", "synthesis", "prices_retrieved", "warnings", "configured"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -153,10 +153,11 @@ class TestEstimate(Sandbox):
         self.assertEqual((nothing["estimates"], nothing["any_over_budget"]), ([], False), "filtering to nothing is not a crash")
 
     def test_haiku_surcharge_applies_above_the_tier_to_the_key_haiku_only(self):
-        """R7: 5x for the model keyed exactly `haiku`, strictly above 100,000 reader tokens, with a
+        """R7: 5x for a row that is the haiku tier however it is named (`haiku`, `haiku-5-5`,
+        `claude-haiku-5-5`), but not `myhaiku`; strictly above 100,000 reader tokens, with a
         warning naming --per-agent; and lowering --per-agent clears it."""
         mk = lambda: {"low": {"usd_per_ktok": .001, "minutes_per_paper": 1}}
-        self.cal({"haiku": mk(), "haiku-5-5": mk(), "myhaiku": mk(), "sonnet": mk()})
+        self.cal({"haiku": mk(), "haiku-5-5": mk(), "claude-haiku-5-5": mk(), "myhaiku": mk(), "sonnet": mk()})
         at = write(self.p("at.md"), "a" * 279270)        # 96,300 tokens + 3,700 = 100,000 exactly
         doc = self.est_json(at)
         self.assertEqual(doc["largest_reader_tokens"], HAIKU_TIER)
@@ -168,7 +169,9 @@ class TestEstimate(Sandbox):
         self.assertTrue(any("--per-agent" in w for w in doc["warnings"]), doc["warnings"])
         tokens = 279273 / 2.9
         self.close(self.cell(doc, "haiku", "low")["usd"], tokens / 1000 * .001 * 5, "haiku x5")
-        for m in ("haiku-5-5", "myhaiku", "sonnet"):
+        for m in ("haiku-5-5", "claude-haiku-5-5"):
+            self.close(self.cell(doc, m, "low")["usd"], tokens / 1000 * .001 * 5, m + " x5")
+        for m in ("myhaiku", "sonnet"):
             self.close(self.cell(doc, m, "low")["usd"], tokens / 1000 * .001, m)
         files = [write(self.p(f"h{i}.md"), "a" * (2900 * 60)) for i in range(3)]
         self.assertTrue(self.est_json(*files, "--per-agent", "3")["long_context_surcharge"])
@@ -249,6 +252,85 @@ class TestEstimate(Sandbox):
         doc = self.est_json(self.doc("a.md"), "--effort", "low")
         self.assertFalse(doc["any_over_budget"], "cost == threshold is not over")
         self.assertIsNone(doc["cheapest_over_budget"])
+
+    def test_the_configured_row_is_the_one_an_approval_gate_reads(self):
+        """`any_over_budget` is true when ANY row of the table is, so a model told to gate approval on
+        it was asking about a $2.30 sonnet/max run for a $0.018 haiku/medium one."""
+        mk = lambda u: {"usd_per_ktok": u, "minutes_per_paper": 1.0}
+        self.cal({"haiku": {"medium": mk(.001)}, "sonnet": {"max": mk(5.0)}})
+        self.config({"budget_warn_usd": 1.0})
+        f = self.doc("a.md", 10)
+        doc = self.est_json(f)
+        self.assertTrue(doc["any_over_budget"])
+        self.assertEqual(doc["configured"], {"model": "haiku", "effort": "medium", "calibrated": True,
+                                             "usd": doc["configured"]["usd"], "over_budget": False})
+        self.assertAlmostEqual(doc["configured"]["usd"], 10_000 / 1000 * .001, places=9)
+        # the configured row, however it is named in the calibration or in the config
+        self.cal({"claude-haiku-5-5": {"medium": mk(.001)}})
+        self.assertTrue(self.est_json(f)["configured"]["calibrated"])
+        self.config({"budget_warn_usd": 1.0, "models": {"reader": "claude-haiku-5-5"}})
+        self.assertTrue(self.est_json(f)["configured"]["calibrated"])
+        self.cal({"haiku": {"medium": mk(1.0)}})
+        self.assertTrue(self.est_json(f, "--model", "haiku", "--effort", "low")["configured"]["over_budget"],
+                        "a filter narrows the table, not the question")
+        self.config({"budget_warn_usd": 1.0, "models": {"reader": "opus"}})
+        self.assertEqual(self.est_json(f)["configured"],
+                         {"model": "opus", "effort": "medium", "calibrated": False, "usd": None, "over_budget": None})
+
+    def test_a_mis_shaped_calibration_unreadable_files_and_foreign_types_are_refused_not_tracebacks(self):
+        """D11: each of these was a traceback (or, in text mode, a table of nan)."""
+        f = self.doc("a.md")
+        for name, raw in {"string number": '{"haiku": {"low": {"usd_per_ktok": "0.1", "minutes_per_paper": 1}}}',
+                          "missing field": '{"haiku": {"low": {"usd_per_ktok": 0.1}}}',
+                          "cell is a number": '{"haiku": {"low": 5}}',
+                          "NaN": '{"haiku": {"low": {"usd_per_ktok": NaN, "minutes_per_paper": 1}}}',
+                          "negative": '{"haiku": {"low": {"usd_per_ktok": -1, "minutes_per_paper": 1}}}'}.items():
+            for mode in ((), ("--json",)):
+                with self.subTest(name, json=bool(mode)):
+                    write(os.path.join(self.data, "calibration.json"), raw)
+                    r = self.est(f, *mode)
+                    self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertIn("unusable", r.stderr, "the shipped calibration is used, and the user is told so")
+                    if mode:
+                        self.assertEqual(json.loads(r.stdout)["calibration"]["source"], "upstream")
+        os.remove(os.path.join(self.data, "calibration.json"))
+        locked = write(self.p("locked.md"), "x" * 3000)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o644)
+        folder = os.path.join(self.p("dir"), "folder.md")
+        os.makedirs(folder)
+        write(os.path.join(self.p("dir"), "real.md"), "x" * 3000)
+        for name, args, code in (("unreadable file", [locked], 2), ("a .docx by name", [write(self.p("p.docx"), "x" * 3000)], 2),
+                                 ("a directory named *.md", [self.p("dir")], 0)):
+            with self.subTest(name):
+                if name == "unreadable file" and os.access(locked, os.R_OK):
+                    self.skipTest("running as a user who can read anything")
+                r = self.est(*args, "--json")
+                self.assertEqual((r.returncode, "Traceback" in r.stderr), (code, False), r.stderr[-300:])
+                if code == 0:
+                    self.assertEqual(json.loads(r.stdout)["documents"], 1, "the folder is not a document")
+                else:
+                    self.assertEqual(r.stdout, "")
+
+    def test_a_directory_of_uppercase_extensions_is_priced(self):
+        d = self.p("docs")
+        write(os.path.join(d, "A.MD"), "a" * 3000)
+        write(os.path.join(d, "B.TXT"), "b" * 3000)
+        self.assertEqual(self.est_json(d)["documents"], 2)
+
+    def test_a_calibration_warning_is_in_the_report_only_when_that_file_is_in_use(self):
+        write(os.path.join(self.data, "calibration.json"), "[1]")
+        f = self.doc("a.md")
+        r = self.est(f)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("unusable", r.stderr, "text mode says so on stderr")
+        self.assertTrue(any("unusable" in w for w in json.loads(self.est(f, "--json").stdout)["warnings"]))
+        code = ("import sys, json; sys.path.insert(0, %r)\nimport lit_cost as C\n"
+                "r, x = C.estimate([%r], 1, cal=C.json.load(open(%r)))\nprint(json.dumps(r['warnings']))\n") % (
+                LIT, f, SHIPPED_CAL)
+        r = self.run_py(["-c", code])
+        self.assertEqual((r.returncode, json.loads(r.stdout)), (0, []), "an explicit calibration inherits no warning")
 
     def test_bad_budget_disables_the_check_with_a_warning(self):
         """R11: config.json is hand-edited. A non-number warns and disables; 0, negative and
@@ -394,7 +476,7 @@ class TestEstimate(Sandbox):
                 self.assertEqual(flags - set(re.findall(r"--[a-z][\w-]*", text)), set(), text)
         skill = read(os.path.join(ROOT, "skills", "lit-review", "SKILL.md"))
         self.assertIn("lit estimate", skill)
-        self.assertIn("any_over_budget", skill, "the skill must name the field it gates approval on")
+        self.assertIn("configured.over_budget", skill, "the skill must name the field it gates approval on")
 
 
 # --------------------------------------------------------------------------------------------
@@ -482,6 +564,7 @@ class TestSpend(Sandbox):
         self.assertIn("$0.01–$0.41 list price, a lower bound", s)       # +100k sonnet 1h write, $0.40
         self.assertIn("1 call(s) were retried", s)
         self.assertIn("$1.32–$1.72 list price, a lower bound", fleet, "a fork's copied calls are counted once")
+        self.assertIn("1 call(s) were retried", fleet, "the fleet report says so too, not only the session's")
         s, _ = self.spend("--session", self.session)
         self.assertIn("$1.06 list price, a lower bound", s, "no retries: one figure, still called a lower bound")
         self.assertNotIn("retried", s)
@@ -523,6 +606,23 @@ class TestSpend(Sandbox):
         s, _ = self.spend("--session", t)
         self.assertIn("output+thinking $0.02–$10.02", s)
         self.assertIn("$0.020–$10.020", s, "the most-expensive-turns list")
+
+    def test_a_warm_cache_with_a_big_new_write_is_not_labelled_a_cold_rewrite(self):
+        """The per-turn label in the session table had its own copy of the old fixed-threshold rule;
+        only the count line used is_cold. A call that read 11,115 of the previous 11,117 tokens and
+        wrote 43,903 45 s later is the cache working."""
+        now = datetime.now(timezone.utc) - timedelta(minutes=5)
+        s_ = "claude-sonnet-5-5"
+        t = jsonl(os.path.join(self.home, ".claude", "projects", "-w-p", "aaaa.jsonl"), [
+            call("wa", s_, now - timedelta(seconds=45), usage(0, 11_117, 0, 100)),
+            call("wb", s_, now, usage(0, 43_903, 11_115, 100))])
+        s, _ = self.spend("--session", t)
+        self.assertNotIn("cold rewrite", s)
+        late = jsonl(os.path.join(self.home, ".claude", "projects", "-w-p", "bbbb.jsonl"), [
+            call("wc", s_, now - timedelta(hours=3), usage(0, 50_000, 0, 100)),
+            call("wd", s_, now, usage(0, 52_000, 0, 100))])
+        s, _ = self.spend("--session", late)
+        self.assertIn("cold rewrite", s)
 
     def test_session_id_prefix_resolves_and_an_unknown_id_exits_2(self):
         jsonl(os.path.join(self.proj, "zzzz9999.jsonl"), [call("x", "claude-haiku-5-5", datetime.now(timezone.utc), usage(out=10))])
@@ -882,6 +982,86 @@ class TestConfigReport(Sandbox):
                 os.remove(os.path.join(self.data, name))
         write(os.path.join(self.data, "config.json"), deep)
         self.assertIn("not valid JSON", self.lacuna("config").stdout)
+
+    def test_a_config_or_pricing_file_that_was_not_used_is_said_by_every_command_that_spends(self):
+        """A trailing comma sent `synth` to the default planner, skipped the user's after.synth hook
+        and priced at shipped rates, and only `lacuna config` ever mentioned it."""
+        doc = self.doc_file()
+        write(os.path.join(self.data, "config.json"), '{"models": {"planner": "sonnet"},}')
+        runs = {"lit estimate": self.lacuna("lit", "estimate", doc),
+                "spend": self.lacuna("spend"),
+                "lit verify": self.lacuna("lit", "verify", "--target", self.p("nope.md"), "--repo", self.tmp)}
+        for name, r in runs.items():
+            with self.subTest(name):
+                self.assertIn("config.json", r.stderr)
+                self.assertIn("not valid JSON", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.calls(), [])
+        os.remove(os.path.join(self.data, "config.json"))
+        for body, needle in (("[1, 2", "pricing.json: not valid JSON"), ("[1]", "should be an object"),
+                             ('{"models": {"opus-5-5": "12345", "sonnet-5-5": [1, -2, 3, 4, 5]}}', "opus-5-5")):
+            with self.subTest(body):
+                write(os.path.join(self.data, "pricing.json"), body)
+                for r in (self.lacuna("lit", "estimate", doc), self.lacuna("spend")):
+                    self.assertIn(needle, r.stderr)
+        os.remove(os.path.join(self.data, "pricing.json"))
+        for r in (self.lacuna("lit", "estimate", doc), self.lacuna("spend")):
+            self.assertEqual(r.stderr, "", "nothing to say when the files are fine")
+        # a hook and the status line are not the place to talk
+        write(os.path.join(self.data, "config.json"), '{"models": {},}')
+        r = self.run_py([os.path.join(ROOT, "hooks", "cache_guard.py")], input='{"hook_event_name": "SessionStart"}')
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+
+    def doc_file(self):
+        return write(self.p("a.md"), "a" * 3000)
+
+    def test_wrong_typed_settings_fall_back_to_the_default_and_say_so(self):
+        """D10: a number for a model crashed estimate, read and synth; `"cache": true` made a
+        directory named ./True; `config` showed the raw value rather than the one in effect."""
+        doc = self.doc_file()
+        for cfg in ({"models": {"planner": 5}}, {"models": {"planner": ["sonnet"]}}, {"models": {"reader": {"id": "x"}}},
+                    {"effort": {"reader": 5}}, {"paths": {"cache": True}}, {"paths": {"python": ["a"]}},
+                    {"after": {"read": 5}}, {"paths": {"cache": "a\u0000b"}}, {"models": {"reader": "  "}}):
+            with self.subTest(cfg):
+                self.config(cfg)
+                for args in (("config",), ("config", "--json"), ("lit", "estimate", doc, "--json"), ("lit", "estimate", doc)):
+                    r = self.lacuna(*args)
+                    self.assertEqual(r.returncode, 0, f"{args}: {r.stderr[-300:]}")
+                    self.assertNotIn("Traceback", r.stderr)
+                out = json.loads(self.lacuna("config", "--json").stdout)
+                self.assertEqual(out["models"], json.loads(json.dumps(out["models"])))
+                for section in ("models", "effort", "paths"):
+                    for k, v in out[section].items():
+                        self.assertIsInstance(v, str, f"{section}.{k} shows the value in effect")
+                        self.assertTrue(v.strip())
+        self.config({"models": {"planner": 5}, "paths": {"cache": True}})
+        r = self.lacuna("config")
+        self.assertIn("planner should be text, not 5", r.stdout)
+        self.assertIn("planner=claude-opus-5", r.stdout, "the default is shown, not 5")
+        self.assertNotRegex(r.stdout, r"planner=5")
+        r = self.lacuna("lit", "read", doc, "--out", self.p("out"))
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "True")), "a bool is not a path")
+
+    def test_config_json_output_is_strict_json(self):
+        write(os.path.join(self.data, "config.json"), '{"budget_warn_usd": NaN}')
+        r = self.lacuna("config", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        json.loads(r.stdout, parse_constant=lambda c: self.fail(f"{c} is not JSON"))
+
+    def test_a_price_override_applies_however_the_model_is_named(self):
+        """D15: `claude-opus-5-5` in pricing.json priced nothing for a role configured as `opus`,
+        because the alias resolves to `opus-5-5`."""
+        f = self.doc_file()
+        base = json.loads(self.lacuna("config", "--json").stdout)["prices"]
+        self.assertIn("opus-5-5", base)
+        write(os.path.join(self.data, "pricing.json"), json.dumps({"models": {"claude-opus-5-5": [1, 2, 3, 4, 77]}}))
+        self.config({"models": {"planner": "opus"}})
+        prices = json.loads(self.lacuna("config", "--json").stdout)["prices"]
+        self.assertEqual(prices["opus-5-5"], [1, 2, 3, 4, 77])
+        self.assertNotIn("claude-opus-5-5", prices)
+        syn = json.loads(self.lacuna("lit", "estimate", f, "--json").stdout)["synthesis"]
+        self.assertAlmostEqual(syn["usd"], syn["context_tokens"] * 3 / 1e6 + 8_000 * 77 / 1e6, places=9)
 
 
 FAKE_PYMUPDF = '''

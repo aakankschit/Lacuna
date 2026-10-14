@@ -365,6 +365,45 @@ class TestTranscriptMoney(unittest.TestCase):
         cold = sorted(calls[i]["id"] for i in ccost.avoidable_colds(calls))
         self.assertEqual(cold, ["cold", "idle"])
 
+    def test_a_small_context_is_judged_by_the_same_rule_as_a_large_one(self):
+        """VERDICT3 N3: a session whose second call reads all of the first call's context and writes
+        a big tool result 45 s later is the cache working, not an idle re-cache; and a re-cache after
+        an idle hour counts even when the whole context is under 40k. Fixed thresholds got both wrong."""
+        from datetime import datetime, timedelta, timezone
+        base = datetime(2026, 10, 13, 12, 0, 0, tzinfo=timezone.utc)
+        O, S = "claude-opus-5-5", "claude-sonnet-5-5"
+
+        def row(mid, after, write, read, model=O):
+            return {"type": "assistant", "timestamp": (base + after).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "message": {"id": mid, "model": model, "usage": {
+                        "input_tokens": 5, "output_tokens": 500, "cache_creation_input_tokens": write,
+                        "cache_read_input_tokens": read}}}
+        td = lambda **k: timedelta(**k)
+        cases = {   # name: (rows, ids that are avoidable cold rewrites)
+            "warm: reads all of the previous 11,117, writes 43,903, 45 s later":
+                ([row("a", td(), 11_117, 0), row("b", td(seconds=45), 43_903, 11_115)], []),
+            "cache invalidated 30 s on is not idle":
+                ([row("a", td(), 100_000, 0), row("b", td(seconds=30), 101_000, 0)], []),
+            "a /model switch ten minutes on is not idle":
+                ([row("a", td(), 100_000, 0), row("b", td(minutes=10), 101_000, 0, S)], []),
+            "idle two hours, a 50k context re-written":
+                ([row("a", td(), 50_000, 0), row("b", td(hours=2), 52_000, 0)], ["b"]),
+            "idle three hours on a context that was under 40k":
+                ([row("a", td(), 30_000, 0), row("b", td(minutes=1), 2_000, 30_000), row("c", td(hours=3), 45_000, 0)], ["c"]),
+            "a ten-minute tool run outlives the five-minute cache":
+                ([row("a", td(), 80_000, 0), row("b", td(minutes=10), 82_000, 0)], ["b"]),
+            "the first write of a session is the price of starting":
+                ([row("a", td(), 60_000, 0)], []),
+        }
+        for name, (rows, want) in cases.items():
+            with self.subTest(name):
+                with tempfile.TemporaryDirectory() as d:
+                    p = os.path.join(d, "t.jsonl")
+                    with open(p, "w") as f:
+                        f.write("".join(json.dumps(r) + "\n" for r in rows))
+                    calls = ccost.load(p)
+                self.assertEqual(sorted(calls[i]["id"] for i in ccost.avoidable_colds(calls)), want)
+
     def test_refused_attempts_are_priced_apart_from_the_call(self):
         """The top-level usage is the last attempt only; earlier ones sit in usage.iterations, each
         with its own model. Their cost is reported as the top of a range, never added in."""
@@ -612,6 +651,139 @@ class TestMalformedExternalData(unittest.TestCase):
             split, ctx = ccost.split(calls[0])          # must not raise
             self.assertEqual(ctx, 5)
             self.assertGreater(split["output"], 0)
+
+
+class TestWrongShapedTranscripts(unittest.TestCase):
+    """Transcripts are written by other software. Each guard below survived its own revert at 0.3.1,
+    and the status line carries its own copy of every one (it is self-contained by design), so each
+    case runs through ccost and through statusline."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "cost"))
+        sys.path.insert(0, os.path.join(ROOT, "statusline"))
+        import importlib, statusline
+        cls.sl = importlib.reload(statusline)
+
+    def rows(self, *rows):
+        d = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "t.jsonl")
+        with open(p, "w") as f:
+            f.write("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows))
+        return p
+
+    @staticmethod
+    def line(mid="m1", model="claude-opus-5-5", usage=None, **kw):
+        u = {"input_tokens": 10, "output_tokens": 1000, "cache_read_input_tokens": 100_000,
+             "cache_creation_input_tokens": 1000}
+        u.update(usage or {})
+        return {"type": "assistant", "timestamp": "2026-10-14T00:00:00Z",
+                "message": {"id": mid, "model": model, "usage": u, **kw}}
+
+    def test_ccost_load_skips_or_zeroes_what_is_not_the_expected_shape(self):
+        good = self.line("good")
+        odd = self.line("odd")
+        odd["message"]["usage"]["iterations"] = [3, {"output_tokens": 2}, {"output_tokens": 1}]
+        odd["message"]["usage"]["cache_creation"] = "1h"
+        cases = {
+            "usage is a list": ([{**self.line("a"), "message": {"id": "a", "model": "m", "usage": [1]}}, good], ["good"]),
+            "iterations hold a non-object": ([odd], ["odd"]),
+            "string, bool and NaN counts": ([self.line("c", usage={"output_tokens": "1000", "input_tokens": True,
+                                                                      "cache_read_input_tokens": float("nan")})], ["c"]),
+            "model is a number": ([self.line("d", model=5)], ["d"]),
+            "content is a number": ([self.line("e", content=7)], ["e"]),
+            "timestamp is a number": ([{**self.line("f"), "timestamp": 1760400000}], ["f"]),
+        }
+        for name, (rows, want) in cases.items():
+            with self.subTest(name):
+                calls = ccost.load(self.rows(*rows))
+                self.assertEqual([c["id"] for c in calls], want)
+                for c in calls:
+                    ccost.split(c), ccost.earlier_usd(c), ccost.ts(c["ts"]), ccost.short(c["model"])   # none may raise
+        c = ccost.load(self.rows(self.line("c", usage={"output_tokens": "1000"})))[0]
+        self.assertEqual(ccost.split(c)[0]["output"], 0, "a string count is 0, not 1000 and not a crash")
+        self.assertEqual(ccost.ts("yesterday"), 0)
+        self.assertEqual(ccost.ts(None), 0)
+        self.assertEqual(ccost.ts(1760400000), 0, "a numeric timestamp is no timestamp, and must not raise")
+
+    def test_the_status_line_reads_the_same_shapes_the_same_way(self):
+        sl = self.sl
+        self.assertEqual([sl._n({"x": v}, "x") for v in (None, "1000", True, float("nan"), float("inf"), 7)],
+                         [0, 0, 0, 0, 0, 7])
+        sl.cost({"output_tokens": 5}, 5)                      # a model that is not text prices at the fallback
+        sl.cost({"output_tokens": 5}, ["x"])
+        good = self.line("good")
+        wrong = {
+            "iterations is an object": {"iterations": {"a": 1}},
+            "iterations hold a non-object": {"iterations": [3, {"output_tokens": 2}, {"output_tokens": 1}]},
+            "string count": {"output_tokens": "1000"},
+        }
+        for name, extra in wrong.items():
+            with self.subTest(name):
+                row = self.line("w", usage=extra)
+                got = sl.last_turn(self.rows(row))
+                self.assertIsNotNone(got, "the segment survives a field of the wrong type")
+        got = sl.last_turn(self.rows(self.line("w", model=5)))
+        self.assertIsNotNone(got)
+        # an attempt is priced at its own model: a haiku refusal under an opus call is not an opus one
+        two = self.line("t", usage={"iterations": [
+            {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 300_000,
+             "cache_read_input_tokens": 0, "model": "claude-haiku-5-5"},
+            {"input_tokens": 10, "output_tokens": 1000, "cache_creation_input_tokens": 1000,
+             "cache_read_input_tokens": 100_000, "model": "claude-opus-5-5"}]})
+        _, earlier = sl.last_turn(self.rows(two))
+        want = 300_000 * 0.20 / 1e6                           # haiku-5-5's 1h write; opus-5-5's would be 8.00 -> $2.40
+        self.assertAlmostEqual(earlier, want, places=6)
+        c = ccost.load(self.rows(two))[0]
+        self.assertAlmostEqual(ccost.earlier_usd(c), want, places=6, msg="ccost prices the attempt at its own model too")
+
+    def test_prices_that_are_negative_or_not_finite_are_dropped_by_every_reader(self):
+        sl = self.sl
+        for name, table in {"negative": [1, -2, 3, 4, 5], "infinite": [1, float("inf"), 3, 4, 5],
+                            "nan": [1, float("nan"), 3, 4, 5]}.items():
+            with self.subTest(name):
+                self.assertEqual(lacuna_config._price_table({"models": {"x": table}}), {})
+                self.assertEqual(sl._price_table({"models": {"x": table}}), {})
+        for reader in (lacuna_config._price_table, sl._price_table):
+            self.assertEqual(list(reader({"models": {"claude-opus-5-5": [1, 2, 3, 4, 5]}})), ["opus-5-5"],
+                             "a price keyed by the full model id is the alias's price too")
+
+    def test_the_cache_guard_skips_a_compact_looking_line_that_is_not_an_object(self):
+        sys.path.insert(0, os.path.join(ROOT, "hooks"))
+        import cache_guard
+        p = self.rows('"isCompactSummary"', '[1, "compact_boundary"]', '5')
+        self.assertFalse(cache_guard.compacted_since(p, 0))
+
+
+class TestFleetReportOrder(unittest.TestCase):
+    """A fork copies its parent's calls, message ids and all, into a new file; the fleet report
+    counts each id once, in the first file it meets. That file must not depend on what order the
+    filesystem lists them in, or the same disk gives a different "by project" on another machine."""
+
+    def test_the_first_file_in_sorted_order_is_credited_whatever_order_glob_returns(self):
+        import contextlib, io
+        from datetime import datetime, timezone
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "cost"))
+        import spend
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = json.dumps({"type": "assistant", "timestamp": now, "message": {
+            "id": "same", "model": "claude-sonnet-5-5", "usage": {"output_tokens": 1_000_000}}}) + "\n"
+        with tempfile.TemporaryDirectory() as root:
+            for proj in ("-work-aaa", "-work-zzz"):
+                os.makedirs(os.path.join(root, proj))
+                with open(os.path.join(root, proj, "s.jsonl"), "w") as f:
+                    f.write(row)
+            real = spend.glob.glob
+            for name, order in {"as listed": lambda xs: xs, "reversed": lambda xs: list(reversed(xs))}.items():
+                with self.subTest(name), mock.patch.object(spend, "ROOT", root), \
+                        mock.patch.object(spend.glob, "glob", lambda *a, **k: order(real(*a, **k))):
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        spend.COLOR = False
+                        spend.fleet_report(7)
+                    self.assertIn("work-aaa $10.00", out.getvalue())
+                    self.assertNotIn("work-zzz", out.getvalue())
 
 
 class TestEstimateAndReadAgree(unittest.TestCase):

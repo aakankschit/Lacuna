@@ -30,14 +30,34 @@ def die3(msg):
 # Your own calibration in the data directory wins; the shipped one is someone else's runs.
 # A hand-edited file that does not parse is reported and the shipped one used, as lacuna_config does
 # for config.json and pricing.json; it once ended `lit estimate` with a traceback.
+def cal_problem(cal):
+    """Why a calibration cannot be priced from, or None. Each cell of each model row needs a finite,
+    non-negative usd_per_ktok and minutes_per_paper: a string, a missing field or a NaN used to end
+    `lit estimate` in a traceback (or, in text mode, a table of nan)."""
+    if not isinstance(cal, dict):
+        return "the top level is not an object"
+    for m, row in cal.items():
+        if m.startswith("_") or not isinstance(row, dict):
+            continue
+        for e, c in row.items():
+            if c == {}:                  # an empty cell means "not measured": it is left out of the table
+                continue
+            ok = isinstance(c, dict) and all(
+                isinstance(c.get(k), (int, float)) and not isinstance(c.get(k), bool)
+                and math.isfinite(c[k]) and c[k] >= 0 for k in ("usd_per_ktok", "minutes_per_paper"))
+            if not ok:
+                return f"{m}/{e} needs numeric usd_per_ktok and minutes_per_paper"
+    return None
+
+
 _user_cal = os.path.join(lacuna_config.DATA, "calibration.json")
 CAL_PATH, CAL_WARNING = os.path.join(HERE, "calibration.json"), None
 if os.path.exists(_user_cal):
     try:
         with open(_user_cal) as f:
             _cal = json.load(f)
-        if not isinstance(_cal, dict):
-            raise ValueError("the top level is not an object")
+        if cal_problem(_cal):
+            raise ValueError(cal_problem(_cal))
         CAL_PATH = _user_cal
     except (OSError, ValueError, RecursionError) as e:   # a deeply nested file recurses, not ValueErrors
         CAL_WARNING = f"your calibration {_user_cal} is unusable ({e}); using the shipped one instead"
@@ -66,6 +86,11 @@ def pdf_text(path):
         return subprocess.run(["pdftotext", path, "-"], capture_output=True, text=True).stdout
     die3("ERROR: estimating a PDF needs either the parser venv (`lacuna doctor --install-pdf`) "
              "or `pdftotext` (poppler) on PATH. Estimating a parsed .md needs neither.")
+
+
+def is_haiku(model):
+    """A calibration row is the cheap tier whether it is named `haiku` or `claude-haiku-5-5`."""
+    return lacuna_config.canonical(model).startswith("haiku")
 
 
 def is_pdf(path):
@@ -126,17 +151,29 @@ def estimate(files, per_agent, model=None, effort=None, cal=None, config=None):
         warnings.append(budget_msg)
     biggest_n = max(len(g) for g in groups)
     waves = -(-len(groups) // POOL)      # readers run POOL at a time, so N groups take N/POOL waves
+    def usd_of(m, e):
+        c = cal.get(m, {}).get(e) if isinstance(cal.get(m), dict) else None
+        if not c:
+            return None
+        # float() because a hand-written calibration may hold integers, and the contract says float
+        return float(total / 1000 * c["usd_per_ktok"] * (5 if is_haiku(m) and surcharge else 1))
+
     ests = []
     for m in models:
         for e in efforts:
-            c = cal.get(m, {}).get(e)
-            if not c:
+            usd = usd_of(m, e)
+            if usd is None:
                 continue
-            # float() because a hand-written calibration may hold integers, and the contract says float
-            usd = float(total / 1000 * c["usd_per_ktok"] * (5 if m == "haiku" and surcharge else 1))
             ests.append({"model": m, "effort": e, "usd": usd,
-                         "minutes": float(c["minutes_per_paper"] * biggest_n * waves),
+                         "minutes": float(cal[m][e]["minutes_per_paper"] * biggest_n * waves),
                          "over_budget": warn is not None and usd > warn})
+    # The row `lit read` would actually use. `any_over_budget` is true if ANY row of the table is,
+    # so a model told to gate approval on it asked about a $2.30 run for a $0.018 one.
+    rm, re_ = lacuna_config.model("reader"), lacuna_config.effort("reader")
+    row = next((m for m in known if lacuna_config.canonical(m) == lacuna_config.canonical(rm)), None)
+    cu = usd_of(row, re_) if row else None
+    configured = {"model": rm, "effort": re_, "calibrated": cu is not None,
+                  "usd": cu, "over_budget": None if cu is None else (warn is not None and cu > warn)}
     over = [x for x in ests if x["over_budget"]]
     cheap = min(over, key=lambda x: x["usd"]) if over else None  # min() keeps the first of equals
     new_ctx = IDEATION["notes_tok"] * len(files) + IDEATION["context_tok"]
@@ -159,7 +196,7 @@ def estimate(files, per_agent, model=None, effort=None, cal=None, config=None):
         "long_context_surcharge": surcharge,
         "calibration": {"source": src, "path": os.path.abspath(CAL_PATH), "measured": cal.get("_measured")},
         "budget_warn_usd": None if warn is None else float(warn),
-        "estimates": ests, "any_over_budget": bool(over),
+        "estimates": ests, "configured": configured, "any_over_budget": bool(over),
         "cheapest_over_budget": (None if cheap is None else
                                  {"model": cheap["model"], "effort": cheap["effort"], "usd": cheap["usd"]}),
         "synthesis": synth, "prices_retrieved": lacuna_config.price_meta()["retrieved"],
@@ -186,19 +223,35 @@ def main():
     missing = [p for p in a.paths if not os.path.exists(p)]
     if missing:
         die2(f"ERROR: no such path: {', '.join(missing)}")
-    files = [os.path.join(d, f) for d in a.paths if os.path.isdir(d) for f in sorted(os.listdir(d))
-             if f.lower().endswith(READABLE)] + [p for p in a.paths if not os.path.isdir(p)]
+    lacuna_config.warn_config_errors()      # a config.json or pricing.json that was not used as written
+    try:
+        files = [os.path.join(d, f) for d in a.paths if os.path.isdir(d) for f in sorted(os.listdir(d))
+                 if f.lower().endswith(READABLE) and os.path.isfile(os.path.join(d, f))]
+    except OSError as e:
+        die2(f"ERROR: cannot list a directory: {e.strerror}")
+    # A file named on the command line gets the same test as one found in a directory: `lit read`
+    # does not read a .docx, so an estimate for one would be a price for a run that cannot happen.
+    odd = [p for p in a.paths if not os.path.isdir(p) and not p.lower().endswith(READABLE)]
+    if odd:
+        die2("ERROR: not a document `lit read` accepts (" + ", ".join(READABLE) + "): " + ", ".join(odd))
+    files += [p for p in a.paths if not os.path.isdir(p)]
     if not files:
         die2("ERROR: no " + ", ".join(READABLE) + " documents found in those paths.")
     # A PDF yielding no text is broken, encrypted or a scan. Pricing it at $0.00 and exiting 0
     # tells the user the run is free. A small .md or .txt is simply small, and is left alone.
-    unreadable = [f for f in files if is_pdf(f) and tokens(f) < 20]
+    try:
+        unreadable = [f for f in files if is_pdf(f) and tokens(f) < 20]
+    except OSError as e:
+        die2(f"ERROR: cannot read {e.filename}: {e.strerror}")
     if unreadable:
         die2("ERROR: no extractable text in: "
              + ", ".join(os.path.basename(f) for f in unreadable)
              + "\nAn estimate of $0.00 would be meaningless — the file is corrupt, encrypted, or a "
                "scan with no text layer. `lacuna lit read` would fail on it too.")
-    r, x = estimate(files, a.per_agent, a.model or None, a.effort or None)  # nothing printed yet
+    try:
+        r, x = estimate(files, a.per_agent, a.model or None, a.effort or None)  # nothing printed yet
+    except OSError as e:
+        die2(f"ERROR: cannot read {e.filename}: {e.strerror}")
     if CAL_WARNING:
         print(f"warning: {CAL_WARNING}", file=sys.stderr)
     if a.json:

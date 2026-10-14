@@ -44,7 +44,7 @@ def _price_table(doc):
         except (TypeError, ValueError):
             continue
         if not str(k).startswith("_") and len(t) == 5 and all(math.isfinite(x) and x >= 0 for x in t):
-            out[k] = t
+            out[k[len("claude-"):] if k.startswith("claude-") else k] = t   # "claude-opus-5-5" is "opus-5-5"
     return out
 
 

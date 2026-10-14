@@ -11,6 +11,7 @@ import argparse, collections, glob, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ccost import ROOT, avoidable_colds, earlier_split, earlier_usd, load, project_dir, short, split, ts
+import lacuna_config    # on sys.path once ccost has been imported
 
 COLOR = True
 
@@ -176,6 +177,7 @@ def fleet_report(days):
 
 def main():
     global COLOR
+    lacuna_config.warn_config_errors()    # a pricing.json that was not used means these figures are not yours
     ap = argparse.ArgumentParser()
     ap.add_argument("--session")
     ap.add_argument("--days", type=int, default=7)
