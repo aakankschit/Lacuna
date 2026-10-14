@@ -23,9 +23,11 @@ for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
 # real run fails; "apology" is the dangerous one — a long, fluent failure that clears a size check.
 # "reply" is how a real model declines: is_error false, FAKE_REPLY as its text, nothing written.
 # "notdict" does the work but replies with JSON that is not an object; "hang" does the work and
-# never returns, so a test can interrupt a run part-way. "incomplete" writes a plausible plan and
-# then says, in its reply, that it could not read its sources — the honest failure a real model
-# gives. "clobber" writes its plan over --out itself instead of the .partial it was given.
+# never returns, so a test can interrupt a run part-way. "incomplete" is a model whose sources are
+# unreadable: it writes a plausible note or plan anyway and, only if the prompt told it the INCOMPLETE
+# rule, says in its reply that it could not read them — under a line of prose, as a real planner did.
+# Not told, it replies as usual, as a real reader did. "clobber" writes its plan over --out itself
+# instead of the .partial it was given.
 # "body" writes exactly FAKE_BODY to the note or plan path and replies FAKE_REPLY (default: the path).
 FAKE_CLAUDE = r'''#!{py}
 import json, os, re, sys, time
@@ -34,6 +36,8 @@ argv = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as f:
     f.write(json.dumps({{"argv": argv, "prompt": prompt}}) + "\n")
 mode = os.environ.get("FAKE_MODE", "ok")
+gave_up = mode == "incomplete" and "`INCOMPLETE: <what you could not read>`" in prompt
+GAVE_UP = "The text I was given is symbol noise; no sentence survives.\nINCOMPLETE: the sources could not be read"
 _d = float(os.environ.get("FAKE_DELAY", 0))      # lets a test overlap two real processes
 if _d:
     import time as _t; _t.sleep(_d)
@@ -68,13 +72,14 @@ if mode == "apology" and target:
                 + ("Explanation of the blockage. " * 120))
     print(json.dumps({{"is_error": False, "result": "done", "total_cost_usd": 0.01}}))
     sys.exit(0)
-if mode == "prose" and target:      # fluent, long, and not a note
+if mode == "prose" and target:      # fluent, long, no apology, and not a note: only its shape tells
     with open(target, "w") as f:
-        f.write("I can't summarise this paper because the text appears garbled throughout. " * 30)
+        f.write("The paper discusses its subject at length, and this summary follows it closely. " * 30)
     print(json.dumps({{"is_error": False, "result": "done", "total_cost_usd": 0.01}}))
     sys.exit(0)
 if prompt.startswith("Fact-check"):
-    print(json.dumps({{"is_error": False, "result": "No unverifiable claims found.", "total_cost_usd": 0.0012}}))
+    print(json.dumps({{"is_error": False, "total_cost_usd": 0.0012,
+                      "result": GAVE_UP if gave_up else "No unverifiable claims found."}}))
     sys.exit(0)
 if note:
     model = argv[argv.index("--model") + 1]
@@ -85,14 +90,14 @@ if note:
     with open(target, "w") as f:
         f.write("# A note ({{}})\n\n## Claim\n{{}}\n{{}}\n{{}}\nmodel={{}}\n\n## Key results\n".format(
             os.path.basename(note.group(1)), title, brief, books, model) + ("Finding with a number, 42 units. " * 40))
-    done({{"is_error": False, "result": target, "total_cost_usd": 0.012}})
+    done({{"is_error": False, "result": GAVE_UP if gave_up else target, "total_cost_usd": 0.012}})
 if plan:
     objective = next((l for l in prompt.splitlines() if l.startswith("Objective:")), "")
     with open(target, "w") as f:
         f.write("# Development plan\n\n{{}}\n\n## 1. A real proposal\n\n".format(objective)
                 + ("Substantive plan content naming src/widget/sampler.py. " * 60))
     done({{"is_error": False, "total_cost_usd": 0.3,
-           "result": "INCOMPLETE: the notes could not be read" if mode == "incomplete" else target}})
+           "result": GAVE_UP if gave_up else target}})
 print(json.dumps({{"is_error": False, "result": "nothing to do", "total_cost_usd": 0.0}}))
 '''
 
