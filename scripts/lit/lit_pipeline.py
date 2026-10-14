@@ -136,6 +136,14 @@ def after(stage, out_path):
     cmd = (lacuna_config.CONFIG.get("after") or {}).get(stage)
     if not cmd:
         return
+    # What the hook leaves in the output's directory is still Lacuna's: see rerecord().
+    d = out_path if os.path.isdir(out_path) else os.path.dirname(out_path) or "."
+    before = as_recorded(d)
+    _run_hook(stage, cmd, out_path)
+    rerecord(d, before)
+
+
+def _run_hook(stage, cmd, out_path):
     # Run through a shell so "~", "$VAR" and shell syntax work. The output path is APPENDED as the
     # final argument: a command with no arguments of its own therefore receives it as "$1".
     try:
@@ -313,10 +321,10 @@ def cmd_read(a):
             [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
         cached = os.path.join(CACHE, "notes", fitted(stem, f"_{key}.md", os.path.join(CACHE, "notes")))
-        # A note from before ownership was recorded (0.2.0), or from a run killed between writing
-        # it and recording it, is still provably this document's when it is exactly this document's
-        # cached note.
-        if blocked.get(note, ("",))[0] == UNRECORDED and same_bytes(note, cached):
+        # A note from before ownership was recorded (0.2.0), from a run killed between writing it
+        # and recording it, or restored from a backup over one a hook had changed (B29), is still
+        # provably this document's when it is exactly this document's cached note.
+        if blocked.get(note, ("",))[0] in (UNRECORDED, "edited") and same_bytes(note, cached):
             del blocked[note]
         jobs.append((src, md, note, cached))
     if blocked and not a.overwrite:
@@ -335,7 +343,6 @@ def cmd_read(a):
         if os.path.exists(cached) and os.path.getsize(cached) > 400:
             shutil.copy(cached, out)      # always refresh: --out may hold another run's note
             record(out, src)
-            written.append((out, src))
             return os.path.basename(out), "cached (free)", 0.0
         # Remove any earlier note first, so "the file exists" can only mean this call wrote it.
         # Otherwise a refusal on a re-run reports success and caches the stale note under a new key.
@@ -360,7 +367,6 @@ def cmd_read(a):
         if ok:
             _atomic_copy(out, cached)
             record(out, src)
-            written.append((out, src))
             return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
         why = (str(res.get("result"))[:120] if res.get("is_error") else
                "the file it wrote is not a note (see above)" if os.path.exists(out) else "agent produced no note file")
@@ -368,7 +374,7 @@ def cmd_read(a):
             os.remove(out)      # an apology left in --out would be read as a note by the next synth
         return os.path.basename(out), f"FAILED ${usd(res):.4f} — {why}", usd(res)
 
-    t0, total, failed, written = time.time(), 0.0, 0, []
+    t0, total, failed = time.time(), 0.0, 0
     with cf.ThreadPoolExecutor(min(8, len(jobs))) as ex:
         for name, msg, cost in ex.map(lambda j: one(*j), jobs):
             print(f"  {name:48s} {msg}")
@@ -380,8 +386,6 @@ def cmd_read(a):
               f"directory, and no partial note was cached.", file=sys.stderr)
         sys.exit(EX_MODEL)
     after("read", out_dir)
-    for out, src in written:
-        rerecord(out, src)
 
 
 # Phrases a model writes when it could not do the job. A file of apologies passes any size check,
@@ -713,15 +717,49 @@ def forget(path):
         pass
 
 
-def rerecord(path, source=None):
+def as_recorded(d):
+    """{key: sha256} for each file recorded in `d` that is still exactly as Lacuna recorded it."""
+    out = {}
+    try:
+        for k, e in _owners(d)[0].items():
+            p = os.path.join(d, str(e.get("name")))
+            if e.get("sha256") and os.path.basename(p) == e.get("name") and not os.path.islink(p) \
+                    and os.path.isfile(p) and _sha(p) == e["sha256"]:
+                out[k] = e["sha256"]
+    except OSError:
+        pass
+    return out
+
+
+def rerecord(d, before):
     """After an after.* hook: the hook is part of the user's pipeline, so what it leaves is still
     Lacuna's output. A hook that prepended frontmatter, as docs/extending.md suggests, otherwise made
-    every later run refuse the note as edited. A hook that moved the file away takes it out of the
-    record."""
-    if os.path.isfile(path):
-        record(path, source)
-    else:
-        forget(path)
+    every later run refuse the note as edited. Every file the hook changed is re-recorded, not only
+    this run's: such a hook edits each note in the directory, and an earlier run's notes were then
+    refused as edited (B10). Only files that were still as recorded before it ran: an edit of the
+    user's does not become Lacuna's because a hook touched the file too. A hook that moved a file
+    away takes it out of the record."""
+    if not before:
+        return
+    try:
+        with _locked(d):
+            files, changed = _owners(d)[0], False
+            for k, sha in before.items():
+                e = files.get(k)
+                if not e or e.get("sha256") != sha:
+                    continue                  # re-recorded by another run meanwhile: theirs to keep
+                p = os.path.join(d, e["name"])
+                if os.path.islink(p) or not os.path.isfile(p):
+                    del files[k]
+                    changed = True
+                elif _sha(p) != sha:
+                    files[k] = {**e, "sha256": _sha(p)}
+                    changed = True
+            if changed:
+                _save_owners(d, files)
+    except OSError as e:
+        print(f"  ! could not re-record what the hook changed in {d} ({e}); the next run may ask before "
+              f"replacing those files", file=sys.stderr)
 
 
 def not_ours(path, source=None, namespaced=False):
@@ -948,7 +986,6 @@ def cmd_synth(a):
     os.replace(part, a.out)
     record(a.out)
     after("synth", a.out)
-    rerecord(a.out)
 
 
 def cmd_verify(a):
@@ -1019,7 +1056,6 @@ def cmd_verify(a):
     print(report[:3000])
     if where != "(not saved; printed below)":
         after("verify", out)
-        rerecord(out, a.target)
 
 
 def main():

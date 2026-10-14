@@ -330,6 +330,51 @@ class TestOwnership(Pipeline):
         self.assertIn("wrote", r.stderr)
         self.assertNotIn("earlier run's output", r.stderr, "the file held this run's output, not an earlier one")
 
+    def test_what_an_after_hook_leaves_is_still_lacunas(self):
+        """A hook that prepends frontmatter to every note in the directory, as extending.md
+        suggests, edits earlier runs' notes as well as this run's; only this run's were re-recorded,
+        so the next read of an earlier document was refused as edited. after.synth and after.verify
+        are given one file, and may change its neighbours just the same."""
+        hook = write(self.p("every.py"), "import os, sys\n"
+                     "d = sys.argv[-1] if os.path.isdir(sys.argv[-1]) else os.path.dirname(sys.argv[-1])\n"
+                     "for f in sorted(os.listdir(d)):\n"
+                     "    if f.endswith('.md'):\n"
+                     "        p = os.path.join(d, f)\n"
+                     "        t = open(p).read()\n"
+                     "        open(p, 'w').write('---\\ntags: [lit]\\n---\\n' + t)\n")
+        self.config({"after": {stage: [sys.executable, hook] for stage in ("read", "synth", "verify")}})
+        beta = os.path.join(self.docs, "beta.md")
+        self.assertEqual(self.read().returncode, 0)
+        self.assertEqual(self.lacuna("lit", "read", beta, "--out", self.notes).returncode, 0)
+        r = self.read()
+        self.assertEqual(r.returncode, 0, f"an earlier note the hook edited again was refused:\n{r.stderr}")
+        self.assertEqual(self.note("beta.md").count("tags: [lit]"), 2, "each run's hook edited every note")
+
+        # Only what was still Lacuna's before the hook ran: the hook touching a file the user edited
+        # does not make the user's edit Lacuna's.
+        write(os.path.join(self.notes, "beta.md"), self.note("beta.md") + "\nMy own annotation.\n")
+        self.assertEqual(self.read().returncode, 0)
+        r = self.lacuna("lit", "read", beta, "--out", self.notes)
+        self.assertEqual(r.returncode, 2, "a user's edit became Lacuna's because a hook touched the file")
+        self.assertIn("has been edited since", r.stderr)
+
+        # A note restored from a backup is exactly that document's cached note: adopted, not refused.
+        cache = os.path.join(self.data, "cache", "notes")
+        (cached,) = [f for f in os.listdir(cache) if f.startswith("alpha_")]
+        shutil.copy(os.path.join(cache, cached), os.path.join(self.notes, "alpha.md"))
+        r = self.read()
+        self.assertEqual(r.returncode, 0, f"the note restored from its cached copy was refused:\n{r.stderr}")
+        self.assertIn("cached (free)", r.stdout)
+
+        lit = self.p("lit")
+        plan = os.path.join(lit, "plan.md")
+        self.assertEqual(self.synth(plan).returncode, 0)
+        self.assertEqual(self.verify(plan).returncode, 0)
+        self.assertEqual(self.synth(plan, "--objective", "again").returncode, 0)     # its hook edits the report
+        r = self.verify(plan)
+        self.assertEqual(r.returncode, 0, f"a report after.synth edited was refused as edited:\n{r.stderr}")
+        self.assertEqual(self.synth(plan, "--objective", "and again").returncode, 0)
+
 
 class TestMoneyGuarantees(Pipeline):
     """Bad input never reaches a model, and a model's failure is never filed as its output."""

@@ -198,11 +198,13 @@ MUTANTS = [
     # ---- ownership: a file in the user's directory is replaced only if Lacuna wrote it, for this
     # document, unedited (N1/N6 at 0.2.0: proven by cache bytes, blind to which document)
     ("ownership-ignores-document", PIPE, "    if source and theirs and not (", "    if False and not ("),
-    ("ownership-never-recorded", PIPE, "            _save_owners(d, files)\n    except OSError as e:",
-     "            pass\n    except OSError as e:"),
+    ("ownership-never-recorded", PIPE, "            files[name_key(path)] = entry\n            _save_owners(d, files)\n    except OSError as e:",
+     "            files[name_key(path)] = entry\n            pass\n    except OSError as e:"),
     ("edited-note-replaced", PIPE, '    if entry.get("sha256") != _sha(path):', "    if False:"),
     ("refusal-names-only-first", PIPE, "        for _, why in blocked.values():", "        for _, why in list(blocked.values())[:1]:"),
-    ("legacy-note-not-adopted", PIPE, '        if blocked.get(note, ("",))[0] == UNRECORDED and same_bytes(note, cached):', "        if False:"),
+    ("legacy-note-not-adopted", PIPE, '        if blocked.get(note, ("",))[0] in (UNRECORDED, "edited") and same_bytes(note, cached):', "        if False:"),
+    # B29: a note restored from a backup over one a hook had changed is exactly its cached note
+    ("restored-note-not-adopted", PIPE, 'blocked.get(note, ("",))[0] in (UNRECORDED, "edited")', 'blocked.get(note, ("",))[0] in (UNRECORDED,)'),
     ("overwrite-flag-ignored", PIPE, "    if blocked and not a.overwrite:", "    if blocked:"),
     ("overwrite-writes-through-symlink", PIPE, "        if os.path.islink(out):\n            os.remove(out)                # only with --overwrite",
      "        if False:\n            os.remove(out)                # only with --overwrite"),
@@ -215,7 +217,12 @@ MUTANTS = [
     ("synth-out-unguarded", PIPE, "    why = not_ours(a.out)\n", "    why = None\n"),
     ("verify-report-unguarded", PIPE, "    why = not_ours(out, namespaced=True)", "    why = None"),
     ("clobbered-out-kept", PIPE, "        if os.path.isfile(a.out) and _sha(a.out) != before:", "        if False:"),
-    ("hook-edit-not-rerecorded", PIPE, "    for out, src in written:\n        rerecord(out, src)\n", "\n"),
+    ("hook-edit-not-rerecorded", PIPE, "    before = as_recorded(d)\n", "    before = {}\n"),
+    # B10: a hook that edits every file in the directory changes earlier runs' files too
+    ("hook-rerecords-only-its-output", PIPE, "    before = as_recorded(d)\n",
+     "    before = {k: v for k, v in as_recorded(d).items() if os.path.isdir(out_path) or k == name_key(out_path)}\n"),
+    ("hook-adopts-user-edits", PIPE, '                    and os.path.isfile(p) and _sha(p) == e["sha256"]:',
+     "                    and os.path.isfile(p):"),
     ("clobbered-out-deleted", PIPE, '            os.replace(a.out, f"{a.out}.rejected")', "            os.remove(a.out)"),
     # B13/B14: a name the filesystem refuses after the model call costs the call
     ("atomic-copy-temp-longer-than-name", PIPE,
