@@ -8,7 +8,7 @@ prove that bad input exits *before* money is spent and that a cache hit really i
 
 No test here calls a model: see support.Sandbox. Run: python3 -m unittest discover -s tests
 """
-import json, os, shutil, signal, subprocess, sys, time, unittest
+import json, os, re, shutil, signal, subprocess, sys, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from support import FAKE_PARSER_PY, LACUNA, ROOT, Sandbox, ls, read, write
@@ -614,6 +614,57 @@ class TestMoneyGuarantees(Pipeline):
         long_pdf = write(self.p("long", "x" * nm), "%PDF")       # no extension: parsed, noted as <name>.md
         long_target = write(self.p("long", "t" * (nm - 8) + ".md"), "# Plan\n" + "x" * 500)
         os.makedirs(self.p("dirnote", "alpha.md", "inner"))
+        # An input that is not content: every file argument of every subcommand, each named in the refusal.
+        os.makedirs(self.p("emptyrepo"))
+        dangling = self.p("dangling", "n.md")
+        os.makedirs(os.path.dirname(dangling))
+        os.symlink(self.p("nowhere.md"), dangling)
+        binary = self.p("binnote", "x.md")
+        os.makedirs(os.path.dirname(binary))
+        with open(binary, "wb") as f:
+            f.write(bytes(range(256)) * 20)
+        locked_status = write(self.p("locked-status.md"), "dead end: X\n")
+        os.chmod(locked_status, 0)
+        locked_target = write(self.p("locked-target.md"), "# plan\n" * 50)
+        os.chmod(locked_target, 0)
+        locked_pdf = write(self.p("docs", "locked.pdf"), "%PDF-1.4 not really a pdf")
+        os.chmod(locked_pdf, 0)
+        os.makedirs(self.p("sealed"))
+        os.chmod(self.p("sealed"), 0)
+        for f in (locked_status, locked_target, locked_pdf):
+            self.addCleanup(os.chmod, f, 0o644)
+        self.addCleanup(os.chmod, self.p("sealed"), 0o755)
+        empties = [
+            ("an empty .md document", ("lit", "read", write(self.p("docs", "empty.md"), ""), "--out", self.notes)),
+            ("a whitespace-only .txt document", ("lit", "read", write(self.p("docs", "blank.txt"), " \n\t\n"),
+                                                 "--out", self.notes)),
+            ("a binary .txt document", ("lit", "read", write(self.p("docs", "bin.txt"), "x"), binary, "--out",
+                                        self.notes)),
+            ("a document it cannot read", ("lit", "read", locked_pdf, "--out", self.notes)),
+            ("synth --status it cannot read", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out",
+                                               plan, "--status", locked_status)),
+            ("synth --status that is empty", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out",
+                                              plan, "--status", write(self.p("empty-status.md"), ""))),
+            ("synth --repo with no files", ("lit", "synth", "--notes", self.notes, "--repo", self.p("emptyrepo"),
+                                            "--out", plan)),
+            ("synth --digest that is a few bytes", ("lit", "synth", "--digest", write(self.p("d.md"), "hi\n"),
+                                                    "--repo", self.repo, "--out", plan, "--kind", "plan")),
+            ("synth --digest that is binary", ("lit", "synth", "--digest", binary, "--repo", self.repo, "--out",
+                                               plan, "--kind", "plan")),
+            ("synth --notes holding a binary note", ("lit", "synth", "--notes", os.path.dirname(binary), "--repo",
+                                                     self.repo, "--out", plan)),
+            ("synth --notes holding a dangling link", ("lit", "synth", "--notes", os.path.dirname(dangling),
+                                                       "--repo", self.repo, "--out", plan)),
+            ("verify --target that is empty", ("lit", "verify", "--target", write(self.p("t.md"), ""), "--repo",
+                                               self.repo)),
+            ("verify --target that is binary", ("lit", "verify", "--target", binary, "--repo", self.repo)),
+            ("verify --target it cannot read", ("lit", "verify", "--target", locked_target, "--repo", self.repo)),
+            ("synth --notes directory it cannot read", ("lit", "synth", "--notes", self.p("sealed"), "--repo",
+                                                        self.repo, "--out", plan)),
+            ("verify --notes directory it cannot read", ("lit", "verify", "--target", self.alpha, "--repo",
+                                                         self.repo, "--notes", self.p("sealed"))),
+            ("verify --repo with no files", ("lit", "verify", "--target", self.alpha, "--repo", self.p("emptyrepo"))),
+        ]
         cases = [
             ("two documents, one name", ("lit", "read", *twins, "--out", self.notes)),
             ("a .txt and a .pdf, one name", ("lit", "read", txt, pdf, "--out", self.notes)),
@@ -651,17 +702,56 @@ class TestMoneyGuarantees(Pipeline):
                                                             "--out", self.p("long", "p" * (nm - 5) + ".md"))),
             ("a verify report name longer than allowed", ("lit", "verify", "--target", long_target, "--repo", self.repo)),
         ]
-        for label, argv in cases:
+        for label, argv in cases + empties:
             if ("cannot read" in label or "cannot write" in label) and os.geteuid() == 0:
                 continue                      # root ignores file modes
             with self.subTest(label):
                 r = self.lacuna(*argv, LACUNA_PYTHON=venv_py)
                 self.assertEqual(r.returncode, 2, f"{label}: {r.stdout}{r.stderr}")
+                self.assertNotIn("Traceback", r.stderr, f"{label}: bad input must be a message, not a crash")
                 self.assertEqual(self.calls(), [], f"{label} reached a model, which costs real money")
         self.assertEqual(read(vault_note), "# My own alpha notes\n", "a user's file in --out was overwritten")
         self.assertEqual(read(hand_plan), "# My plan, written by hand\n", "a hand-written plan was overwritten")
         self.assertFalse(os.path.lexists(self.p("elsewhere.md")), "a note was written through a symlink")
         self.assertEqual(read(self.alpha), alpha_text, "the document was deleted or overwritten by its own note")
+
+    def test_every_bad_input_is_named_in_one_refusal(self):
+        blank, empty = write(self.p("docs", "blank.txt"), "  \n"), write(self.p("docs", "empty.md"), "")
+        r = self.lacuna("lit", "read", self.alpha, blank, empty, "--out", self.notes)
+        self.assertEqual((r.returncode, self.calls()), (2, []), r.stderr)
+        self.assertIn(blank, r.stderr)
+        self.assertIn(empty, r.stderr)
+        self.assertNotIn(self.alpha, r.stderr, "a good document is not blamed")
+        self.assertFalse(os.path.exists(self.notes), "a refused run leaves --out alone")
+        r = self.lacuna("lit", "synth", "--notes", self.notes, "--repo", self.p("nope"), "--out", self.p("plan.md"))
+        self.assertIn("is not a directory", r.stderr, "a missing --repo is not an empty one")
+
+    def test_a_status_file_nobody_named_is_skipped_not_refused(self):
+        os.makedirs(self.notes)
+        write(os.path.join(self.notes, "n.md"), "# n\n" + "x" * 500)
+        write(os.path.join(self.repo, "research", "STATUS.md"), "")
+        write(os.path.join(self.repo, "NOTES.md"), "dead end: widget cache\n")
+        r = self.verify(write(self.p("t.md"), "# plan\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        prompt = self.calls()[-1]["prompt"]
+        self.assertIn(os.path.join(self.repo, "NOTES.md"), prompt, "the empty research/STATUS.md is not a status file")
+        self.assertNotIn("research/STATUS.md", prompt)
+
+    def test_verify_prompt_paths_are_absolute(self):
+        """The agent runs in another directory: `research/STATUS.md` named relative checked nothing."""
+        write(os.path.join(self.repo, "research", "STATUS.md"), "# Status\ndead end: widget cache\n")
+        target = write(self.p("t.md"), "# plan\n")
+        for extra in ((), ("--notes", self.notes)):
+            os.makedirs(self.notes, exist_ok=True)
+            r = self.verify(target, *extra)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            prompt = self.calls()[-1]["prompt"]
+            self.assertIn(os.path.join(self.repo, "research", "STATUS.md"), prompt)
+            for rel in re.findall(r"(?<![/\w.-])(?:research|docs|src)/\S+", prompt):
+                self.fail(f"the prompt names {rel} relative to the caller's directory")
+        os.remove(os.path.join(self.repo, "research", "STATUS.md"))
+        self.verify(target)
+        self.assertNotIn("STATUS", self.calls()[-1]["prompt"], "no status file, no instruction to grep one")
 
     def test_a_refusal_is_never_filed_as_a_note(self):
         for mode in ("refuse", "apology", "prose"):
@@ -870,6 +960,24 @@ class TestPdfPlumbing(Pipeline):
             r = self.lacuna("lit", "read", long_pdf, "--out", self.notes, LACUNA_PYTHON=self.venv_py)
             self.assertEqual(r.returncode, 0, f"a PDF whose name fits must parse: {r.stderr[-300:]}")
         self.assertEqual(len(self.parse_lines()), 6, "a long name is parsed once, then served from the cache")
+
+    def test_equations_needs_only_the_marker_venv(self):
+        """`doctor --install-equations` makes venv-marker and nothing else; the README recipe then runs
+        `read --equations`. prep_md.py is standard-library code, so a missing default venv is no reason
+        to refuse, though a PDF read without it must say its truncation check is off."""
+        marker_py = write(os.path.join(self.data, "venv-marker", "bin", "python"), "#!/bin/sh\n", 0o755)
+        gone = self.p("no-such-venv", "python")
+        # sys.executable is what prep_md runs under when there is no venv: the fake stands in for it
+        prelude = f"sys.executable = {self.venv_py!r}"
+        for extra in (("--equations",), ("--parser", "marker"), ("--parser", "docling")):
+            with self.subTest(extra):
+                r = self.read_pdf(*extra, LACUNA_PYTHON=gone, prelude=prelude)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("truncation", r.stderr)
+        self.assertEqual(len(self.parse_lines()), 2, "--equations and --parser marker share one cached parse")
+        r = self.read_pdf(LACUNA_PYTHON=gone, prelude=prelude)
+        self.assertEqual((r.returncode, len(self.parse_lines())), (3, 2), "the default parser still needs its venv")
+        self.assertTrue(os.path.exists(marker_py))
 
     def test_parse_failures_exit_3_before_any_model_call(self):
         r = self.read_pdf(LACUNA_PYTHON=self.p("no-such-venv", "python"))

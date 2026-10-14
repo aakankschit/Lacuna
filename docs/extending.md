@@ -87,7 +87,7 @@ Write the importer to read its *last* argument, or keep the command argument-fre
 
 **What it is given differs by stage**, so check before writing an importer:
 
-| Hook | `$1` is |
+| Hook | The path argument is |
 |---|---|
 | `after.read` | the notes **directory** — one note per document inside it |
 | `after.synth` | the digest or plan **file** |
