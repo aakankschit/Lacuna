@@ -1043,6 +1043,12 @@ class TestConfigReport(Sandbox):
         self.assertEqual(r.returncode, 0, r.stderr[-300:])
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "True")), "a bool is not a path")
 
+    def test_a_null_or_empty_setting_means_the_default_and_is_not_an_error(self):
+        self.config({"effort": {"reader": None}, "models": {"planner": ""}, "paths": {"cache": None}})
+        r = self.lacuna("config")
+        self.assertNotIn("should be text", r.stdout)
+        self.assertEqual(json.loads(self.lacuna("config", "--json").stdout)["errors"], [])
+
     def test_config_json_output_is_strict_json(self):
         write(os.path.join(self.data, "config.json"), '{"budget_warn_usd": NaN}')
         r = self.lacuna("config", "--json")

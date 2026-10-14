@@ -178,7 +178,7 @@ MUTANTS = [
     ("prices-shortest-key-first", CFG, "key=lambda kv: -len(kv[0])", "key=lambda kv: len(kv[0])"),
     ("user-pricing-ignored", CFG, '    p.update(_price_table(_read_json(mine), mine))\n', "\n"),
     ("alias-not-resolved", CFG, 'return ALIASES.get((model or "").strip(), model)', "return model"),
-    ("null-effort-crashes", CFG, 'return CONFIG["effort"].get(role) or "medium"', 'return CONFIG["effort"].get(role, "medium")'),
+    ("null-setting-is-an-error", CFG, "            if v is None or (isinstance(v, str) and not v.strip()):\n                got[key] = default", "            if False:\n                got[key] = default"),
     ("config-crashes-on-string-budget", CFG, "budget     warn above {_fmt_usd(cfg.get('budget_warn_usd'))}",
      "budget     warn above ${cfg.get('budget_warn_usd', 0):.2f}"),
     # ---- transcripts and money
