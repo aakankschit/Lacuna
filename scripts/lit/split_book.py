@@ -133,8 +133,12 @@ def main():
     pdf, outdir = sys.argv[1], sys.argv[2]
     if not os.path.exists(pdf):
         die2(f"ERROR: no such file: {pdf}")
-    doc = pymupdf.open(pdf)
-    full_toc = doc.get_toc()
+    try:
+        doc = pymupdf.open(pdf)
+        full_toc = doc.get_toc()
+    except Exception as e:      # pymupdf's own FileDataError, or whatever MuPDF raises on a damaged file
+        die3(f"ERROR: pymupdf could not read {os.path.basename(pdf)} ({type(e).__name__}: {e}). "
+             f"It may be damaged, encrypted or not a PDF; nothing was written.")
     if not full_toc:
         die2(f"ERROR: {os.path.basename(pdf)} has no table of contents, so it cannot be split by "
              f"chapter. Parse it as one document instead: `lacuna lit read {pdf}`.")

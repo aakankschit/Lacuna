@@ -152,6 +152,8 @@ MUTANTS = [
     ("book-chapter-overruns", SPLIT, "end = deduped[i + 1][1] - 1 if", "end = deduped[i + 1][1] if"),
     ("book-no-toc-guessed", SPLIT, "if not full_toc:\n        die2(", "if False:\n        die2("),
     ("book-toc-not-written", SPLIT, 'with open(f"{outdir}/toc.md", "w") as f:', 'with open(f"{outdir}/toc.txt", "w") as f:'),
+    ("book-corrupt-pdf-traceback", SPLIT, "    except Exception as e:      # pymupdf's own FileDataError",
+     "    except ImportError as e:      # pymupdf's own FileDataError"),
     ("book-title-keeps-ctrl", SPLIT, "valid = [(lvl, one_line(t), p) for", "valid = [(lvl, t, p) for"),
     ("book-toc-pipe-splits-row", SPLIT, r'cell = r["title"].replace("|", "\\|")', 'cell = r["title"]'),
     ("book-shallower-leaves-dropped", SPLIT, "if lvl == level or lvl < level and (not below or start < min(below)):",

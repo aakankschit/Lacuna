@@ -750,7 +750,9 @@ class _Doc:
         self.metadata = {"title": _spec.get("title", "")}
     def get_toc(self): return [tuple(x) for x in _spec["toc"]]
     def __getitem__(self, i): return _Page(self._pages[i])
-def open(path): return _Doc()
+def open(path):
+    if _spec.get("corrupt"): raise RuntimeError("Failed to open file %r." % path)
+    return _Doc()
 '''
 
 
@@ -760,9 +762,9 @@ class TestSplitBook(Sandbox):
 
     PAGES = ["alpha page", "beta page", "gamma page", "delta page", "epsilon page"]
 
-    def split(self, toc, pages=None, title="My Book", outdir=None):
+    def split(self, toc, pages=None, title="My Book", outdir=None, corrupt=False):
         write(self.p("fake", "pymupdf.py"), FAKE_PYMUPDF)
-        write(self.p("spec.json"), json.dumps({"pages": pages or self.PAGES, "toc": toc, "title": title}))
+        write(self.p("spec.json"), json.dumps({"pages": pages or self.PAGES, "toc": toc, "title": title, "corrupt": corrupt}))
         self.outdir = outdir or self.p("books", "mybook")
         return self.run_py([os.path.join(LIT, "split_book.py"), write(self.p("book.pdf"), "%PDF"), self.outdir],
                            PYTHONPATH=self.p("fake"), FAKE_PDF_SPEC=self.p("spec.json"))
@@ -877,6 +879,11 @@ class TestSplitBook(Sandbox):
         self.assertEqual(r.returncode, 2)
         self.assertIn("no table of contents", r.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.outdir, "toc.md")), "a book that cannot be split must not be offered to readers")
+        r = self.split([[1, "Only", 1]], corrupt=True)
+        self.assertEqual(r.returncode, 3, "a PDF pymupdf cannot open is a parse failure, not a crash")
+        self.assertIn("could not read book.pdf (RuntimeError: Failed to open file", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(os.path.exists(self.outdir), "nothing was written")
 
 
 class TestPrepMdCLI(Sandbox):
