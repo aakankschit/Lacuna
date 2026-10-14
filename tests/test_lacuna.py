@@ -7,7 +7,7 @@ pricing that silently matches the wrong model, a note cache that serves stale no
 assumptions, a parse that fails plausibly instead of loudly, and config precedence that ignores the
 override you just set.
 """
-import json, os, subprocess, sys, tempfile, unittest
+import json, os, shutil, subprocess, sys, tempfile, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -423,3 +423,65 @@ class TestCLI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOutputIsJudgedByContent(unittest.TestCase):
+    """A stage must not report success because a file is big enough.
+
+    Found end-to-end: with relative paths the synthesiser could read nothing, wrote a fluent
+    "BLOCKED — not completed" document, and the pipeline exited 0, logged it as written, and ran
+    the user's after.synth hook on it.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_pipeline
+        self.L = lit_pipeline
+
+    def test_a_long_refusal_is_not_usable_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "plan.md")
+            for opening in ("# Plan\n\nBLOCKED — not completed. I could not read any of the notes.",
+                            "I cannot help with this request.",
+                            "# Result\n\nUnable to read the supplied directory, so no plan follows."):
+                with open(p, "w") as f:
+                    f.write(opening + "\n\n" + ("padding text " * 200))
+                self.assertGreater(os.path.getsize(p), 800, "fixture must clear the size check")
+                self.assertFalse(self.L.usable_output(p, 800, "plan"),
+                                 f"a document opening {opening[:40]!r} must not count as output")
+
+    def test_real_output_is_usable(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "plan.md")
+            with open(p, "w") as f:
+                f.write("# Development plan\n\n## 1. Add a --json flag\n\n" + ("real content " * 200))
+            self.assertTrue(self.L.usable_output(p, 800, "plan"))
+
+    def test_short_output_is_not_usable(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "plan.md")
+            with open(p, "w") as f:
+                f.write("# Plan\n")
+            self.assertFalse(self.L.usable_output(p, 800, "plan"))
+
+
+class TestShippedExampleIsActuallyShipped(unittest.TestCase):
+    """The README's first run depends on examples/notes/. A .gitignore rule silently excluded it
+    from every commit, so the showcase command failed for everyone while working locally."""
+
+    def test_example_notes_exist_and_are_not_ignored(self):
+        notes = os.path.join(ROOT, "examples", "notes")
+        self.assertTrue(os.path.isdir(notes), "examples/notes/ is missing")
+        files = [f for f in os.listdir(notes) if f.endswith(".md")]
+        self.assertGreaterEqual(len(files), 3, f"expected the shipped example notes, found {files}")
+        for f in files:
+            self.assertGreater(os.path.getsize(os.path.join(notes, f)), 400, f)
+        if shutil.which("git") and os.path.isdir(os.path.join(ROOT, ".git")):
+            # --no-index tests the ignore RULES, not whether the files happen to be tracked
+            # already. Without it this passes even when the rule would exclude them from a
+            # fresh clone, which is exactly how they were lost in the first place.
+            r = subprocess.run(["git", "-C", ROOT, "check-ignore", "--no-index",
+                                os.path.join(notes, files[0])], capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0,
+                                "a .gitignore rule excludes examples/notes, so it will never "
+                                "reach a user even though it is present locally")

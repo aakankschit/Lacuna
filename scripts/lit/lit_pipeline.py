@@ -217,7 +217,11 @@ def cmd_read(a):
     """One slim reader per paper, in parallel. The agent writes into --out (its cwd); Python does the
     caching, so a paper is never read twice and no agent needs write access outside --out."""
     out_dir = os.path.abspath(a.out)
+    if os.path.isfile(out_dir):
+        print(f"ERROR: --out {a.out!r} is a file; it must be a directory for notes.", file=sys.stderr)
+        sys.exit(EX_INPUT)
     os.makedirs(out_dir, exist_ok=True)
+    a.papers = [os.path.abspath(p) for p in a.papers]
     os.makedirs(f"{CACHE}/notes", exist_ok=True)
     reader_model = a.model or lacuna_config.model("reader")
     books = "" if a.no_books else books_block()
@@ -248,7 +252,7 @@ def cmd_read(a):
             NOTE_TEMPLATE, f"Paper:\n- {md} -> {out}", "Keep the note under 1,100 words."] if x)
         res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, BOOKS_DIR],
                      effort=lacuna_config.effort("reader"), cwd=out_dir)
-        ok = os.path.exists(out) and os.path.getsize(out) > 400
+        ok = usable_output(out, 400, "note")
         # source_tokens makes the calibration recipe in docs/extending.md actually runnable
         ledger({"stage": "read", "model": reader_model, "paper": os.path.basename(md), "cost": usd(res),
                 "wall_s": res["wall_s"], "books": not a.no_books, "wrote_note": ok,
@@ -273,6 +277,32 @@ def cmd_read(a):
     after("read", out_dir)
 
 
+# Phrases a model writes when it could not do the job. A file of apologies passes any size check,
+# which is how a blocked run came to report success and fire the user's after.* hook.
+REFUSAL_MARKERS = (
+    "blocked", "not completed", "cannot complete", "could not complete", "unable to complete",
+    "i can't help", "i cannot help", "i'm unable to", "i am unable to", "no files were found",
+    "unable to read", "could not read any", "cannot access", "i don't have access",
+)
+
+
+def usable_output(path, min_bytes, what):
+    """True when a stage produced real output, not a short file or an explanation of failure.
+
+    Size alone is not evidence: a model that cannot do the job writes a fluent paragraph saying so.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) < min_bytes:
+        return False
+    with open(path, errors="ignore") as f:
+        head = f.read(1200).lower()
+    hit = next((m for m in REFUSAL_MARKERS if m in head), None)
+    if hit:
+        print(f"  ! the {what} opens with {hit!r} — treating it as a failed run, not output",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def need_dir(p, what):
     if not p or not os.path.isdir(p):
         print(f"ERROR: {what} {p!r} is not a directory. Nothing was sent to a model.", file=sys.stderr)
@@ -295,6 +325,14 @@ def cmd_synth(a):
     need_dir(a.repo, "--repo")
     if a.digest:
         need_file(a.digest, "--digest")
+    # The agent runs with cwd set to the output directory, so relative inputs would resolve
+    # against the wrong place and it would silently read nothing.
+    a.repo = os.path.abspath(a.repo)
+    a.out = os.path.abspath(a.out)
+    if a.notes:
+        a.notes = os.path.abspath(a.notes)
+    if a.digest:
+        a.digest = os.path.abspath(a.digest)
     notes = []
     if a.notes:
         if not os.path.isdir(a.notes):
@@ -346,7 +384,7 @@ def cmd_synth(a):
     dirs = [a.repo, out_dir] + ([a.notes] if a.notes else []) + \
            ([os.path.dirname(os.path.abspath(a.digest))] if a.digest else [])
     res = claude("synth", model, prompt, dirs, effort=lacuna_config.effort(role), cwd=out_dir)
-    ok = os.path.exists(a.out) and os.path.getsize(a.out) > 800
+    ok = usable_output(a.out, 800, a.kind)
     ledger({"stage": "synth", "kind": a.kind, "model": model, "notes": len(notes),
             "from_digest": bool(a.digest), "cost": usd(res), "wall_s": res["wall_s"], "wrote": ok,
             "is_error": res.get("is_error")})

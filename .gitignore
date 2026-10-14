@@ -9,7 +9,11 @@ venv-marker/
 cost-ledger.jsonl
 cache/
 books/
+# Output directories a user creates when running the pipeline — but NOT the shipped example notes,
+# which the README's first run depends on. Without the negation they are silently never committed.
 notes/
+!examples/notes/
+!examples/notes/**
 *.unverified.md
 *.filelist.txt
 .DS_Store
