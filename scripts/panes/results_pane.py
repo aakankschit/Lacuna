@@ -7,7 +7,7 @@ keys:  j/k or arrows scroll · space/b page · g/G top/bottom · n/p newer/older
 Renders with `rich` when it is installed, and falls back to plain text when it is not: this is the
 only part of the plugin that wants a third-party package, and it is optional.
 """
-import os, select, shutil, signal, sys, termios, time, tty
+import os, select, shutil, signal, sys, termios, textwrap, time, tty
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,6 +59,26 @@ class _Capture:
     def get(self):
         return "\n".join(self._buf)
 POLL = 0.4
+
+
+def mtime(path):
+    """Modification time, or 0 for a file that is not there. A dangling .md symlink in the results
+    directory raised out of the sort and took the whole pane down."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def wrap_plain(text, width):
+    """Hard-wrap the plain-text fallback to the pane width. rich wraps for itself; without it a
+    long paragraph is one line that the terminal wraps, so a frame of N rows took more than N and
+    scrolled the header away."""
+    out = []
+    for line in text.split("\n"):
+        out.extend(textwrap.wrap(line, width, replace_whitespace=False, drop_whitespace=False,
+                                 break_long_words=True) or [""])
+    return out
 INV, DIM, RST = "\033[7m", "\033[2m", "\033[0m"
 
 
@@ -72,7 +92,7 @@ class Pane:
 
     def files(self):
         fs = [os.path.join(self.target, f) for f in os.listdir(self.target) if f.endswith(".md")]
-        return sorted(fs, key=os.path.getmtime, reverse=True)
+        return sorted((f for f in fs if os.path.exists(f)), key=mtime, reverse=True)
 
     def current(self):
         if not self.dir_mode:
@@ -92,12 +112,18 @@ class Pane:
         if not path or not os.path.exists(path):
             self.lines, self.mtime = [], 0
         else:
-            self.mtime = os.path.getmtime(path)
-            text = open(path, errors="ignore").read()
-            con = Console(width=max(20, cols - 1), force_terminal=True, color_system="256")
+            self.mtime = mtime(path)
+            try:
+                with open(path, errors="ignore") as f:
+                    text = f.read()
+            except OSError:         # vanished or unreadable between the check and the read
+                text = ""
+            width = max(20, cols - 1)
+            con = Console(width=width, force_terminal=True, color_system="256")
             with con.capture() as cap:
                 con.print(Markdown(text, code_theme="monokai", hyperlinks=True))
-            self.lines = cap.get().rstrip("\n").split("\n")
+            out = cap.get().rstrip("\n")
+            self.lines = out.split("\n") if HAVE_RICH else wrap_plain(out, width)
         if at_bottom:
             self.offset = max(0, len(self.lines) - (rows - 1))
         self.dirty = True
@@ -205,7 +231,7 @@ def main():
             if time.time() - last_check >= POLL:
                 last_check = time.time()
                 path = pane.current()
-                if path != pane.path or (path and os.path.exists(path) and os.path.getmtime(path) != pane.mtime):
+                if path != pane.path or (path and os.path.exists(path) and mtime(path) != pane.mtime):
                     pane.render()
     except KeyboardInterrupt:
         pass
