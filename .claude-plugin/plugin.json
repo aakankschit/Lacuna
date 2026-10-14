@@ -2,7 +2,7 @@
   "name": "lacuna",
   "displayName": "Lacuna",
   "description": "Papers to code. Find the gaps in a literature and turn them into work you can build and test: cheap models read every document, strong models synthesise, a fact-check pass catches what they made up, and every session's cost is visible.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Aakankschit Nandkeolyar"
   },

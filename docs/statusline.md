@@ -46,7 +46,9 @@ Then add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 ```
 
 The script is deliberately self-contained — one file, standard library only — so copying it works,
-and it still picks up your `pricing.json` from the data directory. Re-run the copy after a plugin
+and it still picks up your `pricing.json` from the data directory (`$LACUNA_DATA`, with `~`
+expanded, exactly as the CLI resolves it). A malformed `pricing.json` is skipped, not fatal, and
+its inline price table matches the shipped `scripts/pricing.json`. Re-run the copy after a plugin
 upgrade to get any changes.
 
 `refreshInterval` is in seconds and has a minimum of 1. At 30 the cache countdown stays useful
@@ -62,7 +64,7 @@ without re-running the script constantly.
 | `cache ● 1h cache · 42m left` | the cache TTL and the time left on it; `○ cold` plus a dollar figure once it has expired; absent when Claude Code reports no expiry time |
 | `→ /compact or handoff…` | appears only when the context is large enough for it to matter |
 | `$4.12 session` | this session's cost at list price |
-| `last $0.120 (read · write · out)` | the previous turn, split so you can see *why* it cost that |
+| `last $0.120 (read · write · out)` | the previous turn, split so you can see *why* it cost that. `last $0.030–$0.120` means the call was retried after a refused or failed attempt: the lower end is what was recorded, the upper adds the earlier attempts, and whether they were billed is not in the transcript |
 | `hit 97%` | cache hit ratio; a number dropping here is the first sign of repeated cold writes |
 | `5h` / `7d` bars | plan usage windows and when they reset |
 

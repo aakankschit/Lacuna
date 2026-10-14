@@ -41,7 +41,9 @@ class TestPrices(unittest.TestCase):
             self.assertEqual(lacuna_config.prices()["haiku-5-5"], (9.0,) * 5)
             self.assertIn("opus-5-5", lacuna_config.prices(), "an override layers over the table, not replaces it")
             self.assertEqual(lacuna_config.price_meta(), {"retrieved": "2099-01-01", "overridden": True})
-            for doc in ([["haiku-5-5", 1, 1, 1, 1, 1]], {"models": [1, 2]}, "prices"):    # hand-edited, wrongly
+            for doc in ([["haiku-5-5", 1, 1, 1, 1, 1]], {"models": [1, 2]}, "prices",    # hand-edited, wrongly
+                        {"models": {"haiku-5-5": "12345"}},                  # a string is not five prices
+                        {"models": {"haiku-5-5": [float("nan"), 1, 1, 1, 1]}}):   # priced every call at $nan
                 with self.subTest(doc):
                     write(os.path.join(d, "pricing.json"), json.dumps(doc))
                     self.assertIn("opus-5-5", lacuna_config.prices(), "a malformed override must not take the table down")
@@ -312,6 +314,7 @@ class TestTranscriptMoney(unittest.TestCase):
                          "usage": {"input_tokens": 0, "output_tokens": 10, "cache_read_input_tokens": 60_000,
                                    "cache_creation_input_tokens": 0}}},
             "{ not json at all",
+            [1, 2], {"type": "assistant", "message": "a string"},      # valid JSON, not a call: skipped
         ]
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.jsonl")
@@ -328,13 +331,59 @@ class TestTranscriptMoney(unittest.TestCase):
         self.assertAlmostEqual(split["write1h"], 10_000 * 0.20 / 1e6, places=9,
                                msg="a write with no TTL breakdown is priced as the dearer 1h write")
 
-    def test_cold_detection(self):
-        cold = {"u": {"cache_creation_input_tokens": 150_000, "cache_read_input_tokens": 0}}
-        warm = {"u": {"cache_creation_input_tokens": 1_000, "cache_read_input_tokens": 150_000}}
-        self.assertTrue(ccost.is_cold(cold))
-        self.assertFalse(ccost.is_cold(warm))
-        self.assertFalse(ccost.is_avoidable_cold(cold, 0), "a session's first write is the price of starting")
-        self.assertTrue(ccost.is_avoidable_cold(cold, 1))
+    def test_avoidable_cold_rewrites_are_judged_against_the_call_before(self):
+        """Every case here was miscounted once. A fixed "reads under 40k" missed idle re-caches
+        that still read Claude Code's ~42k warm prefix (9 of them, $39.66, on one machine). A
+        <synthetic> API-error line counted as a session's first call, so the real first write was
+        called avoidable. The fix must not count a compaction's rewrite or a big new file."""
+        t = lambda m: f"2026-10-13T{m // 60:02d}:{m % 60:02d}:00Z"
+        u = lambda w, r: {"input_tokens": 5, "output_tokens": 500, "cache_creation_input_tokens": w,
+                          "cache_read_input_tokens": r}
+        row = lambda mid, minute, w, r, model="claude-opus-5-5", **kw: {
+            "type": "assistant", "timestamp": t(minute), **kw, "message": {"id": mid, "model": model, "usage": u(w, r)}}
+        rows = [row("err", 0, 0, 0), *[]]
+        rows[0]["message"]["model"] = "<synthetic>"
+        rows += [
+            row("first", 1, 650_000, 40_000),        # the session's first write: the price of starting
+            row("warm", 3, 2_000, 690_000),
+            row("side", 4, 60_000, 0, isSidechain=True),   # a subagent's thread: neither judged nor "previous"
+            row("idle", 130, 649_000, 42_500),       # 2 h idle: re-cached, reading only the warm prefix
+            row("compact", 131, 60_000, 42_000),     # a minute later: a compaction's new context, not idle
+            row("grow", 140, 100_000, 100_000),      # a large new file, read on a warm cache
+            row("cold", 300, 150_000, 0),            # the case the old rule did catch
+            row("warm2", 302, 1_000, 150_000),
+            row("switch", 320, 140_000, 42_000, model="claude-sonnet-5-5"),   # /model, 18 min on: not idle
+            row("tokens", 322, 1_000, 182_000, output_tokens=None),          # a null count is 0
+        ]
+        rows[-1]["message"]["usage"]["output_tokens"] = None
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.jsonl")
+            with open(p, "w") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in rows))
+            calls = ccost.load(p)
+        self.assertEqual([c["id"] for c in calls][0], "first", "an API error is not a call")
+        cold = sorted(calls[i]["id"] for i in ccost.avoidable_colds(calls))
+        self.assertEqual(cold, ["cold", "idle"])
+
+    def test_refused_attempts_are_priced_apart_from_the_call(self):
+        """The top-level usage is the last attempt only; earlier ones sit in usage.iterations, each
+        with its own model. Their cost is reported as the top of a range, never added in."""
+        last = {"input_tokens": 2, "output_tokens": 271, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 65_700, "cache_creation": {"ephemeral_1h_input_tokens": 65_700}}
+        first = {"input_tokens": 17, "output_tokens": 0, "cache_read_input_tokens": 30_741,
+                 "cache_creation_input_tokens": 35_036, "model": "claude-fable-5-1",
+                 "cache_creation": {"ephemeral_1h_input_tokens": 35_036}}
+        c = {"type": "assistant", "timestamp": "2026-10-13T00:00:00Z",
+             "message": {"id": "m", "model": "claude-opus-5", "usage": {**last, "iterations": [first, last]}}}
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.jsonl")
+            with open(p, "w") as f:
+                f.write(json.dumps(c) + "\n")
+            call, = ccost.load(p)
+        # fable-5-1: 10 input, 20 1h write, 0.25 read per MTok
+        self.assertAlmostEqual(ccost.earlier_usd(call), (17 * 10 + 35_036 * 20 + 30_741 * 0.25) / 1e6, places=9)
+        self.assertAlmostEqual(sum(ccost.split(call)[0].values()), (2 * 5 + 65_700 * 10 + 271 * 25) / 1e6, places=9,
+                               msg="the call itself is still priced from the top-level usage, at its own model")
 
 
 class TestShippedState(unittest.TestCase):
@@ -385,8 +434,21 @@ class TestShippedState(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0, "a .gitignore rule excludes examples/notes from a fresh clone")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+
+    def test_a_standalone_status_line_prices_every_shipped_model(self):
+        """The documented install copies statusline.py on its own, where scripts/pricing.json is out
+        of reach, so its inline table is all it has. It lacked haiku-4-5: such a turn showed
+        $2.200 for $0.600."""
+        import importlib.util
+        with tempfile.TemporaryDirectory() as d:
+            alone = shutil.copy(os.path.join(ROOT, "statusline", "statusline.py"), d)
+            spec = importlib.util.spec_from_file_location("statusline_alone", alone)
+            mod = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(os.environ, {"LACUNA_DATA": d}):
+                spec.loader.exec_module(mod)
+        with open(os.path.join(ROOT, "scripts", "pricing.json")) as f:
+            shipped = {k: tuple(map(float, v)) for k, v in json.load(f)["models"].items()}
+        self.assertEqual({k: tuple(map(float, v)) for k, v in mod.PRICE.items()}, shipped)
 
 
 class TestRefusalPosition(unittest.TestCase):
@@ -412,6 +474,16 @@ class TestRefusalPosition(unittest.TestCase):
             ("I could not read any of the supplied files.\n\npadding", "bare opening"),
             ("BLOCKED - not completed.\n\nmore text", "a bare status marker"),
             ("# Digest\n\n> I am unable to summarise documents I could not open.", "in a blockquote"),
+            # What a real sonnet digester filed, exit 0, when it could read none of the notes: honest
+            # about having nothing, and phrased so that no apology marker opens a block.
+            ("# PARTIAL: literature notes unreadable\n\n## Status of this digest\n\nThis digest contains no "
+             "literature claims. Every note in the directory returned a permission error.", "a self-declared partial"),
+            ("INCOMPLETE: the notes directory could not be read.", "the agents' own failure line"),
+            ("`INCOMPLETE: the notes could not be read`", "echoing the prompt's backticks"),
+            ("1. Incomplete: every note returned EACCES.", "numbered, title case"),
+            ("> [!warning] PARTIAL: two of three notes unreadable", "in a callout"),
+            ("Status: INCOMPLETE — no literature was readable", "behind a Status: label"),
+            ("# Development plan — next iteration (PARTIAL / BLOCKED)\n\n## Read this first", "a real planner's title"),
         ]:
             with self.subTest(label):
                 self.assertTrue(self.refusal(text), f"{label} must be recognised as an apology")
@@ -423,6 +495,14 @@ class TestRefusalPosition(unittest.TestCase):
             ("# Note\n\n## Claim\n\nThe solver cannot complete in polynomial time.", "complexity"),
             ("# Verify\n\n- JobState.BLOCKED -> not found in the repo", "BLOCKED in a finding"),
             ("# Plan\n\n## 1. A real proposal\n\nSubstantive content naming src/widget.py.", "a plan"),
+            ("# PARTIAL LEAST SQUARES for batch correction\n\n## 1. Replace PCA", "a title in capitals"),
+            ("# Digest\n\n## Partial results\n\nTwo of three trials were incomplete: see Table 2.", "partial as a word"),
+            ('- PARTIAL: "54-69/100" -> the note gives 54-69 for ROCS only', "a verify finding graded PARTIAL"),
+            ("# Plan\n\nThree proposals follow.\n\n- INCOMPLETE: data for site B (Table 3)", "a marker below the opening"),
+            ("# Plan\n\n- **BLOCKED** until the CUDA build lands: port the scorer", "a status tag on a proposal"),
+            ("# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim", "a hyphenated title"),
+            ("# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA", "a bracketed title"),
+            ("# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim", "a title in capitals"),
         ]:
             with self.subTest(label):
                 self.assertIsNone(self.refusal(text), f"{label} must not be discarded")
@@ -432,7 +512,8 @@ class TestFixesThatSurvivedTheirOwnRevert(unittest.TestCase):
     """Four fixes were shipped with no test: reverting any of them left the suite green.
 
     Their tests existed, in docs/reviews/, outside tests/ — so nothing ever ran them. A test that
-    is not discovered is not a test.
+    is not discovered is not a test. The other three now live with what they guard: the
+    <synthetic> skip in TestCacheGuard, casefold and islink in the ownership tests.
     """
 
     def test_lacuna_data_is_expanded(self):
@@ -445,29 +526,89 @@ class TestFixesThatSurvivedTheirOwnRevert(unittest.TestCase):
         self.assertNotIn("~", data, "LACUNA_DATA must be expanded, not taken literally")
         self.assertTrue(data.startswith(os.path.expanduser("~")), data)
 
-    def test_cache_guard_skips_synthetic_api_error_lines(self):
-        """Claude Code records an API failure as a zero-usage <synthetic> line. Read as the newest
-        call it reports 0 tokens of context, so the guard stayed silent exactly when the next
-        prompt would re-cache everything."""
-        import subprocess
+
+class TestOwnershipRecord(unittest.TestCase):
+
+    def test_two_processes_recording_into_one_directory_lose_nothing(self):
+        """Two `lit read` runs into one --out kept 9 of 16 entries: each read the record, added its
+        own and replaced the file. The next run refused the other 7 notes as not Lacuna's."""
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + '/lit')\n"
+                "import lit_pipeline as L\n"
+                "for i in range(150):\n"
+                "    p = f'{sys.argv[2]}/{sys.argv[3]}{i}.md'; open(p, 'w').write(str(i)); L.record(p)\n")
         with tempfile.TemporaryDirectory() as d:
-            t = os.path.join(d, "t.jsonl")
-            real = {"type": "assistant", "timestamp": "2026-10-13T00:00:00Z",
-                    "message": {"id": "m1", "model": "claude-opus-5",
-                                "usage": {"input_tokens": 10, "output_tokens": 50,
-                                          "cache_read_input_tokens": 500_000,
-                                          "cache_creation_input_tokens": 0}}}
-            synth = {"type": "assistant", "timestamp": "2026-10-13T00:05:00Z",
-                     "message": {"id": "<synthetic>", "model": "<synthetic>",
-                                 "usage": {"input_tokens": 0, "output_tokens": 0,
-                                           "cache_read_input_tokens": 0,
-                                           "cache_creation_input_tokens": 0}}}
-            with open(t, "w") as f:
-                f.write(json.dumps(real) + "\n" + json.dumps(synth) + "\n")
-            r = subprocess.run([sys.executable, os.path.join(ROOT, "hooks", "cache_guard.py")],
-                               input=json.dumps({"hook_event_name": "SessionStart", "source": "resume",
-                                                 "session_id": "s", "transcript_path": t}),
-                               capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("500k", r.stdout.replace("\\u00a0", " "),
-                          "the guard must see the real call's context, not the synthetic zero")
+            procs = [subprocess.Popen([sys.executable, "-c", code, os.path.join(ROOT, "scripts"), d, tag],
+                                      env={**os.environ, "LACUNA_DATA": d}) for tag in ("a", "b")]
+            for p in procs:
+                p.wait()
+            with open(os.path.join(d, ".lacuna.json")) as f:
+                self.assertEqual(len(json.load(f)["files"]), 300)
+
+
+class TestMutationGate(unittest.TestCase):
+    """At 0.2.0 six mutant anchors had gone stale after fixes moved the code. The runner listed
+    them among the survivors, so a broken gate read as six test gaps, and nobody re-anchored them."""
+
+    def test_a_stale_anchor_stops_the_gate_before_anything_runs(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import mutate
+        stale = ("moved-code", "scripts/lit/lit_pipeline.py", "text that is nowhere in the file", "x")
+        with mock.patch.object(mutate, "MUTANTS", [stale]), \
+                mock.patch.object(mutate, "run_one", side_effect=AssertionError("a mutant ran")), \
+                mock.patch.object(sys, "argv", ["mutate.py"]), \
+                mock.patch("sys.stderr", new_callable=__import__("io").StringIO) as err:
+            self.assertEqual(mutate.main(), 2, "a stale anchor must fail the gate, distinctly from a survivor")
+        self.assertIn("moved-code", err.getvalue())
+        self.assertIn("anchor occurs 0 times", err.getvalue())
+        # The independent battery printed "caught 16/16 applied mutations", exit 0, with two skipped.
+        import mutation_battery
+        with mock.patch.object(mutation_battery, "MUTATIONS", [stale]), \
+                mock.patch.object(mutation_battery, "run_suite", return_value=(True, ["OK"])), \
+                mock.patch.object(sys, "argv", ["mutation_battery.py", ROOT]), \
+                mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
+            self.assertEqual(mutation_battery.main(), 2, "a battery that tested nothing must not pass")
+        self.assertIn("FAILED: 1 of 1 could not be applied", out.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+class TestMalformedExternalData(unittest.TestCase):
+    """Two defensive fixes shipped without tests: the project's own runner caught both as
+    surviving mutants. Transcripts and pricing.json are written by other software and by hand;
+    neither may take a tool down, and neither may be accepted as valid when it is not."""
+
+    def test_statusline_ignores_a_price_row_that_is_not_numbers(self):
+        """A row like ["four", 5, 8, 0.2, 20] must be skipped, not turned into a bogus price."""
+        sys.path.insert(0, os.path.join(ROOT, "statusline"))
+        import importlib, statusline
+        importlib.reload(statusline)
+        good = statusline._price_table({"models": {"opus-5-5": [4, 5, 8, 0.2, 20]}})
+        self.assertEqual(good["opus-5-5"], (4.0, 5.0, 8.0, 0.2, 20.0))
+        for bad in ({"models": {"opus-5-5": ["four", 5, 8, 0.2, 20]}},
+                    {"models": {"opus-5-5": [None, 5, 8, 0.2, 20]}},
+                    {"models": {"opus-5-5": [{"a": 1}, 5, 8, 0.2, 20]}}):
+            with self.subTest(bad=str(bad)[:40]):
+                self.assertEqual(statusline._price_table(bad), {},
+                                 "a non-numeric price row must be skipped, not coerced")
+
+    def test_a_null_token_count_in_a_transcript_is_zero_not_a_crash(self):
+        """Claude Code has written null counts. ccost.load is the entry point for every cost
+        tool, so a crash here takes down spend, the status line and the ledger at once."""
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "cost"))
+        import ccost
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.jsonl")
+            with open(p, "w") as f:
+                f.write(json.dumps({"type": "assistant", "timestamp": "2026-10-14T00:00:00Z",
+                                    "message": {"id": "m1", "model": "claude-haiku-5-5",
+                                                "usage": {"input_tokens": None, "output_tokens": 10,
+                                                          "cache_read_input_tokens": None,
+                                                          "cache_creation_input_tokens": 5}}}) + "\n")
+            calls = ccost.load(p)
+            self.assertEqual(len(calls), 1)
+            split, ctx = ccost.split(calls[0])          # must not raise
+            self.assertEqual(ctx, 5)
+            self.assertGreater(split["output"], 0)

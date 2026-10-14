@@ -5,6 +5,7 @@ $LACUNA_DATA/pricing.json rather than editing code.
 Transcript JSONL is an internal format, not a documented contract: treat results as estimates.
 """
 import json, os, re, sys
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import lacuna_config
@@ -24,7 +25,14 @@ def short(model):
 
 
 def load(path):
-    """API calls in order, deduplicated by message id: dicts with model, usage, ts, tools."""
+    """API calls in order, deduplicated by message id: dicts with id, model, usage, ts, tools, side
+    (a sidechain call, on another thread than the main conversation) and earlier (the attempts
+    before the last in usage.iterations, as (usage, model) pairs).
+
+    Claude Code records a failed API call (a session limit, an overload) as an assistant line whose
+    model is <synthetic> and whose usage is zero. It is not a call: counted as one it inflated the
+    call count and, as a session's first line, turned the real first cache write into an
+    "avoidable" one."""
     calls, order = {}, []
     with open(path, errors="ignore") as f:
         for line in f:
@@ -32,24 +40,42 @@ def load(path):
                 d = json.loads(line)
             except ValueError:
                 continue
-            if d.get("type") != "assistant":
+            if not isinstance(d, dict) or d.get("type") != "assistant":
                 continue
-            m = d.get("message") or {}
+            m = d.get("message")
+            if not isinstance(m, dict):
+                continue
             u, mid = m.get("usage"), m.get("id")
-            if not u or not mid:
+            if not isinstance(u, dict) or not mid or m.get("model") == "<synthetic>":
                 continue
+            u = {k: (v if v is not None else 0) for k, v in u.items()}   # a null count is 0, not a crash
             if mid not in calls:
                 order.append(mid)
             tools = [c.get("name") for c in m.get("content") or [] if isinstance(c, dict) and c.get("type") == "tool_use"]
-            calls[mid] = dict(model=m.get("model"), u=u, ts=d.get("timestamp") or "",
+            its = u.get("iterations") if isinstance(u.get("iterations"), list) else []
+            calls[mid] = dict(id=mid, model=m.get("model"), u=u, ts=d.get("timestamp") or "",
+                              side=bool(d.get("isSidechain")),
+                              earlier=[(i, i.get("model") or m.get("model")) for i in its[:-1] if isinstance(i, dict)],
                               tools=calls.get(mid, {}).get("tools", []) + tools)
     return [calls[i] for i in order]
 
 
 def split(c):
     """Dollar split of one call: dict(uncached, write5m, write1h, read, output) and context size."""
-    u = c["u"]
-    pi, p5, p1, pr, po = price(c["model"])
+    return split_usage(c["u"], c["model"])
+
+
+def earlier_usd(c):
+    """What the attempts before the last in usage.iterations would cost, if they were billed.
+
+    The top-level usage is the last attempt only. Anthropic bills a refusal before any output only
+    for some categories, and the transcript does not record which: so this is the gap between the
+    figure reported and the most it could have been, never something to add in silently."""
+    return sum(sum(split_usage(u, model)[0].values()) for u, model in c.get("earlier", ()))
+
+
+def split_usage(u, model):
+    pi, p5, p1, pr, po = price(model)
     cc = u.get("cache_creation") or {}
     w5, w1 = cc.get("ephemeral_5m_input_tokens"), cc.get("ephemeral_1h_input_tokens")
     if w5 is None and w1 is None:
@@ -61,20 +87,61 @@ def split(c):
     return s, ctx
 
 
-def is_cold(c):
-    """True when this call paid to write a large cache instead of reading one."""
+def ts(s):
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0
+
+
+IDLE_S = 300    # the shortest cache lifetime: a re-write sooner than this is not an expired cache
+
+
+def is_cold(c, prev=None):
+    """True when this call paid to write a large cache instead of reading one.
+
+    A warm call reads about what the previous call had in context. After the cache expires, the
+    next call still reads what is warm for everyone — Claude Code's ~42k system prompt and tools —
+    and writes the rest. So "reads under 40k" alone missed most idle re-caches: on one machine, 9
+    worth $39.66 each read 42.2k-42.7k (one: 6.5 h idle, 647,597 written, 42,210 read). Against
+    the previous call, such a write reads under half of it after an idle gap. The gap keeps out a
+    compaction, which also writes a new context, seconds after the call before it.
+    """
     u = c["u"]
-    return u.get("cache_creation_input_tokens", 0) > 40_000 and u.get("cache_read_input_tokens", 0) < 40_000
+    read = u.get("cache_read_input_tokens", 0)
+    if u.get("cache_creation_input_tokens", 0) <= 40_000:
+        return False
+    if read < 40_000:
+        return True
+    if prev is None:
+        return False
+    # A /model switch re-writes the cache too, minutes after the last call: that is not idling.
+    return (read < split(prev)[1] / 2 and ts(c["ts"]) - ts(prev["ts"]) >= IDLE_S
+            and c["model"] == prev["model"])
 
 
-def is_avoidable_cold(c, index):
-    """True when a cold write could have been avoided.
+def is_avoidable_cold(c, prev):
+    """True when a cold write could have been avoided. `prev` is the call before it on the same
+    thread, or None.
 
     A session's FIRST call always writes its cache; that is the price of starting work, not waste.
-    Every later cold write means the cache expired while the session sat idle. Both the session
-    report and the fleet report must use this, or the same transcript gets two different counts.
+    Every later cold write means the cache expired while the session sat idle.
     """
-    return index > 0 and is_cold(c)
+    return prev is not None and is_cold(c, prev)
+
+
+def avoidable_colds(calls):
+    """Indices of the avoidable cold rewrites among one transcript's calls. Both the session report
+    and the fleet report use this, or the same transcript gets two different counts. A sidechain
+    call is on another thread, so it is neither judged nor the "previous call" of a main one."""
+    out, prev = set(), None
+    for i, c in enumerate(calls):
+        if c.get("side"):
+            continue
+        if is_avoidable_cold(c, prev):
+            out.add(i)
+        prev = c
+    return out
 
 
 def project_dir(cwd):

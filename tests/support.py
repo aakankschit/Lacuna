@@ -23,7 +23,9 @@ for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
 # real run fails; "apology" is the dangerous one — a long, fluent failure that clears a size check.
 # "reply" is how a real model declines: is_error false, FAKE_REPLY as its text, nothing written.
 # "notdict" does the work but replies with JSON that is not an object; "hang" does the work and
-# never returns, so a test can interrupt a run part-way.
+# never returns, so a test can interrupt a run part-way. "incomplete" writes a plausible plan and
+# then says, in its reply, that it could not read its sources — the honest failure a real model
+# gives. "clobber" writes its plan over --out itself instead of the .partial it was given.
 FAKE_CLAUDE = r'''#!{py}
 import json, os, re, sys, time
 prompt = sys.stdin.read()
@@ -50,6 +52,8 @@ def done(reply):
 note = re.search(r"(?m)^- (\S+) -> (\S+)$", prompt)
 plan = re.search(r"Write the result to (\S+)\.", prompt)
 target = (note and note.group(2)) or (plan and plan.group(1))
+if mode == "clobber" and plan:
+    target = target[:-len(".partial")]
 if mode == "apology" and target:
     with open(target, "w") as f:
         f.write("# Plan\n\nBLOCKED - not completed. I could not read any of the supplied files.\n\n"
@@ -68,16 +72,19 @@ if note:
     model = argv[argv.index("--model") + 1]
     brief = next((l for l in prompt.splitlines() if l.startswith("BRIEF:")), "BRIEF:none")
     books = "BOOKS-OFFERED" if "Textbooks you may consult" in prompt else "NO-BOOKS"
+    with open(note.group(1), errors="ignore") as f:
+        title = f.readline().strip()      # so two papers with one file name get different notes
     with open(target, "w") as f:
-        f.write("# A note ({{}})\n\n## Claim\n{{}}\n{{}}\nmodel={{}}\n\n## Key results\n".format(
-            os.path.basename(note.group(1)), brief, books, model) + ("Finding with a number, 42 units. " * 40))
+        f.write("# A note ({{}})\n\n## Claim\n{{}}\n{{}}\n{{}}\nmodel={{}}\n\n## Key results\n".format(
+            os.path.basename(note.group(1)), title, brief, books, model) + ("Finding with a number, 42 units. " * 40))
     done({{"is_error": False, "result": target, "total_cost_usd": 0.012}})
 if plan:
     objective = next((l for l in prompt.splitlines() if l.startswith("Objective:")), "")
     with open(target, "w") as f:
         f.write("# Development plan\n\n{{}}\n\n## 1. A real proposal\n\n".format(objective)
                 + ("Substantive plan content naming src/widget/sampler.py. " * 60))
-    done({{"is_error": False, "result": target, "total_cost_usd": 0.3}})
+    done({{"is_error": False, "total_cost_usd": 0.3,
+           "result": "INCOMPLETE: the notes could not be read" if mode == "incomplete" else target}})
 print(json.dumps({{"is_error": False, "result": "nothing to do", "total_cost_usd": 0.0}}))
 '''
 
@@ -101,6 +108,11 @@ def write(path, text, mode=None):
 def read(path):
     with open(path) as f:
         return f.read()
+
+
+def ls(path):
+    """What a user sees in a directory: sorted, without dotfiles (Lacuna's .lacuna.json record)."""
+    return sorted(f for f in os.listdir(path) if not f.startswith("."))
 
 
 def strip_ansi(s):

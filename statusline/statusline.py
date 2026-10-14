@@ -10,24 +10,51 @@ absent those segments go blank rather than guess.
 
 Deliberately self-contained — a status line runs on every refresh and must not fail — so it can be
 copied anywhere. It picks up a pricing.json beside it or in the data directory if one exists.
-"""
-import json, os, sys, time
 
-# $/MTok: input, 5m write, 1h write, cache read, output. Longest key first.
+Self-contained is not the same as free to differ. Where it reads what the CLI reads — the data
+directory, the price files, the transcript — it reads them as scripts/lacuna_config.py and
+scripts/cost/ccost.py do, by duplicated code rather than an import. It once fell behind on all
+three at once: an unexpanded "~" in LACUNA_DATA, a malformed pricing.json, and a <synthetic> API
+error line read as the last turn ("last $0.000").
+"""
+import json, math, os, sys, time
+
+# $/MTok: input, 5m write, 1h write, cache read, output. Longest key first. The same table as
+# scripts/pricing.json, because a copy of this file installed on its own cannot see that one.
 PRICE = {
     "opus-5-5": (4, 5, 8, .20, 20), "sonnet-5-5": (2, 2.5, 4, .10, 10), "haiku-5-5": (.10, .125, .20, .01, .50),
     "fable-5-1": (10, 12.5, 20, .25, 50), "opus-5": (5, 6.25, 10, .50, 25), "opus-4-8": (5, 6.25, 10, .50, 25),
+    "haiku-4-5": (1, 1.25, 2, .10, 5),
 }
+# The data directory exactly as lacuna_config resolves it: "~" and "$VAR" expanded, and no
+# CLAUDE_PLUGIN_DATA fallback, which a hook sees and a shell does not.
+DATA = os.path.expanduser(os.path.expandvars(os.environ.get("LACUNA_DATA") or "~/.lacuna"))
+
+
+def _price_table(doc):
+    """{model: 5-tuple} from a pricing file, accepting what lacuna_config accepts: the table under
+    "models" or at the top level. A hand-edited entry that is not five numbers is skipped."""
+    table = (doc.get("models") or doc) if isinstance(doc, dict) else None
+    out = {}
+    for k, v in (table.items() if isinstance(table, dict) else ()):
+        if not isinstance(v, (list, tuple)):
+            continue
+        try:
+            t = tuple(float(x) for x in v)
+        except (TypeError, ValueError):
+            continue
+        if not str(k).startswith("_") and len(t) == 5 and all(math.isfinite(x) and x >= 0 for x in t):
+            out[k] = t
+    return out
+
+
 for _p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "pricing.json"),
            os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing.json"),
-           os.path.join(os.environ.get("LACUNA_DATA")
-                        or os.environ.get("CLAUDE_PLUGIN_DATA")
-                        or os.path.expanduser("~/.lacuna"), "pricing.json")):
+           os.path.join(DATA, "pricing.json")):
     try:
         with open(_p) as _f:
-            PRICE.update({k: tuple(v) for k, v in (json.load(_f).get("models") or {}).items()
-                          if not k.startswith("_") and len(v) == 5})
-    except (OSError, ValueError, TypeError):
+            PRICE.update(_price_table(json.load(_f)))
+    except Exception:     # this runs at import, outside main()'s guard: nothing here may raise
         pass
 PRICE = dict(sorted(PRICE.items(), key=lambda kv: -len(kv[0])))
 TIER = {"Haiku": 114, "Sonnet": 75, "Opus": 177, "Fable": 214}  # 256-colour codes per model family
@@ -54,8 +81,28 @@ def price(model):
     return next((v for k, v in PRICE.items() if k in (model or "")), PRICE["opus-5-5"])
 
 
+def _n(d, key):
+    """A token count from a transcript: a missing, null or non-numeric field is 0."""
+    v = d.get(key) if isinstance(d, dict) else None
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def cost(u, model):
+    """Dollar split of one usage block: (read$, write$, out$, uncached$)."""
+    inp, w5, w1, rd, out = price(model if isinstance(model, str) else None)
+    cc = u.get("cache_creation")
+    t5, t1 = _n(cc, "ephemeral_5m_input_tokens"), _n(cc, "ephemeral_1h_input_tokens")
+    if not (t5 or t1):
+        t1 = _n(u, "cache_creation_input_tokens")
+    return (_n(u, "cache_read_input_tokens") * rd / 1e6, (t5 * w5 + t1 * w1) / 1e6,
+            _n(u, "output_tokens") * out / 1e6, _n(u, "input_tokens") * inp / 1e6)
+
+
 def last_turn(path):
-    """Cost split of the most recent main-thread API call: (read$, write$, out$, uncached$)."""
+    """The most recent main-thread API call: ((read$, write$, out$, uncached$), earlier$).
+
+    `earlier$` prices the attempts before the last in `usage.iterations` (a refusal, a fallback),
+    which the top-level usage leaves out. Whether they were billed is not in the transcript."""
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -68,17 +115,17 @@ def last_turn(path):
             e = json.loads(ln)
         except ValueError:
             continue
-        m = e.get("message") or {}
-        u = m.get("usage")
-        if e.get("type") != "assistant" or not u or e.get("isSidechain"):
+        if not isinstance(e, dict):           # valid JSON that is not a transcript line
             continue
-        inp, w5, w1, rd, out = price(m.get("model"))
-        cc = u.get("cache_creation") or {}
-        t5, t1 = cc.get("ephemeral_5m_input_tokens", 0), cc.get("ephemeral_1h_input_tokens", 0)
-        if not (t5 or t1):
-            t1 = u.get("cache_creation_input_tokens", 0)
-        return (u.get("cache_read_input_tokens", 0) * rd / 1e6, (t5 * w5 + t1 * w1) / 1e6,
-                u.get("output_tokens", 0) * out / 1e6, u.get("input_tokens", 0) * inp / 1e6)
+        m = e.get("message")
+        u = m.get("usage") if isinstance(m, dict) else None
+        if e.get("type") != "assistant" or not isinstance(u, dict) or e.get("isSidechain"):
+            continue
+        if m.get("model") == "<synthetic>":   # an API error Claude Code recorded, with zero usage
+            continue
+        its = u.get("iterations") if isinstance(u.get("iterations"), list) else []
+        earlier = sum(sum(cost(i, i.get("model") or m.get("model"))) for i in its[:-1] if isinstance(i, dict))
+        return cost(u, m.get("model")), earlier
     return None
 
 
@@ -87,7 +134,10 @@ def main():
         d = json.load(sys.stdin)
     except ValueError:
         return          # a status line that prints a traceback is worse than one that prints nothing
-    cols = int(os.environ.get("COLUMNS", 120))
+    try:
+        cols = int(os.environ.get("COLUMNS") or 120)
+    except ValueError:
+        cols = 120
     model = d.get("model") or {}
     name = model.get("display_name", "?")
     fam = next((k for k in TIER if k in name), "Opus")
@@ -130,8 +180,11 @@ def main():
     l2 = [f"${cost:.2f} session"]
     lt = last_turn(d.get("transcript_path"))
     if lt:
-        rd, wr, out, unc = lt
-        l2.append(f"last ${rd + wr + out + unc:.3f} {DIM}(read {rd:.3f} · write {wr:.3f} · out {out:.3f}){RST}")
+        (rd, wr, out, unc), earlier = lt
+        low = rd + wr + out + unc
+        # Earlier attempts in the same call may or may not have been billed: show both ends.
+        fig = f"${low:.3f}–${low + earlier:.3f}" if earlier >= 0.0005 else f"${low:.3f}"
+        l2.append(f"last {fig} {DIM}(read {rd:.3f} · write {wr:.3f} · out {out:.3f}){RST}")
     if pc.get("hit_ratio") is not None:
         l2.append(f"hit {pc['hit_ratio'] * 100:.0f}%" if pc["hit_ratio"] <= 1 else f"hit {pc['hit_ratio']:.0f}%")
     rl = d.get("rate_limits") or {}

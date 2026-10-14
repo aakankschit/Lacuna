@@ -54,6 +54,11 @@ directory when it does.
   numbers above and nobody can compute which.
 - If your work triggers refusals — chemistry and biology source material does — assume the real
   cost is higher than reported, possibly much higher.
+- The report says so itself: every total is labelled a lower bound, and where calls carry earlier
+  iterations it shows a range (`$62.65–$285.28`) and how many calls were retried, rather than the
+  lower number alone.
+- A forked session copies its parent's calls into a new file. The fleet report counts each message
+  id once across files; before 0.3.0 it counted a fork's copies again.
 
 ## The cache guard is a heuristic
 
@@ -63,6 +68,10 @@ can stay quiet when you were charged. It exists to make an invisible cost notice
 trusted to the cent.
 
 ## The status line reads undocumented fields
+
+Its `last $` figure has the same gap: when the last call has earlier iterations it shows a range
+(`last $0.030–$0.120`) instead of the lower end.
+
 
 Rate-limit percentages and cache-TTL details come from fields that are not a public interface. They
 may change or disappear without notice; when they do, those segments go blank rather than lying.

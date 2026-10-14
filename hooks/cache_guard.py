@@ -25,7 +25,7 @@ try:
     import lacuna_config
     _DATA, _CFG, _PRICES = lacuna_config.DATA, lacuna_config.CONFIG, lacuna_config.prices()
 except Exception:                                      # the hook must never break a session
-    _DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")
+    _DATA = os.path.expanduser(os.path.expandvars(os.environ.get("LACUNA_DATA") or "~/.lacuna"))
     _CFG, _PRICES = {}, {}
 
 
@@ -72,7 +72,7 @@ def compacted_since(path, after_ts):
             e = json.loads(ln)
         except ValueError:
             continue
-        if not (e.get("isCompactSummary") or e.get("subtype") == "compact_boundary"):
+        if not isinstance(e, dict) or not (e.get("isCompactSummary") or e.get("subtype") == "compact_boundary"):
             continue
         # Both shapes Claude Code writes carry a timestamp. An undated line is no evidence: it
         # must not switch the guard off for the whole session.
@@ -95,17 +95,20 @@ def last_call(path):
     except OSError:
         return None
     for ln in reversed(lines):
-        # Claude Code records an API failure (a session limit, an overload) as a <synthetic>
-        # assistant line whose usage is all zeros. Taken as the newest call it reports 0 tokens of
-        # context, so the guard stays silent exactly when the next prompt will re-cache everything.
-        if "<synthetic>" in ln:
-            continue
         try:
             e = json.loads(ln)
         except ValueError:
             continue
-        u = (e.get("message") or {}).get("usage")
-        if e.get("type") != "assistant" or not u or e.get("isSidechain"):
+        m = e.get("message") if isinstance(e, dict) else None     # valid JSON that is not a call
+        u = m.get("usage") if isinstance(m, dict) else None
+        if not isinstance(u, dict) or e.get("type") != "assistant" or e.get("isSidechain"):
+            continue
+        # Claude Code records an API failure (a session limit, an overload) as an assistant line
+        # whose model is <synthetic> and whose usage is all zeros. Taken as the newest call it
+        # reports 0 tokens of context, so the guard stays silent exactly when the next prompt will
+        # re-cache everything. Judged by the model field, not the raw line: a real call whose text
+        # merely mentions "<synthetic>" was skipped, and an idle hour was invented.
+        if e["message"].get("model") == "<synthetic>":
             continue
         ctx = (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                + u.get("cache_read_input_tokens", 0))

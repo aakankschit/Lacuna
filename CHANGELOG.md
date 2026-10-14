@@ -3,6 +3,61 @@
 Dates are the measurement or release date. Price-table changes get their own entry, because a stale
 price table makes every cost figure wrong without looking wrong.
 
+## 0.3.0 — 2026-10-14
+
+Clears the six caveats of the seventh review (`docs/reviews/VERDICT2.md`). Each was fixed as a
+class: the sibling paths of every fix were searched for and fixed with it, and every fix has a test
+in `tests/` and a mutant in `tools/mutate.py` (its revert).
+
+- **A note now records which document it came from (N1, N6).** Ownership was byte-equality with the
+  note cache: blind to *which* document, so `main.pdf` from one paper's folder silently replaced
+  another's note on the next day's run; and tied to the cache, so deleting it or moving machines
+  refused every later run with a message saying Lacuna had not written notes it had. The record is
+  now `.lacuna.json` beside the files. A run that would replace a file Lacuna cannot show is its own
+  — edited, unrecorded, or another document's note with the same name — exits 2 before any model
+  call, names every such file and why, and says how to go ahead (`--overwrite`). The same rule now
+  covers `synth --out` (a hand-edited plan in a vault was replaced without a word) and `verify`'s
+  report. A note written by 0.2.0 is adopted when it is exactly that document's cached note.
+  Siblings: Unicode-normalisation collisions (`café` typed vs pasted), a document given inside its
+  own `--out` even with `--overwrite`, writing through a symlink, and a model that writes `--out`
+  itself (its failed output was left there under a message calling it an earlier run's; now moved
+  to `<out>.rejected`). An adversarial review then found, and this release fixes: a document named
+  `Paper.MD` inside `--out` deleted by `--overwrite` (realpaths differ where the disk folds case;
+  compared by `samefile` now); an `after.read` frontmatter hook, as extending.md suggests, making
+  every later run refuse; two processes writing one record losing entries (now locked); a damaged
+  record raising; and a read-only `--out` ending in a traceback.
+- **An output that says it has nothing is not output (N2).** A real digester that could read no
+  notes filed "PARTIAL: literature notes unreadable", exit 0. `BLOCKED`, `PARTIAL:` or
+  `INCOMPLETE:` as the opening line (below any headings, through backticks, list
+  numbers, callouts or a `Status:` label) now fails the stage, and nowhere else — the same words
+  lower down are findings; `synth` and `verify` agents are told to reply
+  `INCOMPLETE: <reason>` instead of writing a document about it, and `synth` judges the reply.
+  Checked against real models: sonnet with unreadable notes replied `INCOMPLETE`, exit 4, $0.023;
+  haiku with an unreadable repo replied `INCOMPLETE` and said it did not substitute a nearby copy.
+  `synth` also refuses, before paying, inputs it cannot read or that declare themselves failed.
+- **The status line reads what the CLI reads, as the CLI reads it (N7).** `~` in `LACUNA_DATA`,
+  every malformed `pricing.json` shape `lacuna_config` tolerates (it raised at import, outside its
+  own guard), `<synthetic>` API-error lines judged by `message.model`, and an inline price table
+  equal to the shipped one (it lacked `haiku-4-5`, so a standalone copy priced it at opus rates).
+  `cache_guard` now judges `<synthetic>` by the model field too: the substring test skipped real
+  calls that mentioned it. `lit estimate` no longer crashes on a malformed `calibration.json`.
+  A price must be a list of five finite numbers everywhere (`"12345"` was five prices, NaN printed
+  `last $nan`), and a transcript line that is valid JSON but not a call no longer blanks the status
+  line or disables the guard.
+- **`/spend` says it is a lower bound, and shows what it cannot settle as a range (N5, §2).** Idle
+  re-caches that still read the ~42k warm prefix are now counted as cold rewrites (judged against
+  the previous call on the same model after an idle gap, not a fixed 40k). On the reviewer's
+  machine: 84 → 92 counted, $47.23 → $87.67: the ten added are exactly the idle re-caches it found,
+  the two dropped are a forked session's copies, and `/model` switches are not counted as idling. Earlier attempts in `usage.iterations` are priced at their
+  own model and shown as the top of a range (`$62.65–$285.28`), never added in or dropped.
+  `<synthetic>` lines are no longer calls (as a session's first line they made the real first write
+  "avoidable"); a sidechain call no longer counts as the main thread's previous call; and the fleet
+  report counts a forked session's copied calls once. The status line's `last $` shows the range too.
+- **The mutation gate fails loudly on a stale anchor (N4).** Six anchors were stale at 0.2.0 and
+  read as test gaps. `tools/mutate.py` now checks every anchor first and exits 2 if one does not
+  match; `--check-anchors` runs in `tools/check.sh` and CI. `tools/mutation_battery.py` fails on a
+  skipped mutation (it printed "caught 16/16" with two skipped) and no longer edits the repo in place.
+
 ## 0.2.0 — 2026-10-14
 
 Seven independent reviews. The sixth returned NOT READY with nine defect classes; the seventh

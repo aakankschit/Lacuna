@@ -14,11 +14,16 @@ Which model fills each role comes from scripts/lacuna_config.py (env: LACUNA_REA
 LACUNA_DIGESTER, LACUNA_PLANNER, LACUNA_VERIFIER); --model overrides it.
 
 usage:
-  lit_pipeline.py read   <pdf-or-md> [...] [--out DIR] [--no-books] [--model M] [--brief TEXT]
-  lit_pipeline.py synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT]
+  lit_pipeline.py read   <pdf-or-md> [...] [--out DIR] [--no-books] [--model M] [--brief TEXT] [--overwrite]
+  lit_pipeline.py synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT] [--overwrite]
   lit_pipeline.py verify --target FILE --repo DIR [--notes DIR]
 """
-import argparse, concurrent.futures as cf, glob, hashlib, json, os, re, shlex, shutil, subprocess, sys, time
+import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, shutil, subprocess, sys, threading, time
+import unicodedata
+try:
+    import fcntl                       # POSIX; elsewhere the record is guarded within one process only
+except ImportError:
+    fcntl = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -245,31 +250,37 @@ def cmd_read(a):
         print(f"ERROR: --out {a.out!r} is a file; it must be a directory for notes.", file=sys.stderr)
         sys.exit(EX_INPUT)
     os.makedirs(out_dir, exist_ok=True)
+    need_writable(out_dir, "--out")
     os.makedirs(f"{CACHE}/notes", exist_ok=True)
     # Each document's note is <out>/<its name>.md. Settle every name before anything is parsed or
     # paid for: two documents with one name once shared a note path, and the parallel readers then
     # cached one paper's note under the other's key, permanently.
-    papers, by_note = [], {}
+    papers, by_note, blocked = [], {}, {}
     for src in map(os.path.abspath, a.papers):
         stem = os.path.splitext(os.path.basename(src))[0]
         note = f"{out_dir}/{stem}.md"
-        other = by_note.get(note.casefold())          # casefold: macOS treats Paper.md as paper.md
+        other = by_note.get(name_key(note))
         if other and os.path.realpath(other) == os.path.realpath(src):
             continue                                  # the same document twice: read it once
         if other:
             print(f"ERROR: {other} and {src} would both be noted as {note}. Rename one, or read "
                   f"them into separate --out directories. Nothing was sent to a model.", file=sys.stderr)
             sys.exit(EX_INPUT)
-        # A note may only replace a note this tool wrote. Anything else at that path is the user's:
-        # a hand-edited note, an unrelated file in a vault, or the document itself.
-        if os.path.lexists(note) and not lacuna_wrote(note, stem):
-            why = ("is inside --out, so its note would replace the document itself"
-                   if os.path.realpath(note) == os.path.realpath(src) else
-                   f"would overwrite {note}, which Lacuna did not write (or which has been edited since)")
-            print(f"ERROR: {src} {why}. Move it, or choose another --out. Nothing was sent to a model.",
-                  file=sys.stderr)
+        if os.path.lexists(note) and same_file(note, src):
+            print(f"ERROR: {src} is inside --out, so its note would replace the document itself. Move it, "
+                  f"or choose another --out. Nothing was sent to a model.", file=sys.stderr)
             sys.exit(EX_INPUT)
-        by_note[note.casefold()] = src
+        if os.path.isdir(note) and not os.path.islink(note):
+            print(f"ERROR: {note} is a directory, so {src} has nowhere to put its note. Nothing was sent "
+                  f"to a model.", file=sys.stderr)
+            sys.exit(EX_INPUT)
+        # A note may only replace a note this tool wrote for this document and nobody has edited
+        # since. Anything else at that path is someone's: a hand-edited note, a file in a vault, or
+        # the note for another paper that happens to share this one's file name.
+        why = not_ours(note, src)
+        if why:
+            blocked[note] = why
+        by_note[name_key(note)] = src
         papers.append((src, stem, note))
     reader_model = a.model or lacuna_config.model("reader")
     idx = [] if a.no_books else book_indexes()
@@ -290,17 +301,37 @@ def cmd_read(a):
         key = hashlib.sha256("\0".join(
             [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
-        jobs.append((md, note, f"{CACHE}/notes/{stem}_{key}.md"))
+        cached = f"{CACHE}/notes/{stem}_{key}.md"
+        # A note from before ownership was recorded (0.2.0), or from a run killed between writing
+        # it and recording it, is still provably this document's when it is exactly this document's
+        # cached note.
+        if blocked.get(note, ("",))[0] == UNRECORDED and same_bytes(note, cached):
+            del blocked[note]
+        jobs.append((src, md, note, cached))
+    if blocked and not a.overwrite:
+        print(f"ERROR: {len(blocked)} file(s) in {out_dir} would be replaced, and Lacuna cannot show they "
+              f"are notes it wrote for these documents:", file=sys.stderr)
+        for _, why in blocked.values():
+            print(f"  - {why}", file=sys.stderr)
+        print("Nothing was sent to a model. To keep a file, move it or read into another --out. To read a "
+              "different document with the same file name, rename it or use another --out. To replace "
+              "these files anyway, run the same command with --overwrite.", file=sys.stderr)
+        sys.exit(EX_INPUT)
 
-    def one(md, out, cached):
+    def one(src, md, out, cached):
+        if os.path.islink(out):
+            os.remove(out)                # only with --overwrite; never write through a link
         if os.path.exists(cached) and os.path.getsize(cached) > 400:
             shutil.copy(cached, out)      # always refresh: --out may hold another run's note
+            record(out, src)
+            written.append((out, src))
             return os.path.basename(out), "cached (free)", 0.0
         # Remove any earlier note first, so "the file exists" can only mean this call wrote it.
         # Otherwise a refusal on a re-run reports success and caches the stale note under a new key.
         # (Only ever a note this tool wrote: anything else at this path stopped the run above.)
         if os.path.exists(out):
             os.remove(out)
+            forget(out)
         prompt = "\n\n".join(x for x in [
             a.brief, books,
             "Read the paper below in full and write its note to the given path, using exactly this template:",
@@ -317,6 +348,8 @@ def cmd_read(a):
                 "source_tokens": round(os.path.getsize(md) / 2.9), "is_error": res.get("is_error")})
         if ok:
             shutil.copy(out, cached)
+            record(out, src)
+            written.append((out, src))
             return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
         why = (str(res.get("result"))[:120] if res.get("is_error") else
                "the file it wrote is not a note (see above)" if os.path.exists(out) else "agent produced no note file")
@@ -324,7 +357,7 @@ def cmd_read(a):
             os.remove(out)      # an apology left in --out would be read as a note by the next synth
         return os.path.basename(out), f"FAILED ${usd(res):.4f} — {why}", usd(res)
 
-    t0, total, failed = time.time(), 0.0, 0
+    t0, total, failed, written = time.time(), 0.0, 0, []
     with cf.ThreadPoolExecutor(min(8, len(jobs))) as ex:
         for name, msg, cost in ex.map(lambda j: one(*j), jobs):
             print(f"  {name:48s} {msg}")
@@ -336,6 +369,8 @@ def cmd_read(a):
               f"directory, and no partial note was cached.", file=sys.stderr)
         sys.exit(EX_MODEL)
     after("read", out_dir)
+    for out, src in written:
+        rerecord(out, src)
 
 
 # Phrases a model writes when it could not do the job. A file of apologies passes any size check,
@@ -396,24 +431,217 @@ def refusal(head):
             hit = _opens_with_apology(low[len(first_sentence):].lstrip())
             if hit:
                 return hit
-    # A status marker in capitals, as a blocked agent writes it — but only standing alone, not
-    # inside prose such as "- JobState.BLOCKED -> not found".
-    if re.search(r"(?m)^[#>\s*-]*\**BLOCKED\b", head[:600]):
-        return "BLOCKED"
+    return declared_failure(head)
+
+
+# A status marker opening a document or a reply: BLOCKED, as a blocked agent writes it, or PARTIAL: /
+# INCOMPLETE:, as a real digester titled its file ("PARTIAL: literature notes unreadable", filed as a
+# digest, exit 0) and as the agents are told to reply (INCOMPLETE_RULE). Only the OPENING line counts
+# — the first line that is not a heading, and any headings above it. Matched anywhere at a line
+# start, it discarded correct output: a `BLOCKED` status tag on a proposal, a constant in a code
+# block, an "INCOMPLETE-data" theme. The word must stand alone (a colon, a spaced dash, a full stop
+# or the end of the line after it), so "Blocked Gibbs sampling" and "PARTIAL LEAST SQUARES" are
+# titles. The furniture a model puts around it — backticks echoing the prompt, quotes, a list number,
+# an emoji, a callout, "Status:" — is stripped first.
+STATUS_MARKER = re.compile(r"(?i)^(BLOCKED(?=\**\s*(?:$|[:.\u2013\u2014-]))"
+                           r"|(?:PARTIAL|INCOMPLETE)\**(?=\s*[:.]|\s+[\u2013\u2014-]\s|\s*$))")
+# A heading that ENDS in a bracketed marker, as a real planner titled one: "# Development plan (PARTIAL /
+# BLOCKED)". The marker must be followed by a separator, so "(PARTIAL LEAST SQUARES)" is a title.
+_TITLE_MARKER = re.compile(r"(?i)[(\[]\s*(BLOCKED|PARTIAL|INCOMPLETE)\s*[/:)\],][^()\[\]]*[)\]]\s*$")
+_FURNITURE = re.compile(r"^(?:\[![^\]]*\]|\d+[.)](?=\s)|[^\w])*(?:status\s*[:\u2013\u2014-](?:[^\w])*)?", re.I)
+
+# An honest model that could not read its sources says so; it must say so where a program can see
+# it, not in a fluent document that passes every check.
+INCOMPLETE_RULE = ("If you could not read {what}, do not write a document explaining why{also}: reply with "
+                   "one line, `INCOMPLETE: <what you could not read>`, and nothing else.")
+
+
+def declared_failure(text):
+    """The status marker a document or reply opens with (BLOCKED, PARTIAL, INCOMPLETE), or None."""
+    for line in text.splitlines()[:40]:
+        if not line.strip():
+            continue
+        heading = line.lstrip().startswith("#")
+        # "claim -> what you found" is the verify report's format: a finding graded PARTIAL is a finding.
+        m = None if "->" in line else STATUS_MARKER.match(_FURNITURE.sub("", line, count=1))
+        m = m or (_TITLE_MARKER.search(line) if heading else None)
+        if m:
+            return m.group(1).rstrip("*").upper()
+        if not heading:
+            return None                       # the opening line was not a marker
     return None
 
 
-def lacuna_wrote(path, stem):
-    """True when `path` is byte-for-byte a note in the cache: one this tool wrote, and may replace."""
-    if os.path.islink(path) or not os.path.isfile(path):
-        return False
+# ---- ownership: which files in the user's directories Lacuna may replace
+#
+# Lacuna writes into directories that belong to the user — a notes folder, an Obsidian vault, a
+# repo's lit/plan.md — so it replaces a file only when it can show that it wrote that file, for the
+# document it is writing now, and that nobody has edited it since. The evidence is a record kept
+# beside the files (OWNERS), not the note cache. Ownership was once proven by byte-equality with
+# the cache, which asked "did Lacuna write this?" and never "for which document?": a note read on
+# Monday from smith2023/main.pdf was silently replaced on Tuesday by jones2024/main.pdf's, and
+# deleting the cache or moving to another machine refused every later run with a message saying
+# Lacuna had not written notes that it had.
+OWNERS = ".lacuna.json"
+UNRECORDED = "unrecorded"
+_owners_lock = threading.Lock()
+
+
+def name_key(path):
+    """One key per file that the filesystem treats as one. macOS folds case (Paper.md is paper.md)
+    and Unicode normalisation (café typed and café pasted from a PDF are one name)."""
+    return unicodedata.normalize("NFC", os.path.basename(path)).casefold()
+
+
+def _sha(path):
     with open(path, "rb") as f:
-        body = f.read()
-    for c in glob.glob(f"{glob.escape(CACHE)}/notes/{glob.escape(stem)}_*.md"):
-        with open(c, "rb") as f:
-            if f.read() == body:
-                return True
-    return False
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def same_bytes(a, b):
+    return os.path.isfile(a) and os.path.isfile(b) and _sha(a) == _sha(b)
+
+
+def same_file(a, b):
+    """One file under two names. macOS folds case and Unicode form, so Paper.MD inside --out IS the
+    note path notes/Paper.md, though their realpaths differ; comparing realpaths let --overwrite
+    delete the document."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(a) == os.path.realpath(b)
+
+
+def _owners(d):
+    """The record of files Lacuna wrote in `d`: (entries, why it could not be read or None).
+    Hand-edited or damaged, it must never raise; whatever is not a well-formed entry is ignored."""
+    p = os.path.join(d, OWNERS)
+    if not os.path.exists(p):
+        return {}, None
+    try:
+        with open(p) as f:
+            files = json.load(f).get("files")
+        if not isinstance(files, dict):
+            raise ValueError("no files table")
+    except Exception as e:       # OSError, ValueError, a list at the top, RecursionError on deep nesting
+        return {}, f"{OWNERS} could not be read ({type(e).__name__})"
+    good = {}
+    for k, v in files.items():
+        if isinstance(v, dict) and isinstance(v.get("sha256"), str):
+            good[k] = {**v, "source": v["source"] if isinstance(v.get("source"), str) else None}
+    return good, None
+
+
+class _locked:
+    """The record is read, changed and replaced by up to 8 reader threads and by any other Lacuna
+    process writing to the same directory; without a lock between processes, two concurrent reads
+    into one --out kept 9 of 16 entries, and the next run refused the other 7."""
+
+    def __init__(self, d):
+        self.d, self.fd = d, None
+
+    def __enter__(self):
+        _owners_lock.acquire()
+        if fcntl:
+            try:
+                self.fd = os.open(self.d, os.O_RDONLY)
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+            except OSError:
+                self.fd = None
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)        # releases the lock
+        _owners_lock.release()
+
+
+def need_writable(d, what):
+    if not os.access(d, os.W_OK):
+        print(f"ERROR: {what} {d} is not writable. Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
+
+
+def _save_owners(d, files):
+    tmp = os.path.join(d, f"{OWNERS}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with open(tmp, "w") as f:
+        json.dump({"about": "Files Lacuna wrote in this directory, and what from, so that it only ever "
+                            "replaces its own. Deleting this makes Lacuna ask (--overwrite) before "
+                            "replacing any of them.", "files": files}, f, indent=1, sort_keys=True)
+    os.replace(tmp, os.path.join(d, OWNERS))
+
+
+def record(path, source=None):
+    """Record that Lacuna wrote `path`, as it is now, from the document `source`.
+
+    The stage has already succeeded and been paid for, so this never raises: a record that cannot
+    be written costs a question (--overwrite) on the next run, not this run's output."""
+    d = os.path.dirname(path)
+    try:
+        entry = {"name": os.path.basename(path), "sha256": _sha(path), "written": time.strftime("%Y-%m-%d %H:%M")}
+        if source:
+            entry.update(source=source, source_sha256=_sha(source))
+        with _locked(d):
+            files = _owners(d)[0]
+            files[name_key(path)] = entry
+            _save_owners(d, files)
+    except OSError as e:
+        print(f"  ! could not record {path} as Lacuna's ({e}); the next run will ask before replacing it",
+              file=sys.stderr)
+
+
+def forget(path):
+    d = os.path.dirname(path)
+    try:
+        with _locked(d):
+            files = _owners(d)[0]
+            if files.pop(name_key(path), None) is not None:
+                _save_owners(d, files)
+    except OSError:
+        pass
+
+
+def rerecord(path, source=None):
+    """After an after.* hook: the hook is part of the user's pipeline, so what it leaves is still
+    Lacuna's output. A hook that prepended frontmatter, as docs/extending.md suggests, otherwise made
+    every later run refuse the note as edited. A hook that moved the file away takes it out of the
+    record."""
+    if os.path.isfile(path):
+        record(path, source)
+    else:
+        forget(path)
+
+
+def not_ours(path, source=None, namespaced=False):
+    """None when Lacuna may replace `path`; otherwise (kind, why), `why` a sentence for the user.
+
+    `source` is the document the new file is written from. When given, a file Lacuna wrote from a
+    *different* document is not ours to replace either. A document is the same one when it is at
+    the same path (and may have changed) or has the same bytes (and may have moved).
+    `namespaced` is for names only Lacuna makes (plan.md.unverified.md): an unrecorded file there
+    was written by an earlier Lacuna, so only an edit since it was recorded makes it the user's."""
+    if not os.path.lexists(path):
+        return None
+    if os.path.islink(path) or not os.path.isfile(path):
+        return "other", f"{path} is a {'symbolic link' if os.path.islink(path) else 'directory'}, not a file Lacuna wrote."
+    files, damaged = _owners(os.path.dirname(path))
+    entry = files.get(name_key(path))
+    if not isinstance(entry, dict):
+        if namespaced:
+            return None
+        return UNRECORDED, (f"{path} has no record in {OWNERS} of being written by Lacuna"
+                            + (f" ({damaged})" if damaged else "") + ". It may be your own file, one "
+                            f"written before Lacuna kept that record (0.2.0 and earlier), or one left by an "
+                            f"interrupted run.")
+    if entry.get("sha256") != _sha(path):
+        return "edited", (f"{path} was written by Lacuna on {entry.get('written', 'an earlier run')}, and has "
+                          f"been edited since.")
+    theirs = entry.get("source")
+    if source and theirs and not (os.path.realpath(source) == os.path.realpath(theirs)
+                                  or (os.path.isfile(source) and _sha(source) == entry.get("source_sha256"))):
+        return "other", (f"{path} is the note for {theirs}; {source} is a different file with the same name "
+                         f"(another document, or a changed copy of that one elsewhere), and reading it would "
+                         f"replace that note.")
+    return None
 
 
 def usable_output(path, min_bytes, what, must_contain=()):
@@ -471,6 +699,14 @@ def cmd_synth(a):
         sys.exit(EX_INPUT)
     a.repo = os.path.abspath(a.repo)
     a.out = os.path.abspath(a.out)
+    # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
+    # plan was once replaced without a word: the ownership rule covered read's notes only.
+    why = not_ours(a.out)
+    if why and not a.overwrite:
+        print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it "
+              f"or choose another --out; to replace it anyway, run the same command with --overwrite.",
+              file=sys.stderr)
+        sys.exit(EX_INPUT)
     if a.notes:
         a.notes = os.path.abspath(a.notes)
     if a.digest:
@@ -487,8 +723,29 @@ def cmd_synth(a):
     if not notes and not a.digest:
         print(f"ERROR: no usable notes in {a.notes!r} and no --digest. Run `read` first.", file=sys.stderr)
         sys.exit(EX_INPUT)
+    # An input that says it holds nothing ("PARTIAL: literature notes unreadable") is refused before
+    # the call, by the same test its output will face: a plan from it is paid for and empty.
+    # One that cannot be read is refused too: the agent could not read it either, and a real
+    # digester given unreadable notes was paid to file "PARTIAL: literature notes unreadable".
+    empty = []
+    for f in ([a.digest] if a.digest else []) + notes:
+        try:
+            with open(f, errors="ignore") as fh:
+                hit = refusal(fh.read(1200))
+        except OSError as e:
+            empty.append(f"{f} cannot be read ({e.strerror})")
+            continue
+        if hit:
+            empty.append(f"{f} opens with {hit!r}: it says it holds no literature")
+    if empty:
+        print("ERROR: these inputs cannot be used as literature:\n" + "\n".join(f"  - {e}" for e in empty)
+              + "\nFix their permissions, remove them, or run the stage that wrote them again. Nothing was "
+                "sent to a model.",
+              file=sys.stderr)
+        sys.exit(EX_INPUT)
     out_dir = os.path.dirname(os.path.abspath(a.out)) or "."
     os.makedirs(out_dir, exist_ok=True)
+    need_writable(out_dir, "the directory of --out")
     try:
         tree = subprocess.run(["git", "-C", a.repo, "ls-files"], capture_output=True, text=True).stdout
     except OSError:                            # no git on this machine
@@ -497,6 +754,8 @@ def cmd_synth(a):
         tree = "\n".join(walk_files(a.repo))   # not a git repo: list it ourselves
     status = find_status(a.repo, a.status)
     tree_path = f"{a.out}.filelist.txt"
+    if os.path.islink(tree_path):
+        os.remove(tree_path)                   # Lacuna's own scratch name: never write through a link
     open(tree_path, "w").write(tree)
     # The agent writes beside --out, never over it. Judged at --out, an earlier run's plan passed for
     # this run's when the model refused; and an apology written there was taken as input by the next
@@ -533,11 +792,20 @@ def cmd_synth(a):
         ("Read the README and the main source directories" +
          (f", and the project status file {status} in full — anything it records as tried, rejected or a dead "
           "end must not be re-proposed" if status else "") + "."),
-        task, f"Write the result to {part}. Under 2,000 words."])
+        task, f"Write the result to {part}. Under 2,000 words.",
+        INCOMPLETE_RULE.format(what="the literature you were given (the notes or the digest)",
+                               also=f" and do not write {part}")])
     dirs = [a.repo, out_dir] + ([a.notes] if a.notes else []) + \
            ([os.path.dirname(os.path.abspath(a.digest))] if a.digest else [])
+    before = _sha(a.out) if os.path.isfile(a.out) else None
     res = claude("synth", model, prompt, dirs, effort=lacuna_config.effort(role), cwd=out_dir)
     ok = usable_output(part, 800, a.kind)
+    # A model that could not read its sources may say so in its reply and still leave a document
+    # behind; a real digester filed "PARTIAL: literature notes unreadable", exit 0. Its own word wins.
+    said = declared_failure(str(res.get("result") or ""))
+    if ok and said:
+        print(f"  ! the model reported {said!r} — treating it as a failed run, not output", file=sys.stderr)
+        ok = False
     ledger({"stage": "synth", "kind": a.kind, "model": model, "effort": lacuna_config.effort(role),
             "notes": len(notes),
             "from_digest": bool(a.digest), "cost": usd(res), "wall_s": res["wall_s"], "wrote": ok,
@@ -547,12 +815,25 @@ def cmd_synth(a):
         for f in (part, tree_path):
             if os.path.exists(f):
                 os.remove(f)
-        kept = (f"{a.out} was left as it was, and holds an earlier run's output, not this one's."
-                if os.path.exists(a.out) else "Nothing was written.")
+        if os.path.isfile(a.out) and _sha(a.out) != before:
+            # --out changed during the run: the model wrote it rather than the .partial it was
+            # given, or someone edited it meanwhile. Either way it is not an earlier run's plan,
+            # and the next command must not read it as one; moved aside, never deleted.
+            os.replace(a.out, f"{a.out}.rejected")
+            forget(a.out)
+            kept = (f"{a.out} changed during this run (the model wrote it directly, or it was edited), so it "
+                    f"is not a checked plan. It was moved to {a.out}.rejected for you to inspect.")
+        else:
+            kept = (f"{a.out} was left as it was, and holds an earlier run's output, not this one's."
+                    if os.path.exists(a.out) else "Nothing was written.")
         print(f"ERROR: {model} wrote no usable output. {kept}\n{str(res.get('result'))[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
+    if os.path.islink(a.out):
+        os.remove(a.out)     # only with --overwrite; replacing the link, not writing through it
     os.replace(part, a.out)
+    record(a.out)
     after("synth", a.out)
+    rerecord(a.out)
 
 
 def cmd_verify(a):
@@ -566,6 +847,11 @@ def cmd_verify(a):
     if a.notes:
         a.notes = os.path.abspath(a.notes)
     out = f"{a.target}.unverified.md"
+    why = not_ours(out, namespaced=True)       # a report annotated by hand is the user's
+    if why and not a.overwrite:
+        print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "
+              f"to replace it anyway, run the same command with --overwrite.", file=sys.stderr)
+        sys.exit(EX_INPUT)
     with open(a.target, "rb") as f:
         checked = f"sha256 {hashlib.sha256(f.read()).hexdigest()[:12]}"
     prompt = "\n\n".join([
@@ -578,7 +864,8 @@ def cmd_verify(a):
         "3. An attribution to a paper: check it against the note for that paper. Report mismatches.",
         "Reply with a markdown list: one line per failure, as `claim -> what you found`. "
         "Reply exactly 'No unverifiable claims found.' if there are none. Do not comment on the ideas, "
-        "do not summarise the document, and do not use any file-writing tool."])
+        "do not summarise the document, and do not use any file-writing tool.",
+        INCOMPLETE_RULE.format(what="the document or the codebase", also="")])
     dirs = [a.repo, os.path.dirname(os.path.abspath(a.target))] + ([a.notes] if a.notes else [])
     vmodel = a.model or lacuna_config.model("verifier")
     res = claude("verifier", vmodel, prompt, dirs, effort=lacuna_config.effort("verifier"))
@@ -604,8 +891,11 @@ def cmd_verify(a):
     if hit:
         failed(f"replied with {hit!r} rather than a report")
     try:
+        if os.path.islink(out):
+            os.remove(out)     # only with --overwrite; never write through a link
         open(out, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n"
                              f"_Checked the version with {checked}._\n\n{report}\n")
+        record(out, a.target)
         where = out
     except OSError:
         where = "(not saved; printed below)"
@@ -613,6 +903,7 @@ def cmd_verify(a):
     print(report[:3000])
     if where != "(not saved; printed below)":
         after("verify", out)
+        rerecord(out, a.target)
 
 
 def main():
@@ -629,6 +920,9 @@ def main():
                         "slower and needs `lacuna doctor --install-equations`")
     r.add_argument("--parser", choices=["pymupdf4llm", "docling", "marker"],
                    help="force one parser instead of the validate-and-fall-back default")
+    r.add_argument("--overwrite", action="store_true",
+                   help="replace notes in --out that Lacuna cannot show are its own for these documents "
+                        "(edited, unrecorded, or another document's with the same name)")
     s = sub.add_parser("synth")
     s.add_argument("--notes")
     s.add_argument("--repo", required=True)
@@ -638,11 +932,14 @@ def main():
     s.add_argument("--digest", help="a digest to start from (plan kind); notes stay authoritative")
     s.add_argument("--model", help="override the default model for this stage")
     s.add_argument("--status", help="path to the project's living status file (auto-detected if omitted)")
+    s.add_argument("--overwrite", action="store_true",
+                   help="replace --out even if Lacuna cannot show it wrote it (edited, or not written by Lacuna)")
     v = sub.add_parser("verify")
     v.add_argument("--target", required=True)
     v.add_argument("--repo", required=True)
     v.add_argument("--notes")
     v.add_argument("--model", help="override the verifier model for this run")
+    v.add_argument("--overwrite", action="store_true", help="replace the report even if it has been edited")
     a = ap.parse_args()
     {"read": cmd_read, "synth": cmd_synth, "verify": cmd_verify}[a.cmd](a)
 

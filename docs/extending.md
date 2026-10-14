@@ -156,6 +156,24 @@ files inside it.
 Treat the cache as disposable — it is a cost optimisation, not a record. Deleting it costs only the
 money to re-read. The notes in `--out` are the record.
 
+### Lacuna replaces only its own files
+
+A vault is yours, so `read`, `synth` and `verify` replace a file there only when Lacuna can show it
+wrote that file — for the same document, in the case of a note — and nobody has edited it since.
+The evidence is `.lacuna.json`, kept beside the files it describes (a dotfile, so Obsidian ignores
+it). It travels with the folder, so moving the vault or deleting the cache changes nothing.
+
+When a run would replace a file that fails one of those tests, it exits 2 before any model call
+and names every such file: edited since Lacuna wrote it, not recorded as Lacuna's (your own file,
+or one written before 0.3.0 kept records), or the note for a different document with the same file
+name (`main.pdf` from two papers' folders). Move the file or choose another `--out` to keep it;
+re-run with `--overwrite` to replace it. What an `after.*` hook leaves (frontmatter it prepends, say)
+still counts as Lacuna's output; only edits made after the run make a file yours. If `synth --out`
+changes while the run is in progress, it is moved to `<out>.rejected` rather than deleted. Deleting
+`.lacuna.json` is safe: Lacuna then asks before
+replacing anything it finds, and adopts a note again when it is exactly that document's cached
+note.
+
 ### A note on frontmatter
 
 The shipped note template has no YAML frontmatter, so Obsidian will not see properties or tags on a

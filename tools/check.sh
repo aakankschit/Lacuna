@@ -51,6 +51,17 @@ for p in "${chosen[@]}"; do
   rm -rf "$tmphome"
 done
 
+# A stale mutant anchor is a broken gate that reads like a test gap; catch it on every run, not
+# only when someone remembers the five-minute mutation run.
+printf '%-16s %-42s ' "mutant anchors" "tools/mutate.py --check-anchors"
+if anchors="$(python3 tools/mutate.py --check-anchors 2>&1)"; then
+  echo "OK   ($anchors)"
+else
+  echo "FAILED"
+  printf '%s\n' "$anchors"
+  fail=1
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "All green on ${#chosen[@]} interpreter(s), with no rich, no tmux and a scrubbed HOME."
