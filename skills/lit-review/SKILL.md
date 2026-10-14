@@ -134,9 +134,20 @@ configured warning threshold (`budget_warn_usd`, default $2), and wait for appro
   own arguments must read the last.
 - Recalibrate from the cost ledger once it has more runs than the calibration was built on.
 
+## If a stage exits 2 because a file is not Lacuna's
+
+`read`, `synth` and `verify` replace a file only when Lacuna wrote it (for the same document, in the
+case of a note) and nobody has edited it since; the record is `.lacuna.json` beside the files. When
+one of those is not true they exit 2 before any model call and name every such file and why: edited
+since, no record, or another document's note with the same file name. **Show the user that message
+and ask.** Do not add `--overwrite` on your own: it discards their edits, or another paper's note.
+For two papers with one file name (`main.pdf` in two folders), rename one or use another `--out`.
+
 ## If a model refuses
 
 A headless agent can refuse a document that the interactive session handles without complaint, and
 tiers differ in how often that happens. `read` exits 4 and caches nothing rather than storing a
 refusal as a note. Try another model for that role (`--model`) and report the refusal to the user
-rather than working around it silently.
+rather than working around it silently. The same exit 4 covers an agent that says it could not read
+its sources (`INCOMPLETE: …`) or files a document saying so (`PARTIAL: …`): nothing is filed. Find
+out what it could not read before re-running — a paid re-run on unreadable inputs fails again.

@@ -157,6 +157,10 @@ lacuna lit read papers/*.pdf --out notes/ --no-books    # or skip them
 lacuna lit read papers/*.pdf --out ~/Obsidian/MyVault/Literature/ --brief "..."
 ```
 
+Lacuna replaces a note there only if it wrote it, for that document, and you have not edited it
+since; otherwise it stops before spending anything and says which file and why (`--overwrite` goes
+ahead). See [extending.md](docs/extending.md#lacuna-replaces-only-its-own-files).
+
 **File finished results into an app that is not a folder** (Heptabase, Notion, a tracker)
 
 In `~/.lacuna/config.json`. Your command runs through a shell, so `~` and `$VAR` work, and the

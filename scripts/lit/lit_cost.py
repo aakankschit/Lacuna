@@ -23,8 +23,19 @@ def die3(msg):
 
 
 # Your own calibration in the data directory wins; the shipped one is someone else's runs.
+# A hand-edited file that does not parse is reported and the shipped one used, as lacuna_config does
+# for config.json and pricing.json; it once ended `lit estimate` with a traceback.
 _user_cal = os.path.join(lacuna_config.DATA, "calibration.json")
-CAL_PATH = _user_cal if os.path.exists(_user_cal) else os.path.join(HERE, "calibration.json")
+CAL_PATH, CAL_WARNING = os.path.join(HERE, "calibration.json"), None
+if os.path.exists(_user_cal):
+    try:
+        with open(_user_cal) as f:
+            _cal = json.load(f)
+        if not isinstance(_cal, dict):
+            raise ValueError("the top level is not an object")
+        CAL_PATH = _user_cal
+    except (OSError, ValueError) as e:
+        CAL_WARNING = f"your calibration {_user_cal} is unusable ({e}); using the shipped one instead"
 with open(CAL_PATH) as f:
     CAL = json.load(f)
 CAL_SOURCE = ("upstream — someone else's runs on their hardware, not yours"
@@ -97,7 +108,7 @@ def estimate(files, per_agent, model=None, effort=None, cal=None, config=None):
     models = [model] if model else known
     efforts = [effort] if effort else list(EFFORTS)
     warn, budget_msg = effective_budget(config.get("budget_warn_usd"))
-    warnings = []
+    warnings = [CAL_WARNING] if CAL_WARNING and cal is CAL else []
     if surcharge:
         warnings.append(f"a reader exceeds {HAIKU_TIER:,} tokens: Haiku's long-context price (5x) "
                         f"applies; lower --per-agent")
@@ -178,6 +189,8 @@ def main():
              + "\nAn estimate of $0.00 would be meaningless — the file is corrupt, encrypted, or a "
                "scan with no text layer. `lacuna lit read` would fail on it too.")
     r, x = estimate(files, a.per_agent, a.model or None, a.effort or None)  # nothing printed yet
+    if CAL_WARNING:
+        print(f"warning: {CAL_WARNING}", file=sys.stderr)
     if a.json:
         print(json.dumps(r, allow_nan=False))
         if x["budget_msg"]:

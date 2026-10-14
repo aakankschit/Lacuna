@@ -1,4 +1,10 @@
-"""Proposed tests for the tenth-class findings. Each must FAIL at 5d94f97."""
+"""Proposed tests for the tenth-class findings. Each must FAIL at 5d94f97.
+
+A RECORD, NOT A TEST: nothing discovers this file. The live tests are in tests/ — the <synthetic>
+skip in test_modules.TestCacheGuard, the "~" data directory in test_unit and in the status line and
+guard tests, and iterations in test_unit.TestTranscriptMoney, which reports refused attempts as a
+range rather than summing them as proposed here (whether they were billed is not recorded).
+"""
 import json, os, sys, tempfile, unittest
 from datetime import datetime, timedelta, timezone
 

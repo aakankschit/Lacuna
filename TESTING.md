@@ -68,6 +68,13 @@ applies each to a scratch copy of the repo and runs the whole suite against it.
 
 `python3 tools/mutate.py` takes about five minutes; `--only NAME` and `--jobs N` narrow it.
 
+A **stale anchor** — a mutant whose `old` text no longer occurs exactly once, because a fix moved the
+code — stops the run with exit 2 before anything is applied, separately from a surviving mutant. At
+0.2.0 six were stale and read as six test gaps. `tools/mutate.py --check-anchors` checks only that,
+in a second; `tools/check.sh` and CI run it, so a fix that moves guarded code fails at once.
+`tools/mutation_battery.py` likewise fails (exit 2) when a mutation cannot be applied, unless it is
+given `--allow-skips` to run against an older version of the repo.
+
 ## Where defects keep appearing
 
 From four audits and the review that followed, in order: cache keys that omit an input (every one

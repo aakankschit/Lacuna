@@ -15,7 +15,7 @@ try:
     import lacuna_config
     DEFAULT_DIR = lacuna_config.path("results")
 except Exception:
-    DEFAULT_DIR = os.environ.get("LACUNA_RESULTS") or os.path.expanduser("~/.claude/results")
+    DEFAULT_DIR = os.path.expanduser(os.path.expandvars(os.environ.get("LACUNA_RESULTS") or "~/.claude/results"))
 
 try:
     from rich.console import Console

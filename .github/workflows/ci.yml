@@ -27,3 +27,6 @@ jobs:
           env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/clean" LANG=en_US.UTF-8 \
             "$(command -v python)" -m unittest discover -s tests -v
 
+      # A stale anchor is a mutant nobody runs; it must turn CI red, not read as a test gap later.
+      - name: Mutant anchors match the code
+        run: python tools/mutate.py --check-anchors

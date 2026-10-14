@@ -6,22 +6,28 @@ the list of those defects, one per line of MUTANTS, and the runner that applies 
 copy of the repo and runs the whole suite against it. Every mutant must be killed (at least one
 test fails). A mutant that survives marks a defect the suite would let ship.
 
-usage: tools/mutate.py [--jobs N] [--only SUBSTRING] [--matrix OUT.json] [--python PY]
-  exit 0 when every mutant is killed, 1 otherwise.
+usage: tools/mutate.py [--jobs N] [--only SUBSTRING] [--matrix OUT.json] [--python PY] [--check-anchors]
+  exit 0 when every mutant is killed, 1 when one survives, 2 when an anchor is stale.
+  --check-anchors checks only that every anchor still matches, in a second; tools/check.sh runs it.
   --matrix writes {mutant: [failing test ids]} so a test's worth can be read off: a test that
   kills nothing no other test kills is dead weight; a mutant nothing kills is a missing test.
 
 Add a mutant when you fix a defect (revert the fix as the mutant) and when you add a test (say what
 it catches). Each entry: (name, file, old, new) — `old` must occur exactly once in `file`.
+
+A stale anchor is a broken gate, not a surviving mutant; so is a mutant whose result does not compile. At 0.2.0 six anchors had stopped matching
+after fixes moved the code; the runner reported them among the survivors as "ERROR", and they read
+as six test gaps when they were six mutants nobody was running. So every anchor is checked before
+anything runs, and one that does not match exactly once stops the run with exit 2.
 """
 import argparse, concurrent.futures as cf, json, os, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PIPE, PREP, SPLIT, COST, CFG, CCOST, SPEND, GUARD, STATUS, DOCTOR, PANE = (
+PIPE, PREP, SPLIT, COST, CFG, CCOST, SPEND, GUARD, STATUS, DOCTOR, PANE, MUTATE = (
     "scripts/lit/lit_pipeline.py", "scripts/lit/prep_md.py", "scripts/lit/split_book.py",
     "scripts/lit/lit_cost.py", "scripts/lacuna_config.py", "scripts/cost/ccost.py",
     "scripts/cost/spend.py", "hooks/cache_guard.py", "statusline/statusline.py",
-    "scripts/doctor.py", "scripts/panes/results_pane.py")
+    "scripts/doctor.py", "scripts/panes/results_pane.py", "tools/mutate.py")
 
 MUTANTS = [
     # ---- note cache key: every omission is a free, fast, wrong answer
@@ -43,11 +49,13 @@ MUTANTS = [
     ("rerun-inherits-old-note", PIPE, "        if os.path.exists(out):\n            os.remove(out)\n", "\n"),
     ("note-judged-by-size", PIPE, 'ok = usable_output(out, 400, "note", must_contain=("## Claim",))',
      "ok = os.path.exists(out) and os.path.getsize(out) > 400"),
-    ("plan-judged-by-size", PIPE, "ok = usable_output(a.out, 800, a.kind)",
-     "ok = os.path.exists(a.out) and os.path.getsize(a.out) > 800"),
+    ("plan-judged-by-size", PIPE, "ok = usable_output(part, 800, a.kind)",
+     "ok = os.path.exists(part) and os.path.getsize(part) > 800"),
     ("note-structure-not-checked", PIPE, 'must_contain=("## Claim",))', "must_contain=())"),
-    ("refusal-words-ignored", PIPE, "hit = next((m for m in REFUSAL_MARKERS if m in head.lower()), None)", "hit = None"),
-    ("any-blocked-is-refusal", PIPE, 'if "BLOCKED" in head[:400]:', 'if "blocked" in head[:400].lower():'),
+    ("refusal-words-ignored", PIPE, "    for _ in range(3):                       # \"Unfortunately, I could not…\"",
+     "    for _ in range(0):"),
+    ("status-marker-past-opening-line", PIPE, "        if not heading:\n            return None                       # the opening line",
+     "        if False:\n            return None                       # the opening line"),
     ("failed-read-exits-0", PIPE, "        sys.exit(EX_MODEL)\n    after(\"read\", out_dir)", "\n    after(\"read\", out_dir)"),
     ("failed-read-leaves-apology", PIPE, "        if os.path.exists(out):\n            os.remove(out)      # an apology", "        if False:\n            os.remove(out)      # an apology"),
     ("failed-read-caches-note", PIPE, "        if ok:\n            shutil.copy(out, cached)", "        if True:\n            shutil.copy(out, cached)"),
@@ -57,7 +65,8 @@ MUTANTS = [
      "    if False:\n        print(f\"ERROR: --out {a.out!r} is a directory"),
     ("read-out-file-accepted", PIPE, "    if os.path.isfile(out_dir):", "    if False:"),
     ("relative-paths-not-absolute", PIPE, "    a.repo = os.path.abspath(a.repo)\n", "\n"),
-    ("txt-note-named-with-dot", PIPE, "os.path.splitext(os.path.basename(md))[0])", "os.path.basename(md)[:-3])"),
+    ("txt-note-named-with-dot", PIPE, "stem = os.path.splitext(os.path.basename(src))[0]",
+     "stem = os.path.basename(src)[:-3]"),
     ("after-without-shell", PIPE, 'argv = ["sh", "-c", cmd + \' "$1"\', "sh", out_path]',
      "argv = [*cmd.split(), out_path]"),
     ("after-failure-raises", PIPE, "    except (OSError, ValueError) as e:", "    except () as e:"),
@@ -65,7 +74,7 @@ MUTANTS = [
     ("status-order-wrong", PIPE, 'STATUS_CANDIDATES = ["research/STATUS.md", "STATUS.md", "docs/STATUS.md", "NOTES.md"]',
      'STATUS_CANDIDATES = ["NOTES.md", "STATUS.md", "docs/STATUS.md", "research/STATUS.md"]'),
     ("books-without-toc-offered", PIPE, 'if os.path.exists(f"{BOOKS_DIR}/{d}/toc.md"))', "if True)"),
-    ("no-books-flag-ignored", PIPE, 'books = "" if a.no_books else books_block()', "books = books_block()"),
+    ("no-books-flag-ignored", PIPE, "idx = [] if a.no_books else book_indexes()", "idx = book_indexes()"),
     ("ledger-drops-effort", PIPE, '"effort": reader_effort,\n', "\n"),
     ("model-flag-ignored", PIPE, 'reader_model = a.model or lacuna_config.model("reader")',
      'reader_model = lacuna_config.model("reader")'),
@@ -138,7 +147,8 @@ MUTANTS = [
     ("partial-section-wipes-defaults", CFG, "            if isinstance(v, dict):\n                _merge(base[k], v)",
      "            if isinstance(v, dict):\n                base[k] = v"),
     ("null-section-crashes", CFG, "            elif v is not None:", "            else:\n                base[k] = v\n            if False:"),
-    ("tilde-not-expanded", CFG, "os.path.expanduser(os.path.expandvars(v)) if isinstance(v, str) else v", "v"),
+    ("tilde-not-expanded", CFG, "os.path.abspath(os.path.expanduser(os.path.expandvars(v))) if isinstance(v, str) and v",
+     "os.path.abspath(v) if isinstance(v, str) and v"),
     ("malformed-config-raises", CFG, "    except ValueError as e:\n        CONFIG_ERRORS.append(f\"{path}: not valid JSON",
      "    except () as e:\n        CONFIG_ERRORS.append(f\"{path}: not valid JSON"),
     ("prices-shortest-key-first", CFG, "key=lambda kv: -len(kv[0])", "key=lambda kv: len(kv[0])"),
@@ -151,7 +161,7 @@ MUTANTS = [
     ("streaming-dup-double-counted", CCOST, "            if mid not in calls:\n                order.append(mid)", "            order.append(mid)"),
     ("write-priced-at-5m", CCOST, "w5, w1 = 0, u.get(\"cache_creation_input_tokens\", 0)  # no breakdown: assume 1h",
      "w1, w5 = 0, u.get(\"cache_creation_input_tokens\", 0)"),
-    ("first-call-counted-as-rewrite", CCOST, "return index > 0 and is_cold(c)", "return is_cold(c)"),
+    ("first-call-counted-as-rewrite", CCOST, "    return prev is not None and is_cold(c, prev)", "    return is_cold(c, prev)"),
     ("fleet-ignores-window", SPEND, "            if ts(call[\"ts\"]) < since:\n                continue\n", "\n"),
     ("unknown-session-falls-through", SPEND, '        if not path:\n            print(f"ERROR: no transcript matches', '        if False:\n            print(f"ERROR: no transcript matches'),
     ("subagents-not-rolled-up", SPEND, '    subs = glob.glob(os.path.join(path[:-6], "subagents", "*.jsonl"))', "    subs = []"),
@@ -173,7 +183,7 @@ MUTANTS = [
     ("status-guesses-cold", STATUS, '        elif pc.get("expires_at"):\n', "        else:\n"),
     ("status-null-expiry-is-cold", STATUS, '        elif pc.get("expires_at"):\n', "        elif pc:\n"),
     ("status-shortest-price-key", STATUS, "PRICE = dict(sorted(PRICE.items(), key=lambda kv: -len(kv[0])))", "PRICE = dict(sorted(PRICE.items(), key=lambda kv: len(kv[0])))"),
-    ("status-counts-sidechain", STATUS, 'if e.get("type") != "assistant" or not u or e.get("isSidechain"):', 'if e.get("type") != "assistant" or not u:'),
+    ("status-counts-sidechain", STATUS, 'or not isinstance(u, dict) or e.get("isSidechain"):', "or not isinstance(u, dict):"),
     ("status-crashes-on-null", STATUS, '    cw = d.get("context_window") or {}', '    cw = d.get("context_window")'),
     ("status-ignores-width", STATUS, "print(sep.join(l2 if cols >= 90 else l2[:2]))", "print(sep.join(l2))"),
     # ---- doctor and the pane: first contact
@@ -185,6 +195,91 @@ MUTANTS = [
     ("pane-typo-makes-directory", PANE, "        elif not positional:\n            os.makedirs(target, exist_ok=True)", "        elif True:\n            os.makedirs(target, exist_ok=True)"),
     ("pane-flag-is-target", PANE, 'positional = [a for a in argv if not a.startswith("-")]', "positional = list(argv)"),
     ("pane-needs-rich", PANE, "except ImportError:                 # plain text", "except ():                 # plain text"),
+    # ---- ownership: a file in the user's directory is replaced only if Lacuna wrote it, for this
+    # document, unedited (N1/N6 at 0.2.0: proven by cache bytes, blind to which document)
+    ("ownership-ignores-document", PIPE, "    if source and theirs and not (", "    if False and not ("),
+    ("ownership-never-recorded", PIPE, "            _save_owners(d, files)\n    except OSError as e:",
+     "            pass\n    except OSError as e:"),
+    ("edited-note-replaced", PIPE, '    if entry.get("sha256") != _sha(path):', "    if False:"),
+    ("refusal-names-only-first", PIPE, "        for _, why in blocked.values():", "        for _, why in list(blocked.values())[:1]:"),
+    ("legacy-note-not-adopted", PIPE, '        if blocked.get(note, ("",))[0] == UNRECORDED and same_bytes(note, cached):', "        if False:"),
+    ("overwrite-flag-ignored", PIPE, "    if blocked and not a.overwrite:", "    if blocked:"),
+    ("overwrite-writes-through-symlink", PIPE, "        if os.path.islink(out):\n            os.remove(out)                # only with --overwrite",
+     "        if False:\n            os.remove(out)                # only with --overwrite"),
+    ("self-note-check-skippable", PIPE, "        if os.path.lexists(note) and same_file(note, src):", "        if False:"),
+    ("self-check-by-realpath", PIPE, "        return os.path.samefile(a, b)", "        return os.path.realpath(a) == os.path.realpath(b)"),
+    ("collision-ignores-case", PIPE, 'unicodedata.normalize("NFC", os.path.basename(path)).casefold()',
+     'unicodedata.normalize("NFC", os.path.basename(path))'),
+    ("collision-ignores-unicode-form", PIPE, 'unicodedata.normalize("NFC", os.path.basename(path)).casefold()',
+     "os.path.basename(path).casefold()"),
+    ("synth-out-unguarded", PIPE, "    why = not_ours(a.out)\n", "    why = None\n"),
+    ("verify-report-unguarded", PIPE, "    why = not_ours(out, namespaced=True)", "    why = None"),
+    ("clobbered-out-kept", PIPE, "        if os.path.isfile(a.out) and _sha(a.out) != before:", "        if False:"),
+    ("hook-edit-not-rerecorded", PIPE, "    for out, src in written:\n        rerecord(out, src)\n", "\n"),
+    ("clobbered-out-deleted", PIPE, '            os.replace(a.out, f"{a.out}.rejected")', "            os.remove(a.out)"),
+    ("record-unlocked-between-processes", PIPE, "                fcntl.flock(self.fd, fcntl.LOCK_EX)", "                pass"),
+    ("damaged-record-raises", PIPE, "    except Exception as e:       # OSError, ValueError, a list at the top, RecursionError on deep nesting",
+     "    except (OSError, ValueError) as e:"),
+    ("filelist-written-through-link", PIPE, "    if os.path.islink(tree_path):\n        os.remove(tree_path)", "    if False:\n        os.remove(tree_path)"),
+    ("readonly-out-accepted", PIPE, "    if not os.access(d, os.W_OK):", "    if False:"),
+    # ---- an output that says it holds nothing is not output (N2: a real "PARTIAL:" digest, exit 0)
+    ("partial-marker-ignored", PIPE, r'r"|(?:PARTIAL|INCOMPLETE)\**(?=\s*[:.]|\s+[\u2013\u2014-]\s|\s*$))")', r'r"|(?!x)x)")'),
+    ("marker-furniture-not-stripped", PIPE, 'm = None if "->" in line else STATUS_MARKER.match(_FURNITURE.sub("", line, count=1))',
+     'm = None if "->" in line else STATUS_MARKER.match(line.lstrip("# "))'),
+    ("graded-finding-is-a-marker", PIPE, 'm = None if "->" in line else STATUS_MARKER', "m = STATUS_MARKER"),
+    ("bracketed-title-marker-ignored", PIPE, "        m = m or (_TITLE_MARKER.search(line) if heading else None)\n", "\n"),
+    ("synth-reply-not-judged", PIPE, "    if ok and said:", "    if False:"),
+    ("synth-unreadable-input-crashes", PIPE, '        except OSError as e:\n            empty.append(f"{f} cannot be read',
+     '        except () as e:\n            empty.append(f"{f} cannot be read'),
+    ("synth-inputs-not-checked", PIPE, '    if empty:\n        print("ERROR: these inputs', '    if False:\n        print("ERROR: these inputs'),
+    # ---- the status line and the guard read what the CLI reads, as the CLI reads it (N7, F2, F3)
+    ("cfg-data-not-expanded", CFG, 'DATA = os.path.expanduser(os.path.expandvars(\n    os.environ.get("LACUNA_DATA") or "~/.lacuna"))',
+     'DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")'),
+    ("status-data-not-expanded", STATUS, 'DATA = os.path.expanduser(os.path.expandvars(os.environ.get("LACUNA_DATA") or "~/.lacuna"))',
+     'DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")'),
+    ("status-import-guard-narrow", STATUS, "    except Exception:     # this runs at import, outside main()'s guard: nothing here may raise",
+     "    except (OSError, ValueError):"),
+    ("status-entry-not-validated", STATUS, "            t = tuple(float(x) for x in v)", "            t = tuple(v)"),
+    ("status-reads-synthetic", STATUS, '        if m.get("model") == "<synthetic>":   # an API error Claude Code recorded, with zero usage',
+     "        if False:"),
+    ("status-ignores-iterations", STATUS, 'fig = f"${low:.3f}–${low + earlier:.3f}" if earlier >= 0.0005 else f"${low:.3f}"',
+     'fig = f"${low:.3f}"'),
+    ("status-inline-prices-stale", STATUS, '    "haiku-4-5": (1, 1.25, 2, .10, 5),\n', "\n"),
+    ("price-string-accepted", CFG, '        if k.startswith("_") or not isinstance(v, (list, tuple)):   # "12345" is not five prices',
+     '        if k.startswith("_"):'),
+    ("price-nonfinite-accepted", CFG, "        if len(t) == 5 and all(math.isfinite(x) and x >= 0 for x in t):", "        if len(t) == 5:"),
+    ("status-price-string-accepted", STATUS, "        if not isinstance(v, (list, tuple)):\n            continue\n        try:", "        try:"),
+    ("status-price-nonfinite-accepted", STATUS, 'and len(t) == 5 and all(math.isfinite(x) and x >= 0 for x in t):', "and len(t) == 5:"),
+    ("status-transcript-line-not-dict", STATUS, "        if not isinstance(e, dict):           # valid JSON that is not a transcript line\n            continue\n", "\n"),
+    ("status-columns-crash", STATUS, '    try:\n        cols = int(os.environ.get("COLUMNS") or 120)\n    except ValueError:\n        cols = 120',
+     '    cols = int(os.environ.get("COLUMNS", 120))'),
+    ("guard-line-not-dict", GUARD, '        m = e.get("message") if isinstance(e, dict) else None     # valid JSON that is not a call',
+     '        m = e.get("message")'),
+    ("guard-reads-synthetic", GUARD, '        if e["message"].get("model") == "<synthetic>":', "        if False:"),
+    ("guard-synthetic-by-substring", GUARD, '        if e["message"].get("model") == "<synthetic>":', '        if "<synthetic>" in ln:'),
+    ("guard-fallback-data-unexpanded", GUARD, '    _DATA = os.path.expanduser(os.path.expandvars(os.environ.get("LACUNA_DATA") or "~/.lacuna"))',
+     '    _DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")'),
+    ("pane-fallback-unexpanded", PANE, 'DEFAULT_DIR = os.path.expanduser(os.path.expandvars(os.environ.get("LACUNA_RESULTS") or "~/.claude/results"))',
+     'DEFAULT_DIR = os.environ.get("LACUNA_RESULTS") or os.path.expanduser("~/.claude/results")'),
+    ("estimate-bad-calibration-raises", COST, "    except (OSError, ValueError) as e:\n        CAL_WARNING", "    except () as e:\n        CAL_WARNING"),
+    # ---- /spend: a lower bound that says so (N5, §2)
+    ("transcript-line-not-dict", CCOST, '            if not isinstance(d, dict) or d.get("type") != "assistant":', '            if d.get("type") != "assistant":'),
+    ("synthetic-counted-as-call", CCOST, '            if not isinstance(u, dict) or not mid or m.get("model") == "<synthetic>":',
+     "            if not isinstance(u, dict) or not mid:"),
+    ("transcript-null-count-crashes", CCOST, "            u = {k: (v if v is not None else 0) for k, v in u.items()}", "            pass"),
+    ("idle-recache-over-warm-prefix-missed", CCOST, "    return (read < split(prev)[1] / 2 and ts(c", "    return False and (read < split(prev)[1] / 2 and ts(c"),
+    ("compaction-counted-as-cold", CCOST, 'and ts(c["ts"]) - ts(prev["ts"]) >= IDLE_S', "and True"),
+    ("model-switch-counted-as-idle", CCOST, '            and c["model"] == prev["model"])', "            and True)"),
+    ("sidechain-is-previous-call", CCOST, '        if c.get("side"):\n            continue\n        if is_avoidable_cold', "        if is_avoidable_cold"),
+    ("earlier-iterations-priced-at-call-model", CCOST, 'earlier=[(i, i.get("model") or m.get("model"))', 'earlier=[(i, m.get("model"))'),
+    ("session-drops-refused-attempts", SPEND, "    gap = sum(earlier_usd(x) for x in retried)", "    gap = 0"),
+    ("fleet-drops-refused-attempts", SPEND, "                gap += earlier_usd(call)", "                pass"),
+    ("fleet-counts-forks-twice", SPEND, '            if call["id"] in seen:\n                continue\n', "\n"),
+    ("spend-hides-lower-bound", SPEND, 'LOWER_BOUND = "a lower bound — see docs/LIMITS.md"', 'LOWER_BOUND = "estimated"'),
+    # ---- the gate itself: a stale anchor read as a test gap at 0.2.0
+    ("stale-anchor-runs-anyway", MUTATE, "    if stale:\n        print(f\"STALE ANCHORS", "    if False:\n        print(f\"STALE ANCHORS"),
+    ("battery-skips-pass", "tools/mutation_battery.py", "return 1 if missed else 2 if skipped and not allow_skips else 0",
+     "return 1 if missed else 0"),
 ]
 
 RUNNER = r"""
@@ -210,7 +305,7 @@ def run_one(name, file, old, new, python):
         shutil.copytree(ROOT, os.path.join(tmp, "repo"), ignore=shutil.ignore_patterns(".git", "__pycache__"))
         target = os.path.join(tmp, "repo", file)
         src = open(target).read()
-        if src.count(old) != 1:
+        if src.count(old) != 1:            # stale_anchors() ran first; this is a second line of defence
             return name, {"error": f"anchor occurs {src.count(old)} times in {file}"}
         open(target, "w").write(src.replace(old, new))
         home = os.path.join(tmp, "home")
@@ -225,16 +320,52 @@ def run_one(name, file, old, new, python):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def stale_anchors(mutants):
+    """(name, why) for every mutant that cannot be applied exactly as written."""
+    out = []
+    for name, file, old, new in mutants:
+        try:
+            with open(os.path.join(ROOT, file)) as f:
+                n = f.read().count(old)
+        except OSError as e:
+            out.append((name, f"{file}: {e.strerror}"))
+            continue
+        if n != 1:
+            out.append((name, f"anchor occurs {n} times in {file}"))
+        elif old == new:
+            out.append((name, "the mutation changes nothing"))
+        elif file.endswith(".py"):
+            # A mutant that does not compile is "killed" by every test for the wrong reason. Two
+            # were, once: their anchors stopped mid-line and turned a comment into code.
+            try:
+                compile(open(os.path.join(ROOT, file)).read().replace(old, new), file, "exec")
+            except SyntaxError as e:
+                out.append((name, f"the mutated {file} does not compile (line {e.lineno}), so it tests nothing"))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) // 2))
     ap.add_argument("--only", help="run mutants whose name contains this")
     ap.add_argument("--matrix", help="write the kill matrix here as JSON")
     ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--check-anchors", action="store_true", help="only check that every anchor matches")
     a = ap.parse_args()
     todo = [m for m in MUTANTS if not a.only or a.only in m[0]]
     names = [m[0] for m in todo]
     assert len(set(names)) == len(names), "duplicate mutant names"
+    stale = stale_anchors(todo)
+    if stale:
+        print(f"STALE ANCHORS: {len(stale)} of {len(todo)} mutants cannot be applied, so the gate did not run.\n"
+              "The code they guard has moved. Re-anchor each one at the code as it is now and confirm the\n"
+              "suite still kills it; never delete one to make this pass.", file=sys.stderr)
+        for name, why in stale:
+            print(f"  {name:36s} {why}", file=sys.stderr)
+        return 2
+    if a.check_anchors:
+        print(f"all {len(todo)} mutant anchors match")
+        return 0
     matrix, alive = {}, []
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         for name, res in ex.map(lambda m: run_one(*m, a.python), todo):

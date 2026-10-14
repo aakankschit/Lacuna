@@ -67,8 +67,19 @@ Other invariants:
 - **Agents run with `cwd` set to the output directory**, so every path handed to one must be
   absolute. Relative paths produce an agent that can read nothing and writes an apology.
 - **Success is judged by content, not size** (`usable_output`). A model that cannot do the job
-  writes a long, fluent explanation that passes any byte threshold.
+  writes a long, fluent explanation that passes any byte threshold. An honest one may say it has
+  nothing ("PARTIAL: literature notes unreadable"): a status marker on the opening line (`BLOCKED`,
+  `PARTIAL:`, `INCOMPLETE:`, after headings and furniture) fails the stage — only there, because the
+  same words lower down are findings, and `synth`/`verify` agents are told to reply
+  `INCOMPLETE: <reason>` rather than write a document about failing — their own word wins.
 - A failed stage must exit non-zero and cache nothing. A refusal must never become a note.
+- **Lacuna replaces a file in a user's directory only if it wrote it** — for the same document, in
+  the case of a note — and nobody has edited it since. The evidence is `.lacuna.json` beside the
+  files (`record`, `not_ours`), never the cache: the cache knows that Lacuna wrote some note, not
+  for which document, and is deleted or left behind on another machine. Anything else exits 2 before
+  any model call, naming each file and the way forward (`--overwrite`). The record is locked across
+  processes, re-written after an `after.*` hook, and compared by file identity (`samefile`), not by
+  path, because macOS folds case and Unicode form.
 
 ### `scripts/lit/prep_md.py`
 PDF → reference-stripped markdown. Parses, **validates**, falls back, and refuses. The validation
@@ -91,7 +102,11 @@ runs on somebody else's hardware.
 Parse Claude Code's transcript JSONL — **an internal format, not a contract**. Every figure is an
 estimate at list price, never a bill. `ccost.is_avoidable_cold()` is the single definition of a
 wasteful cold cache write (a session's first write is unavoidable; later ones mean it sat idle);
-both the session and fleet reports must use it, or the same transcript yields two different counts.
+both the session and fleet reports must use it (through `avoidable_colds()`), or the same transcript
+yields two different counts. A cold write is judged against the previous call on the same thread,
+not a fixed threshold: an idle re-cache still reads the ~42k prefix that is warm for everyone.
+Every figure is a **lower bound**, and the reports say so: earlier attempts in `usage.iterations`
+are shown as the top of a range, because whether they were billed is not recorded.
 
 ### `hooks/cache_guard.py`
 `SessionStart` and `UserPromptSubmit`. **A hook that raises breaks every prompt in the session**,
@@ -104,7 +119,9 @@ Silent unless the session is actually inside the two-pane layout (`CLAUDE_RESULT
 
 ### `statusline/statusline.py`
 Deliberately **self-contained** — one file, standard library only — so it can be copied to a stable
-path. A plugin cannot ship a `statusLine`, so it is a documented manual install. It reads fields
+path. Self-contained is not free to differ: it resolves `$LACUNA_DATA`, reads price files and skips
+`<synthetic>` lines exactly as `lacuna_config` and `ccost` do, by duplicated code, and its inline
+price table is the shipped one. Change one and change the other. A plugin cannot ship a `statusLine`, so it is a documented manual install. It reads fields
 that are not a public interface; when one is absent the segment goes blank rather than guessing.
 
 ### `skills/`, `agents/`, `commands/`
@@ -119,8 +136,8 @@ Three suites by level, `tests/test_unit.py`, `tests/test_modules.py` and `tests/
 with one fake `claude` in `tests/support.py`, and a mutation list in `tools/mutate.py` that every
 test has to justify itself against. **No test may call a model.** [TESTING.md](../TESTING.md) is the
 strategy: what belongs at each level, what belongs at none, and how a test earns or loses its place.
-`tools/check.sh` runs the suite on every Python on the machine in a scrubbed environment; run it,
-and `tools/mutate.py`, before pushing.
+`tools/check.sh` runs the suite on every Python on the machine in a scrubbed environment, and
+checks that every mutant's anchor still matches; run it, and `tools/mutate.py`, before pushing.
 
 ## Where defects keep appearing
 

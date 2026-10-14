@@ -4,10 +4,16 @@
 Each entry is a real defect found by an audit or an end-to-end run, not an invented one. A test
 suite earns its size by catching these. Run it against any version of the repo:
 
-    python3 mutation_battery.py <repo-dir>
+    python3 mutation_battery.py <repo-dir> [--allow-skips]
 
-For each mutation: apply it, run the suite, restore the file, and report whether the suite noticed.
+For each mutation: apply it to a scratch copy, run the suite, and report whether the suite noticed.
 A mutation that applies cleanly and leaves the suite GREEN is a hole.
+
+A mutation that cannot be applied — its anchor no longer matches — fails the run (exit 2) unless
+--allow-skips is given, which is for running this against an older version of the repo. At 0.2.0
+two anchors were stale and the battery still printed "caught 16/16 applied mutations", exit 0; with
+every anchor stale it would have printed "caught 0/0" and passed. It also used to edit the target
+repo in place, so an interrupted run left a mutant behind in the working tree.
 """
 import os, shutil, subprocess, sys, tempfile
 
@@ -18,7 +24,7 @@ MUTATIONS = [
      "[content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]",
      "[content_h, PROMPT_VERSION, reader_model, reader_effort, books_fp]"),
     ("note cache ignores which books exist", "scripts/lit/lit_pipeline.py",
-     'books_fp = hashlib.sha256(books.encode()).hexdigest()[:8]',
+     'books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]',
      'books_fp = "constant"'),
     ("note cache ignores the reader model", "scripts/lit/lit_pipeline.py",
      "[content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]",
@@ -37,7 +43,7 @@ MUTATIONS = [
     ("read infers success from a pre-existing file", "scripts/lit/lit_pipeline.py",
      "        if os.path.exists(out):\n            os.remove(out)\n", ""),
     ("a long apology counts as output", "scripts/lit/lit_pipeline.py",
-     "    hit = next((m for m in REFUSAL_MARKERS if m in head), None)", "    hit = None"),
+     "    hit = refusal(head)\n", "    hit = None\n"),
 
     # --- the extension seam ---
     ("after.* runs without a shell", "scripts/lit/lit_pipeline.py",
@@ -62,8 +68,8 @@ MUTATIONS = [
     ("model aliases stop resolving to a price", "scripts/lacuna_config.py",
      '    return ALIASES.get((model or "").strip(), model)', "    return model"),
     ("cold-rewrite definitions diverge again", "scripts/cost/spend.py",
-     '            if kind == "main" and is_avoidable_cold(call, i):',
-     '            if kind == "main" and i >= 0 and __import__("ccost").is_cold(call):'),
+     '            if kind == "main" and i in colds:',
+     '            if kind == "main" and __import__("ccost").is_cold(call):'),
 
     # --- the hook that must never break a session ---
     ("cache_guard stops swallowing exceptions", "hooks/cache_guard.py",
@@ -79,7 +85,19 @@ def run_suite(repo):
 
 
 def main():
-    repo = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
+    args = [a for a in sys.argv[1:] if a != "--allow-skips"]
+    allow_skips = "--allow-skips" in sys.argv[1:]
+    src_repo = os.path.abspath(args[0] if args else ".")
+    scratch = tempfile.mkdtemp(prefix="lacuna-battery-")
+    try:
+        repo = os.path.join(scratch, "repo")
+        shutil.copytree(src_repo, repo, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        return run(repo, allow_skips)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def run(repo, allow_skips):
     ok, line = run_suite(repo)
     print(f"baseline: {'GREEN' if ok else 'RED'}  {line[0]}")
     if not ok:
@@ -108,14 +126,15 @@ def main():
 
     print(f"\ncaught {len(caught)}/{len(caught) + len(missed)} applied mutations")
     if skipped:
-        print(f"\n{len(skipped)} could not be applied (the code moved — not necessarily a hole):")
+        print(f"\n{'' if allow_skips else 'FAILED: '}{len(skipped)} of {len(MUTATIONS)} could not be applied, so "
+              f"they were not tested. Re-anchor each at the code as it is now:")
         for label, why in skipped:
             print(f"  - {label}: {why}")
     if missed:
         print("\nHOLES — these defects would ship undetected:")
         for label, _ in missed:
             print(f"  - {label}")
-    return 1 if missed else 0
+    return 1 if missed else 2 if skipped and not allow_skips else 0
 
 
 if __name__ == "__main__":

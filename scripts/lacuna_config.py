@@ -8,7 +8,7 @@ Three layers, later wins:
 Nothing here reads the network, and nothing here is specific to a research field. Model prices
 change; override them in $LACUNA_DATA/pricing.json rather than waiting for a release.
 """
-import json, os
+import json, math, os
 
 # Code lives next to this file (read-only, replaced on every plugin update).
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -177,14 +177,14 @@ def _price_table(doc):
     if not isinstance(table, dict):       # hand-edited: a list here crashed every price lookup
         return out
     for k, v in table.items():
-        if k.startswith("_"):
+        if k.startswith("_") or not isinstance(v, (list, tuple)):   # "12345" is not five prices
             continue
         try:
             t = tuple(float(x) for x in v)
-            if len(t) == 5:
-                out[k] = t
         except (TypeError, ValueError):
             continue
+        if len(t) == 5 and all(math.isfinite(x) and x >= 0 for x in t):   # NaN/inf priced a call at $nan
+            out[k] = t
     return out
 
 

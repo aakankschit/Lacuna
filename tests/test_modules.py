@@ -188,6 +188,12 @@ class TestEstimate(Sandbox):
                 self.assertEqual(doc["calibration"]["path"], os.path.join(self.data, "calibration.json"))
                 self.assertIsNone(doc["calibration"]["measured"])
                 self.assertEqual([e["model"] for e in doc["estimates"]], ["mine"], "its models alone are used")
+        for bad in ("[]", "{oops"):      # hand-edited; it once ended the estimate with a traceback
+            with self.subTest(calibration=bad):
+                write(os.path.join(self.data, "calibration.json"), bad)
+                doc = self.est_json(self.doc("a.md"))
+                self.assertEqual(doc["calibration"]["source"], "upstream", "fall back to the shipped calibration")
+                self.assertTrue([w for w in doc["warnings"] if "unusable" in w], doc["warnings"])
 
     def test_synthesis_is_priced_for_the_configured_planner(self):
         """R9: the planner comes from config, aliases resolve, the longest price key wins, and a
@@ -425,6 +431,26 @@ class TestSpend(Sandbox):
         self.assertIn("cache hit 28.6%", fleet)       # 101k read of 353k input-side tokens
         self.assertIn("proj $1.31", fleet)
 
+    def test_says_it_is_a_lower_bound_and_shows_refused_attempts_as_a_range(self):
+        """/spend under-reported silently. A refused-then-retried call keeps its earlier attempts in
+        usage.iterations, outside the top-level usage, and whether they were billed is not in the
+        transcript: so the report shows both ends, and says the figure is a lower bound. A forked
+        session's copied calls were counted twice by the fleet report."""
+        now = datetime.now(timezone.utc) - timedelta(minutes=5)
+        retried = call("r1", "claude-sonnet-5-5", now, {**usage(out=1_000), "iterations": [
+            {**usage(write=100_000), "model": "claude-sonnet-5-5", "type": "message"},
+            {**usage(out=1_000), "model": "claude-sonnet-5-5", "type": "message"}]})
+        t = jsonl(os.path.join(self.home, ".claude", "projects", "-work-retry", "cccc.jsonl"), [retried])
+        with open(self.session) as f:                                   # a fork: the same calls, a new file
+            write(os.path.join(self.proj, "fork0000.jsonl"), f.read())
+        s, fleet = self.spend("--session", t)
+        self.assertIn("$0.01–$0.41 list price, a lower bound", s)       # +100k sonnet 1h write, $0.40
+        self.assertIn("1 call(s) were retried", s)
+        self.assertIn("$1.32–$1.72 list price, a lower bound", fleet, "a fork's copied calls are counted once")
+        s, _ = self.spend("--session", self.session)
+        self.assertIn("$1.06 list price, a lower bound", s, "no retries: one figure, still called a lower bound")
+        self.assertNotIn("retried", s)
+
     def test_session_id_prefix_resolves_and_an_unknown_id_exits_2(self):
         jsonl(os.path.join(self.proj, "zzzz9999.jsonl"), [call("x", "claude-haiku-5-5", datetime.now(timezone.utc), usage(out=10))])
         s, _ = self.spend("--session", "aaaa1111", "--cwd", "/work/proj")
@@ -441,8 +467,9 @@ class TestSpend(Sandbox):
 
 class TestStatusline(Sandbox):
 
-    def render(self, payload, columns="120"):
-        r = self.run_py([os.path.join(ROOT, "statusline", "statusline.py")], input=json.dumps(payload), COLUMNS=columns)
+    def render(self, payload, columns="120", **env):
+        r = self.run_py([os.path.join(ROOT, "statusline", "statusline.py")], input=json.dumps(payload), COLUMNS=columns,
+                        **env)
         self.assertEqual(r.returncode, 0, r.stderr)
         return [strip_ansi(l) for l in r.stdout.splitlines()]
 
@@ -507,6 +534,33 @@ class TestStatusline(Sandbox):
         r = self.run_py([os.path.join(ROOT, "statusline", "statusline.py")], input="not json")
         self.assertEqual((r.returncode, r.stderr), (0, ""), "a status line that prints a traceback is worse than none")
 
+    def test_reads_the_data_dir_prices_and_transcript_as_the_cli_does(self):
+        """It is self-contained by design, and fell behind the CLI three ways at once: "~" in
+        LACUNA_DATA left a user's pricing.json unread (status line $0.020, spend $2.00 for one
+        call); a malformed pricing.json blanked it; and after an API error it read Claude Code's
+        zero-usage <synthetic> line as the last turn and said "last $0.000"."""
+        p = self.payload()
+        write(os.path.join(self.home, "lac", "pricing.json"), json.dumps({"opus-5-5": [400, 500, 800, 20, 2000]}))
+        self.assertIn("last $4.804 ", self.render(p, LACUNA_DATA="~/lac")[1], "a 100x price under ~/ was ignored")
+        for bad in ([], "x", {"models": [1, 2]}, {"models": {"opus-5-5": [1, 2, 3, 4, "x"]}},
+                    {"models": {"opus-5-5": "12345"}}, {"models": {"opus-5-5": [float("nan")] * 5}}, "deep"):
+            with self.subTest(pricing=bad):
+                write(os.path.join(self.data, "pricing.json"), "[" * 100_000 if bad == "deep" else json.dumps(bad))
+                self.assertIn("last $0.048 ", self.render(p)[1], "a malformed pricing.json must fall back, not blank")
+        os.remove(os.path.join(self.data, "pricing.json"))
+        now = datetime.now(timezone.utc)
+        with open(p["transcript_path"], "a") as f:
+            f.write(json.dumps(call("<synthetic>", "<synthetic>", now, usage())) + "\n")
+            f.write('[1, 2]\n{"type": "assistant", "message": "a string"}\n')   # valid JSON, not a call
+        self.assertIn("last $0.048 ", self.render(p, columns="")[1], "an API error is not the last turn")
+        # A refused first attempt is in usage.iterations and not in the top-level usage. Whether it
+        # was billed is not recorded, so the figure is a range, never silently the lower end.
+        retried = call("m3", "claude-opus-5-5", now, {**usage(10, 1_000, 100_000, 1_000), "iterations": [
+            {**usage(0, 300_000, 0, 0), "model": "claude-opus-5-5", "type": "message"},
+            {**usage(10, 1_000, 100_000, 1_000), "model": "claude-opus-5-5", "type": "fallback_message"}]})
+        jsonl(p["transcript_path"], [retried])
+        self.assertIn("last $0.048–$2.448 ", self.render(p)[1])
+
 
 # --------------------------------------------------------------------------------------------
 # cache guard and results hook
@@ -561,6 +615,29 @@ class TestCacheGuard(Sandbox):
                    {"type": "system", "subtype": "compact_boundary"}]
         self.assertIn("block", self.prompt(self.transcript(timedelta(hours=3), extra=undated)).stdout,
                       "an undated line is no evidence of compaction and must not switch the guard off")
+
+    def test_judges_the_last_call_and_the_data_dir_as_the_cli_does(self):
+        """Claude Code records an API failure as a zero-usage line whose model is <synthetic>; read
+        as the newest call it hid a 500k-token re-cache. The first fix skipped any line containing
+        the text, so a real call that merely mentioned it was skipped too and an idle hour was
+        invented. And if lacuna_config cannot be imported, "~" in LACUNA_DATA must still expand."""
+        now = datetime.now(timezone.utc)
+        real = call("m1", "claude-opus-5", now - timedelta(hours=3), usage(10, 0, 500_000, 50))
+        failed = call("<synthetic>", "<synthetic>", now - timedelta(hours=2, minutes=55), usage())
+        r = self.guard({"hook_event_name": "SessionStart", "source": "resume", "session_id": "s",
+                        "transcript_path": jsonl(self.p("t1.jsonl"), [real, failed, "[1, 2]"])})
+        self.assertIn("500k", r.stdout, "the guard must see the real call's context, not the synthetic zero")
+        mentions = call("m2", "claude-opus-5-5", now - timedelta(minutes=2), usage(0, 1_000, 99_000, 500))
+        mentions["message"]["content"] = [{"type": "text", "text": 'a line whose model is "<synthetic>" is an error'}]
+        self.assertEqual(self.prompt(jsonl(self.p("t2.jsonl"), [real, mentions])).stdout.strip(), "",
+                         "a real call two minutes ago was skipped for mentioning <synthetic>")
+        alone = write(self.p("standalone", "cache_guard.py"), read(os.path.join(ROOT, "hooks", "cache_guard.py")))
+        r = self.run_py([alone], input=json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+                                                   "transcript_path": self.transcript(timedelta(hours=3)),
+                                                   "prompt": "go"}), LACUNA_DATA="~/guard-data")
+        self.assertIn("block", r.stdout, r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.home, "guard-data", "cache_guard", "s1.prompt.txt")),
+                        "a literal ./~ directory was made beside the cwd")
 
     def test_never_breaks_a_session(self):
         """A hook that raises breaks every prompt. Garbage input, a transcript line without a
@@ -807,6 +884,12 @@ class TestResultsPane(Sandbox):
         r = self.run_py([self.PANE, self.p("results.txt"), "--once"])
         self.assertEqual(r.returncode, 2, "a missing path that is not .md is a typo, not a directory to create")
         self.assertFalse(os.path.exists(self.p("results.txt")))
+        # Copied on its own, without lacuna_config beside it, "~" in LACUNA_RESULTS must still expand.
+        alone, cwd = write(self.p("alone", "results_pane.py"), read(self.PANE)), self.p("cwd-alone")
+        os.makedirs(cwd)
+        r = self.run_py([alone, "--once"], cwd=cwd, LACUNA_RESULTS="~/pane-results")
+        self.assertEqual((r.returncode, os.listdir(cwd)), (0, []), r.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(self.home, "pane-results")))
 
 
 if __name__ == "__main__":
