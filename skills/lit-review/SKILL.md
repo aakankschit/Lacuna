@@ -85,8 +85,8 @@ Which model fills each role comes from config (`lacuna config` to see it; `model
 
 `read` parses with **pymupdf4llm** (~4 s/document), validates the output, and falls back to
 **docling** (~73 s/document) if validation fails. A document that fails both is reported, not passed
-downstream — there is deliberately no plain-text fallback. `--equations` routes to **marker** when
-LaTeX fidelity matters (~34 expressions/document against ~1 elsewhere, at 130 s and +14% tokens).
+downstream — there is deliberately no plain-text fallback. `--equations` routes to **marker** when LaTeX fidelity matters (~34 expressions/document against
+~1 elsewhere, at 91–130 s and +14% raw tokens). It needs ~3 GB of venv and models.
 
 From a bake-off of 9 parsers over 3 papers (`docs/benchmarks/pdf-parsers.md`):
 
@@ -94,8 +94,12 @@ From a bake-off of 9 parsers over 3 papers (`docs/benchmarks/pdf-parsers.md`):
   robust**; choose on speed, token cost, structure and cleanliness instead.
 - `pdftotext -layout` costs **+36% tokens** for the same documents; plain-text extractors lose all
   tables and emit control characters that make `grep` treat the file as binary.
-- **Never run two GPU parsers concurrently** — that silently corrupted one output to 14k chars while
-  it still looked like valid markdown, and only the fact quiz caught it.
+- **Never run two marker processes concurrently** — reproduced 3 times out of 3: 22% of the body
+  text vanished and the result still passed validation. Marker 2.0 shares model servers through a
+  hardcoded lock directory, so a second run can attach to the first one's.
+- **Marker's figure descriptions are generated, not extracted, and are not reproducible.** On two
+  of three papers they changed between runs and contained invented compounds and identifiers. Use
+  `--equations` for the mathematics, and do not trust its prose about figures.
 - **Never read a PDF with the `Read` tool** for extraction: it sends page images, which cannot be
   grepped, section-filtered or reference-stripped. Images are for when the figure itself is the
   object of study.

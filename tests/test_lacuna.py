@@ -155,11 +155,26 @@ class TestParseValidation(unittest.TestCase):
         self.assertTrue(self.prep.validate(md, pages=20),
                         "a short file for a long document must fail validation")
 
-    def test_control_characters_are_rejected(self):
-        md = ("# A Paper\n\n## Abstract\n\n## Introduction\n\n## Methods\n\n## Results\n\n"
-              + ("word " * 4000) + "\x01\x02\x03")
-        bad = self.prep.validate(md, pages=4)
+    def test_a_flood_of_control_characters_is_rejected(self):
+        """A flood means binary-ish output: grep treats the file as binary and a reader finds
+        nothing. A handful is cosmetic — clean() strips them — and rejecting a good 75k-char parse
+        over a single stray byte made `--equations` exit 3 on a perfectly usable document."""
+        body = ("# A Paper\n\n## Abstract\n\n## Introduction\n\n## Methods\n\n## Results\n\n"
+                + ("word " * 4000))
+        self.assertEqual(self.prep.validate(body + "\x01\x02\x03", pages=4), [],
+                         "a few control characters must not fail an otherwise good parse")
+        bad = self.prep.validate(body + "\x01" * 60, pages=4)
         self.assertTrue(any("control" in b.lower() for b in bad), bad)
+
+    def test_a_truncated_parse_is_rejected_against_the_documents_own_text(self):
+        """The failure validation exists for. A fixed chars-per-page floor cannot catch it: a
+        dense paper cut to 37% still clears any floor low enough to accept a sparse one."""
+        full = "# A Paper\n\n## Abstract\n\n" + ("real sentence of body text. " * 1200)
+        raw = len(full)
+        self.assertEqual(self.prep.validate(full, 14, raw), [])
+        for frac in (0.37, 0.10):
+            bad = self.prep.validate(full[:int(raw * frac)], 14, raw)
+            self.assertTrue(any("truncated" in b for b in bad), f"{frac:.0%}: {bad}")
 
     def test_plausible_output_passes(self):
         md = ("# A Paper\n\n## Abstract\n\n" + ("word " * 500)

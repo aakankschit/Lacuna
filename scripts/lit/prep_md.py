@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 import lacuna_config
 
 DATA = lacuna_config.DATA
-REF = re.compile(r"\n#*\s*\**(References|Bibliography)\**\s*\n", re.I)
+# Leading junk covers ACS's "■ REFERENCES", numbered headings, and bold/heading markers.
+REF = re.compile(r"\n[#*\s■□●▪•]*\**\s*(?:\d+[.)]\s*)?(References|Bibliography|"
+                 r"References and Notes|Literature Cited)\**[:\s]*\n", re.I)
 # Any heading. Used to find where the citation block ends, so material a journal places AFTER the
 # references (acknowledgements, data availability, Extended Data legends) is not lost with them.
 HEADING = re.compile(r"\n#{1,4}\s+\S")
@@ -43,13 +45,28 @@ SCRIPTS = {
 
 
 def page_count(pdf):
+    return pdf_stats(pdf)[0]
+
+
+def pdf_stats(pdf):
+    """(pages, characters of raw extractable text) straight from pymupdf.
+
+    The character count is the thing that makes truncation detectable. A fixed "chars per page"
+    threshold cannot: a dense paper truncated to a third of its text still clears any floor low
+    enough not to reject a sparse one. Comparing a parse against the document's OWN text is the
+    only check that works for both.
+    """
     try:
-        out = subprocess.run([VENVS["pymupdf4llm"], "-I", "-c",
-                              "import sys, pymupdf; print(pymupdf.open(sys.argv[1]).page_count)", pdf],
-                             capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
-        return int(out.strip())
+        out = subprocess.run(
+            [VENVS["pymupdf4llm"], "-I", "-c",
+             "import sys, pymupdf\n"
+             "d = pymupdf.open(sys.argv[1])\n"
+             "print(d.page_count, sum(len(p.get_text()) for p in d))", pdf],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
+        pages, chars = out.split()
+        return int(pages), int(chars)
     except (ValueError, OSError):
-        return 0
+        return 0, 0
 
 
 def parse(pdf, parser):
@@ -59,17 +76,34 @@ def parse(pdf, parser):
     r = subprocess.run([py, "-I", "-c", SCRIPTS[parser], pdf], capture_output=True, text=True,
                        stdin=subprocess.DEVNULL)
     if r.returncode != 0:
-        return None, f"{parser}: {(r.stderr or '')[-160:].strip()}"
+        # Keep enough to see the exception type and its message. 160 characters reliably cut the
+        # cause off the front of a traceback and left only the final frame.
+        err = (r.stderr or "").strip()
+        lines = [l for l in err.splitlines()
+                 if l.strip() and not l.lstrip().startswith(("File \"", "  "))]
+        return None, f"{parser}: " + (" | ".join(lines[-3:]) if lines else err[-400:])
     return r.stdout, None
 
 
-def validate(md, pages):
-    """Return a list of problems. Thresholds come from the 2026-10-13 bake-off across 3 papers."""
+# A parse must keep most of the text the PDF actually contains. Measured: a parse truncated to
+# 37% of its text passed the old per-page floor, which is the exact failure validation exists for.
+KEEP_FRACTION = 0.60
+# Control characters are stripped by clean(), so a handful is cosmetic. A flood means the parser
+# produced binary-ish output; grep would treat the file as binary and the reader would find nothing.
+CTRL_BUDGET = 8
+
+
+def validate(md, pages, raw_chars=0):
+    """Return a list of problems. `raw_chars` is the PDF's own extractable character count."""
     bad = []
-    if len(md) < 1200 * max(pages, 1) * 0.25:          # ~1.2k chars/page was the floor seen
-        bad.append(f"only {len(md):,} chars for {pages} pages")
-    if CTRL.search(md):
-        bad.append(f"{len(CTRL.findall(md))} control characters")
+    if raw_chars > 2000 and len(md) < raw_chars * KEEP_FRACTION:
+        bad.append(f"kept only {len(md) / raw_chars:.0%} of the document's {raw_chars:,} "
+                   f"characters ({len(md):,}) — the parse is truncated")
+    elif not raw_chars and len(md) < 1200 * max(pages, 1) * 0.25:
+        bad.append(f"only {len(md):,} chars for {pages} pages")   # no baseline available
+    n_ctrl = len(CTRL.findall(md))
+    if n_ctrl > CTRL_BUDGET:
+        bad.append(f"{n_ctrl} control characters")
     if pages >= 4 and len(re.findall(r"(?m)^#{1,4} \S", md)) == 0:
         bad.append("no markdown headings")
     if not re.search(r"(?i)(abstract|introduction|method|result)", md):
@@ -101,7 +135,7 @@ def clean(md):
 
 
 def convert(pdf, out, forced=None, equations=False, quiet=False):
-    pages = page_count(pdf)
+    pages, raw_chars = pdf_stats(pdf)
     order = [forced] if forced else (["marker"] if equations else ["pymupdf4llm", "docling"])
     problems = {}
     for parser in order:
@@ -109,7 +143,7 @@ def convert(pdf, out, forced=None, equations=False, quiet=False):
         if md is None:
             problems[parser] = err
             continue
-        bad = validate(md, pages)
+        bad = validate(md, pages, raw_chars)
         if bad:
             # A parse that fails validation is never accepted, whatever its position in the order.
             # A bad parse looks like valid markdown; passing it downstream is the failure this

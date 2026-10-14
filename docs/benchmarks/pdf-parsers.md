@@ -16,12 +16,12 @@ survive as a readable row. It answers "is the number still there at all?"
 
 | Parser | Fact recall | s/doc | kTokens | Headings | Table rows | LaTeX | Control chars |
 |---|---|---|---|---|---|---|---|
-| **docling** | **100%** | 72.7 | 19.5 | **25** | 21 | 1 | **0** |
+| **docling** | **100%** | 72.7* | 19.5 | **25** | 21 | 1 | **0** |
 | pdfplumber | **100%** | 3.0 | **18.5** | 0 | 0 | 0 | 24 |
 | pdftotext -layout | **100%** | **0.1** | 26.5 | 0 | 0 | 0 | 16 |
 | pypdf | 99% | 1.5 | 18.9 | 0 | 0 | 0 | 30 |
 | **pymupdf4llm** | 97% | **4.0** | 19.5 | 14 | 18 | 1 | **0** |
-| marker | 96% | 130.3 | 22.2 | **25** | **25** | **34** | **0** |
+| marker | 96% | 130.3* | 22.2 | **25** | **25** | **34** | **0** |
 | pdftotext | 94% | 0.3 | 18.8 | 0 | 0 | 0 | 19 |
 | pdfminer.six | 92% | 1.8 | 19.2 | 0 | 0 | 0 | 52 |
 | pymupdf (raw) | 92% | 0.2 | 18.9 | 0 | 0 | 0 | 52 |
@@ -34,6 +34,11 @@ survive as a readable row. It answers "is the number still there at all?"
 | docling | −1% |
 | marker | **+14%** |
 | pdftotext -layout | **+36%** |
+
+\* **Re-measured in October 2026 on an M4 Max and found faster**: docling **49 s**, marker **91 s**,
+pymupdf4llm 3.0 s. The ratios hold; the absolute seconds are hardware. The marker token overhead
+(+14% raw) holds, but falls to +7% after reference stripping, and the LaTeX advantage replicated
+exactly (34.7 expressions against 0.7).
 
 ## The downstream test that changed the conclusion
 
@@ -87,8 +92,8 @@ loudly is a lesser problem than one that fails plausibly.
 | Parser | Install | Notes |
 |---|---|---|
 | pymupdf4llm | `pip install pymupdf4llm` | seconds, no models |
-| docling | `pip install docling` | downloads layout models on first run (~98 s) |
-| marker | `pip install marker-pdf` **plus** a llama.cpp binary | fails at import without it; ~2 GB of models |
+| docling | `pip install docling` | **1.4 GB venv plus ~0.5 GB of models** on first run |
+| marker | `pip install marker-pdf` | **1.3 GB venv plus ~1.8 GB of models**, downloaded on first use into `~/.cache`, not the data directory. A llama.cpp binary is **not** needed to import or to convert a born-digital PDF — only for pages requiring OCR. It leaves model servers running after the parse. |
 | MinerU | `pip install "mineru[all]"` + model download + a server | **could not be made to run locally** at v4.0.12: reports "No basic, standard, or advanced engine available" and wants its cloud service, which means uploading your documents |
 | GROBID | Docker or a Gradle build | **not tested.** It remains the only option here that returns a *structured reference list*, which matters for automated citation chasing |
 
