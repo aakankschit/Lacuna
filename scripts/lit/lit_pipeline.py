@@ -37,7 +37,7 @@ LEDGER = lacuna_config.path("ledger")
 
 # Bump when the reader prompt or the note template changes: it is part of the cache key, so a
 # changed prompt must miss the cache rather than silently serve notes written under old assumptions.
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"
 
 # Bump when prep_md's clean() or validate() changes: the parsed-markdown cache is keyed on this,
 # so without it a change to parsing never reaches a document that has already been parsed.
@@ -343,10 +343,19 @@ def cmd_read(a):
         prompt = "\n\n".join(x for x in [
             a.brief, books,
             "Read the paper below in full and write its note to the given path, using exactly this template:",
-            NOTE_TEMPLATE, f"Paper:\n- {md} -> {out}", "Keep the note under 1,100 words."] if x)
+            NOTE_TEMPLATE, f"Paper:\n- {md} -> {out}", "Keep the note under 1,100 words.",
+            INCOMPLETE_RULE.format(what="the paper", also=f" and do not write {out}")] if x)
         res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, BOOKS_DIR],
                      effort=lacuna_config.effort("reader"), cwd=out_dir)
         ok = usable_output(out, 400, "note", must_contain=("## Claim",))
+        # The reader is told the INCOMPLETE rule too, and its reply is read: a haiku given symbol noise
+        # filed a template-shaped "Not recoverable" note, and it was cached (VERDICT3 N5).
+        reply = str(res.get("result") or "").strip()
+        said = None if res.get("is_error") else reply_failure(reply)
+        if said and ok:
+            print(f"  ! the reader of {os.path.basename(md)} reported {said!r} — treating it as a failed run, "
+                  f"not output", file=sys.stderr)
+            ok = False
         # source_tokens makes the calibration recipe in docs/extending.md actually runnable
         # effort and source_tokens are both required by the recalibration recipe in
         # docs/extending.md, which is per model x effort.
@@ -360,6 +369,8 @@ def cmd_read(a):
             written.append((out, src))
             return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
         why = (str(res.get("result"))[:120] if res.get("is_error") else
+               f"it replied {next((l for l in reply.splitlines() if said.lower() in _norm(l)), reply)[:160]!r}"
+               if said else
                "the file it wrote is not a note (see above)" if os.path.exists(out) else "agent produced no note file")
         if os.path.exists(out):
             os.remove(out)      # an apology left in --out would be read as a note by the next synth

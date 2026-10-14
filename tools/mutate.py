@@ -237,9 +237,12 @@ MUTANTS = [
      '        except () as e:\n            empty.append(f"{f} cannot be read'),
     ("synth-inputs-not-checked", PIPE, '    if empty:\n        print("ERROR: these inputs', '    if False:\n        print("ERROR: these inputs'),
     # ---- an honest "nothing", in every shape and from every agent (VERDICT3 N5, N6, N10a, N10b)
+    ("reader-not-told-incomplete", PIPE, '            INCOMPLETE_RULE.format(what="the paper", also=f" and do not write {out}")] if x)',
+     "            ] if x)"),
     ("synth-not-told-incomplete", PIPE, 'INCOMPLETE_RULE.format(what="the literature you were given',
      '"".format(what="the literature you were given'),
     ("verify-not-told-incomplete", PIPE, 'INCOMPLETE_RULE.format(what="the document or the codebase", also="")])', '""])'),
+    ("reader-reply-not-judged", PIPE, "        if said and ok:", "        if False:"),
     ("synth-reply-first-line-only", PIPE, '    said = reply_failure(str(res.get("result") or ""))',
      '    said = declared_failure(str(res.get("result") or ""))'),
     ("verify-reply-not-searched", PIPE, "    hit = reply_failure(report)     # a reply", "    hit = refusal(report)     # a reply"),

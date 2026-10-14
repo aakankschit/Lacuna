@@ -389,7 +389,9 @@ class TestMoneyGuarantees(Pipeline):
         self.assertEqual(read(self.alpha), alpha_text, "the document was deleted or overwritten by its own note")
 
     def test_a_refusal_is_never_filed_as_a_note(self):
-        for mode in ("refuse", "apology", "prose"):
+        """"incomplete" is VERDICT3 N5: a reader given unreadable text wrote a template-shaped note, and
+        it was cached. It is told the INCOMPLETE rule now, and its reply is read."""
+        for mode in ("refuse", "apology", "prose", "incomplete"):
             with self.subTest(mode):
                 r = self.read(mode=mode)
                 self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
@@ -398,6 +400,8 @@ class TestMoneyGuarantees(Pipeline):
                 self.assertFalse(self.ledger()[-1]["wrote_note"])
                 if mode != "refuse":
                     self.assertNotIn("produced no note file", r.stdout, "it did write one; the content was rejected")
+                if mode == "incomplete":
+                    self.assertIn("INCOMPLETE: the sources could not be read", r.stdout, "say what the reader said")
         # the subtle one: success was once inferred from a file an earlier run had left in --out
         self.assertEqual(self.read("--brief", "BRIEF:one").returncode, 0)
         r = self.read("--brief", "BRIEF:two", mode="refuse")
