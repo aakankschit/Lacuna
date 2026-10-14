@@ -5,6 +5,11 @@ Counts tokens locally (no LLM), then prints a cost/time table for every measured
 """
 import argparse, json, math, os, shutil, subprocess, sys
 
+# Exactly what `lit read` will accept, so a directory estimate prices every document the run pays
+# for. These drifted apart: estimate scanned three extensions while read took six, so a mixed
+# folder was quoted for a fraction of the work.
+READABLE = (".md", ".markdown", ".txt", ".text", ".rst", ".pdf")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import lacuna_config
@@ -177,7 +182,7 @@ def main():
     if missing:
         die2(f"ERROR: no such path: {', '.join(missing)}")
     files = [os.path.join(d, f) for d in a.paths if os.path.isdir(d) for f in sorted(os.listdir(d))
-             if f.endswith((".md", ".txt", ".pdf"))] + [p for p in a.paths if not os.path.isdir(p)]
+             if f.lower().endswith(READABLE)] + [p for p in a.paths if not os.path.isdir(p)]
     if not files:
         die2("ERROR: no .md, .txt or .pdf documents found in those paths.")
     # A PDF yielding no text is broken, encrypted or a scan. Pricing it at $0.00 and exiting 0

@@ -279,7 +279,9 @@ class TestEstimate(Sandbox):
         partial object. The unknown-model message is kept verbatim."""
         f = self.doc("a.md")
         empty = self.p("empty")
-        write(os.path.join(empty, "notes.rst"), "x")
+        # A file neither `estimate` nor `read` accepts. It used to be notes.rst, which encoded the
+        # old mismatch — estimate ignored .rst while read charged for it — as intended behaviour.
+        write(os.path.join(empty, "notes.docx"), "x")
         cases = [([f, "--effort", "extreme"], None), ([f, "--effort", "LOW"], None), ([f, "--model"], None),
                  ([f, "--model", "gpt-nothing"], "no calibration for model 'gpt-nothing'"),
                  ([self.p("nope.md")], "no such path"), ([empty], "no .md"), ([f, "--jsonn"], None), ([], None)]

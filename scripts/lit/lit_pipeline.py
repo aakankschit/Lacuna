@@ -347,7 +347,7 @@ def cmd_read(a):
                 "books": bool(idx), "wrote_note": ok,
                 "source_tokens": round(os.path.getsize(md) / 2.9), "is_error": res.get("is_error")})
         if ok:
-            shutil.copy(out, cached)
+            _atomic_copy(out, cached)
             record(out, src)
             written.append((out, src))
             return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
@@ -485,6 +485,26 @@ def declared_failure(text):
 OWNERS = ".lacuna.json"
 UNRECORDED = "unrecorded"
 _owners_lock = threading.Lock()
+
+
+def _atomic_copy(src, dst):
+    """Copy so the destination is never seen half-written.
+
+    A cache entry is read by a later run as proof the work is done. An interrupted plain copy left
+    a truncated note that the next run served as a free hit — the same defect already fixed for the
+    parse cache, in its sibling path.
+    """
+    tmp = f"{dst}.{os.getpid()}.part"
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+    except OSError:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
 
 
 def name_key(path):

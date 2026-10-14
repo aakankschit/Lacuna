@@ -612,3 +612,55 @@ class TestMalformedExternalData(unittest.TestCase):
             split, ctx = ccost.split(calls[0])          # must not raise
             self.assertEqual(ctx, 5)
             self.assertGreater(split["output"], 0)
+
+
+class TestEstimateAndReadAgree(unittest.TestCase):
+    """`lit estimate` exists so nobody is surprised by a bill. It quoted three extensions while
+    `read` accepted six, so a mixed folder was priced for a fraction of what the run paid for."""
+
+    def test_the_two_accept_the_same_documents(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_cost, lit_pipeline
+        self.assertEqual(set(lit_cost.READABLE), set(lit_pipeline.TEXT_EXTS) | {".pdf"},
+                         "estimate must price exactly the documents read will accept")
+
+    def test_a_mixed_directory_is_priced_in_full(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a.md", "b.markdown", "c.rst", "d.text", "e.txt"):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write("# doc\n\n" + ("body " * 400))
+            r = subprocess.run([os.path.join(ROOT, "bin", "lacuna"), "lit", "estimate", d],
+                               capture_output=True, text=True,
+                               env={**os.environ, "LACUNA_DATA": os.path.join(d, "data")})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("5 documents", r.stdout, f"all five should be priced:\n{r.stdout}")
+
+
+class TestCacheWritesAreAtomic(unittest.TestCase):
+    """A cache entry is read by a later run as proof the work is done, so it must appear whole or
+    not at all. An interrupted plain copy left a truncated note served as a free hit."""
+
+    def test_note_cache_copy_goes_through_a_temporary(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_pipeline
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = os.path.join(d, "s.md"), os.path.join(d, "c.md")
+            with open(src, "w") as f:
+                f.write("# note\n" + ("x" * 5000))
+            lit_pipeline._atomic_copy(src, dst)
+            with open(dst) as f:
+                self.assertEqual(len(f.read()), 5007)
+            self.assertEqual([f for f in os.listdir(d) if f.endswith(".part")], [],
+                             "no temporary may be left behind")
+
+    def test_a_failed_copy_leaves_no_partial_entry(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_pipeline
+        with tempfile.TemporaryDirectory() as d:
+            dst = os.path.join(d, "sub", "c.md")       # parent does not exist: copy must fail
+            with self.assertRaises(OSError):
+                lit_pipeline._atomic_copy(__file__, dst)
+            self.assertFalse(os.path.exists(dst))
+            self.assertEqual([f for f in os.listdir(d) if f.endswith(".part")], [])

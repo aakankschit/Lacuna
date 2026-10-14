@@ -58,7 +58,7 @@ MUTANTS = [
      "        if False:\n            return None                       # the opening line"),
     ("failed-read-exits-0", PIPE, "        sys.exit(EX_MODEL)\n    after(\"read\", out_dir)", "\n    after(\"read\", out_dir)"),
     ("failed-read-leaves-apology", PIPE, "        if os.path.exists(out):\n            os.remove(out)      # an apology", "        if False:\n            os.remove(out)      # an apology"),
-    ("failed-read-caches-note", PIPE, "        if ok:\n            shutil.copy(out, cached)", "        if True:\n            shutil.copy(out, cached)"),
+    ("failed-read-caches-note", PIPE, "        if ok:\n            _atomic_copy(out, cached)", "        if True:\n            _atomic_copy(out, cached)"),
     ("verify-ignores-is-error", PIPE, 'if res.get("is_error") or not report.strip():', "if False:"),
     ("synth-skips-repo-check", PIPE, '    need_dir(a.repo, "--repo")\n    if a.digest:', "    if a.digest:"),
     ("synth-out-dir-accepted", PIPE, "    if os.path.isdir(a.out):\n        print(f\"ERROR: --out {a.out!r} is a directory",
