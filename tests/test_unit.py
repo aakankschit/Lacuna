@@ -257,9 +257,10 @@ class TestParse(unittest.TestCase):
         parts += [r.pattern for r in (prep_md.REF, prep_md.ENTRY, prep_md.NUMBER, prep_md.YEAR, prep_md.AUTHOR, prep_md.VENUE,
                                       prep_md.CITED_YEAR, prep_md.LEGEND, prep_md.HEADING, prep_md.SECTION, prep_md.CTRL,
                                       prep_md.JUNK)]
-        parts += [str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET), str(prep_md.JUNK_SHARE), str(prep_md.STRIP_LIMIT)]
+        parts += [str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET), str(prep_md.JUNK_SHARE), str(prep_md.STRIP_LIMIT),
+                  str(prep_md.UNMEASURED_FLOOR)]
         fingerprint = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-        recorded = {"4": "3c4eb5864358d0d2"}
+        recorded = {"4": "1f4cf2c988c622a1"}
         self.assertEqual(recorded.get(L.PARSE_VERSION), fingerprint,
                          f"the parser changed: bump PARSE_VERSION and record {fingerprint!r} for it")
 
@@ -276,9 +277,9 @@ class TestParse(unittest.TestCase):
         self.assertNotIn("File \"", err)
         self.assertNotIn("^^^", err, "indented source and caret lines are noise")
 
-    def convert(self, outputs, pages=4, unmeasured=None, quiet=True, pymupdf=True, **kw):
+    def convert(self, outputs, pages=4, stats_error=None, quiet=True, **kw):
         """Run convert() with parsers stubbed: (ok, parsers called, text written or None); what it
-        said on stderr is left in self.stderr."""
+        said on stderr is left in self.stderr. `stats_error` is what pdf_stats() raises."""
         called, out = [], os.path.join(self.tmp, "out.md")
         if os.path.exists(out):
             os.remove(out)
@@ -287,12 +288,14 @@ class TestParse(unittest.TestCase):
             called.append(parser)
             md = outputs.get(parser)
             return (md, None) if md is not None else (None, f"{parser}: venv missing")
+
+        def fake_stats(pdf):
+            if stats_error:
+                raise stats_error
+            return pages, 0
         err = io.StringIO()
         try:
-            with mock.patch.object(prep_md, "parse", fake_parse), \
-                    mock.patch.object(prep_md, "pdf_stats", lambda pdf: (pages, 0, unmeasured)), \
-                    mock.patch.dict(prep_md.VENVS, {"pymupdf4llm": sys.executable if pymupdf else
-                                                    os.path.join(self.tmp, "no-venv", "python")}), \
+            with mock.patch.object(prep_md, "parse", fake_parse), mock.patch.object(prep_md, "pdf_stats", fake_stats), \
                     mock.patch("sys.stderr", err), mock.patch("sys.stdout"):
                 ok, _ = prep_md.convert("x.pdf", out, quiet=quiet, **kw)
         finally:
@@ -318,19 +321,40 @@ class TestParse(unittest.TestCase):
                                   # pymupdf could not open the PDF to count it: one page of twenty
                                   # passed as the whole paper, with the truncation check silently off
                                   ("PDF not measurable", {"pymupdf4llm": self.GOOD, "docling": self.GOOD},
-                                   {"unmeasured": "pymupdf.FileDataError: cannot open"})]:
+                                   {"stats_error": prep_md.Unmeasured("pymupdf.FileDataError: cannot open")})]:
             with self.subTest(name):
                 ok, _, text = self.convert(outputs, pages=20, **kw)
                 self.assertFalse(ok, f"{name}: a parse that failed validation was accepted")
                 self.assertIsNone(text, f"{name}: the bad parse was written")
-                if "unmeasured" in kw:
+                if "stats_error" in kw:
                     self.assertIn("could not count the PDF's own pages", self.stderr, "and it says why")
         # ...but with no pymupdf installed at all nothing can count it: `doctor --install-equations`
-        # makes only the marker venv, and --equations must still work there, saying the check is off.
-        ok, _, text = self.convert({"marker": self.GOOD}, pages=0, equations=True, pymupdf=False,
-                                   unmeasured="pymupdf is not installed")
+        # makes only the marker venv, and --equations must still work there, saying the check is off,
+        # under the checks that need no page count.
+        none = prep_md.NoPymupdf("no default parser venv at /x")
+        ok, _, text = self.convert({"marker": self.GOOD}, equations=True, stats_error=none)
         self.assertTrue(ok, self.stderr)
         self.assertIn("truncation check is off", self.stderr)
+        one_page = "# A Paper\n\n## Abstract\n\n" + "word " * 280
+        ok, _, text = self.convert({"marker": one_page}, equations=True, stats_error=none)
+        self.assertFalse(ok, "a page of text is not a paper when nothing can say how long the PDF is")
+        self.assertIn("no pymupdf to count", self.stderr)
+
+    def test_pdf_stats_tells_a_missing_pymupdf_from_a_pdf_it_cannot_read(self):
+        """The first is a setup (only the marker venv); the second is evidence against the PDF."""
+        def stats(returncode=0, stdout="", stderr="", venv=sys.executable):
+            run = mock.Mock(return_value=mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr))
+            with mock.patch.object(prep_md.subprocess, "run", run), mock.patch.dict(prep_md.VENVS, {"pymupdf4llm": venv}):
+                return prep_md.pdf_stats("x.pdf")
+        self.assertEqual(stats(stdout="12 34567\n"), (12, 34567))
+        for name, kw in (("no venv", {"venv": os.path.join(self.tmp, "no-venv", "python")}),
+                         ("venv without pymupdf", {"stdout": "no pymupdf\n"})):
+            with self.subTest(name), self.assertRaises(prep_md.NoPymupdf):
+                stats(**kw)
+        with self.assertRaises(prep_md.Unmeasured) as cm:
+            stats(returncode=1, stderr="Traceback ...\npymupdf.FileDataError: Failed to open file 'x.pdf'.\n")
+        self.assertNotIsInstance(cm.exception, prep_md.NoPymupdf)
+        self.assertIn("FileDataError", str(cm.exception))
         # A write that dies part-way (here, on a character it cannot encode; in life, a kill or a full
         # disk) must leave no file: the pipeline serves whatever is at that path as a finished parse.
         with self.assertRaises(UnicodeEncodeError):

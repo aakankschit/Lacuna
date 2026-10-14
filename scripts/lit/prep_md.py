@@ -83,8 +83,17 @@ def page_count(pdf):
     return pdf_stats(pdf)[0]
 
 
+class Unmeasured(Exception):
+    """pymupdf is there and could not count this PDF: evidence against the PDF."""
+
+
+class NoPymupdf(Unmeasured):
+    """pymupdf cannot be imported for the default parser: nothing could count any PDF."""
+
+
 def pdf_stats(pdf):
-    """(pages, characters of raw extractable text, None) straight from pymupdf, or (0, 0, why not).
+    """(pages, characters of raw extractable text) straight from pymupdf. Raises NoPymupdf when it
+    is not installed, Unmeasured (with the cause) when it could not read this PDF.
 
     The character count is the thing that makes truncation detectable. A fixed "chars per page"
     threshold cannot: a dense paper truncated to a third of its text still clears any floor low
@@ -93,22 +102,25 @@ def pdf_stats(pdf):
     """
     py = VENVS["pymupdf4llm"]
     if not os.path.exists(py):
-        return 0, 0, f"pymupdf is not installed ({py}): `lacuna doctor --install-pdf`"
+        raise NoPymupdf(f"no default parser venv at {py}")
     try:
         r = subprocess.run(
             [py, "-I", "-c",
-             "import sys, pymupdf\n"
+             "import sys\n"
+             "try:\n    import pymupdf\nexcept ImportError:\n    print('no pymupdf')\n    sys.exit()\n"
              "d = pymupdf.open(sys.argv[1])\n"
              "print(d.page_count, sum(len(p.get_text()) for p in d))", pdf],
             capture_output=True, text=True, stdin=subprocess.DEVNULL)
     except OSError as e:
-        return 0, 0, str(e)
+        raise NoPymupdf(f"{py} would not run: {e}")
+    if r.stdout.strip() == "no pymupdf":
+        raise NoPymupdf(f"{py} has no pymupdf")
     try:
         pages, chars = r.stdout.split()
-        return int(pages), int(chars), None
+        return int(pages), int(chars)
     except ValueError:
         err = [l for l in (r.stderr or "").strip().splitlines() if l.strip()]
-        return 0, 0, err[-1].strip() if err else f"pymupdf exited {r.returncode} and printed nothing"
+        raise Unmeasured(err[-1].strip() if err else f"pymupdf exited {r.returncode} and printed nothing")
 
 
 def parse(pdf, parser):
@@ -154,9 +166,18 @@ def unreadable(text):
     return None
 
 
-def validate(md, pages, raw_chars=0):
-    """Return a list of problems. `raw_chars` is the PDF's own extractable character count."""
+# With nothing to count the PDF's pages, the floor cannot scale with them; what is left is a floor
+# no whole paper falls under. It does not catch one page of twenty — only pymupdf's count does.
+UNMEASURED_FLOOR = 2000
+
+
+def validate(md, pages, raw_chars=0, measured=True):
+    """Return a list of problems. `raw_chars` is the PDF's own extractable character count;
+    `measured` is False when nothing could count the PDF at all."""
     bad = []
+    if not measured and len(md) < UNMEASURED_FLOOR:
+        bad.append(f"only {len(md):,} chars, and with no pymupdf to count the PDF's pages there is no "
+                   f"telling that this is all of it")
     if raw_chars > 2000 and len(md) < raw_chars * KEEP_FRACTION:
         bad.append(f"kept only {len(md) / raw_chars:.0%} of the document's {raw_chars:,} "
                    f"characters ({len(md):,}) — the parse is truncated")
@@ -248,12 +269,12 @@ def clean(md, strip_refs=True):
 STRIP_LIMIT = 0.50
 
 
-def finish(md, pages):
+def finish(md, pages, measured=True):
     """(clean(md), None), or the text with its references kept and why, when stripping them
     removed an implausible share of the parse or left one that no longer validates."""
     text = clean(md)
     cut = 1 - len(text) / max(len(md), 1)
-    bad = validate(text, pages)
+    bad = validate(text, pages, 0, measured)
     if cut > STRIP_LIMIT or bad:
         return clean(md, strip_refs=False), (f"stripping references would remove {cut:.0%} of the text"
                                              + (f" and leave {'; '.join(bad)}" if bad else ""))
@@ -261,15 +282,19 @@ def finish(md, pages):
 
 
 def convert(pdf, out, forced=None, equations=False, quiet=False):
-    pages, raw_chars, unmeasured = pdf_stats(pdf)
-    if unmeasured and not os.path.exists(VENVS["pymupdf4llm"]):
-        # No pymupdf at all: `doctor --install-equations` makes the marker venv and nothing else,
-        # and --equations runs prep_md without the default one. That is a choice, not evidence
-        # against this PDF, so the parse goes ahead, saying the check is off. A pymupdf that is
-        # there and cannot read the PDF is evidence, and is refused below.
-        print(f"  {os.path.basename(pdf)}: {unmeasured} — the truncation check is off for this parse",
-              file=sys.stderr)
-        unmeasured = None
+    measured, unmeasured = True, None
+    try:
+        pages, raw_chars = pdf_stats(pdf)
+    except NoPymupdf as e:
+        # `doctor --install-equations` makes the marker venv and nothing else, and --equations then
+        # runs prep_md without the default one. That is a choice, not evidence against this PDF: the
+        # parse goes ahead under the checks that need no page count, and says the rest are off.
+        print(f"  {os.path.basename(pdf)}: {e}, so nothing can count the PDF's pages: the truncation "
+              f"check is off for this parse (`lacuna doctor --install-pdf` adds it)", file=sys.stderr)
+        pages, raw_chars, measured = 0, 0, False
+    except Unmeasured as e:
+        # pymupdf is there and could not read this PDF: evidence, refused below.
+        pages, raw_chars, unmeasured = 0, 0, str(e)
     order = [forced] if forced else (["marker"] if equations else ["pymupdf4llm", "docling"])
     problems = {}
     for parser in order:
@@ -277,7 +302,7 @@ def convert(pdf, out, forced=None, equations=False, quiet=False):
         if md is None:
             problems[parser] = err
             continue
-        bad = validate(md, pages, raw_chars)
+        bad = validate(md, pages, raw_chars, measured)
         if unmeasured:
             # Without the PDF's own counts the truncation check is off, and one page of a 20-page
             # paper passed as the whole paper. A check that cannot run is a check that fails.
@@ -293,7 +318,7 @@ def convert(pdf, out, forced=None, equations=False, quiet=False):
                 print(f"  {parser} failed validation ({problems[parser]})"
                       + (f" -> trying {nxt}" if nxt else " -> no parser left"), file=sys.stderr)
             continue
-        text, refs_kept = finish(md, pages)
+        text, refs_kept = finish(md, pages, measured)
         if refs_kept and not quiet:
             print(f"  {parser}: {refs_kept} -> falling back to the text with its references kept",
                   file=sys.stderr)
