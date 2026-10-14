@@ -16,7 +16,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ONE data directory, whoever is asking. It deliberately does not fall back to CLAUDE_PLUGIN_DATA:
 # hooks get that variable and a shell does not, so the two would read different config files and a
 # setting made in one would be silently ignored by the other.
-DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")
+# expanduser/expandvars because this is typed by hand and exported in shell profiles. Without it
+# "~/lacuna" became a literal "./~/lacuna" next to the cwd while config.json was looked for
+# elsewhere: two data directories, and `doctor` reported every step OK.
+DATA = os.path.expanduser(os.path.expandvars(
+    os.environ.get("LACUNA_DATA") or "~/.lacuna"))
 
 # Claude Code's own transcript directory. Not configurable by us — this is where it writes.
 TRANSCRIPTS = os.path.expanduser("~/.claude/projects")
@@ -133,7 +137,8 @@ def load():
             SOURCES[(section, key)] = f"$LACUNA_{env}"
     # Paths are written by hand in config.json, so "~/books" and "$HOME/books" must work.
     # Without this a tilde becomes a literal directory named "~" and the error is baffling.
-    cfg["paths"] = {k: os.path.expanduser(os.path.expandvars(v)) if isinstance(v, str) else v
+    # They are made absolute too: they are handed to agents, which run in another directory.
+    cfg["paths"] = {k: os.path.abspath(os.path.expanduser(os.path.expandvars(v))) if isinstance(v, str) and v else v
                     for k, v in (cfg.get("paths") or {}).items()}
     return cfg
 
@@ -168,7 +173,10 @@ def resolve(model):
 def _price_table(doc):
     """The {model: 5-tuple} map out of a pricing file, ignoring _comment-style metadata."""
     out = {}
-    for k, v in (doc.get("models") or doc).items():
+    table = (doc.get("models") or doc) if isinstance(doc, dict) else None
+    if not isinstance(table, dict):       # hand-edited: a list here crashed every price lookup
+        return out
+    for k, v in table.items():
         if k.startswith("_"):
             continue
         try:
@@ -193,11 +201,16 @@ def prices():
 
 
 def price_meta():
-    """When the shipped table was retrieved, for honest reporting."""
-    d = _read_json(os.path.join(ROOT, "scripts", "pricing.json"))
-    u = _read_json(os.path.join(DATA, "pricing.json"))
+    """When the shipped table was retrieved, for honest reporting.
+
+    `overridden` means the user's file actually contributed prices — not merely that a file
+    exists. A malformed override that yields nothing must not be reported as in effect, or the
+    user is told their edit took when the shipped table is what is being used.
+    """
+    d, u = (x if isinstance(x, dict) else {} for x in (_read_json(os.path.join(ROOT, "scripts", "pricing.json")),
+                                                       _read_json(os.path.join(DATA, "pricing.json"))))
     return {"retrieved": (u.get("_retrieved") or d.get("_retrieved") or "unknown"),
-            "overridden": bool(u)}
+            "overridden": bool(_price_table(u))}
 
 
 if __name__ == "__main__":

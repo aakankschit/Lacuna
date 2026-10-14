@@ -58,13 +58,16 @@ def session_report(path):
     cold = [(t, i, call) for t, i, call, _, _ in turns if is_avoidable_cold(call, i)]
     writes = tot["write5m"] + tot["write1h"]
 
+    def share(x):        # a session that died on its first call has all-zero usage
+        return f"{x / usd:.0%}" if usd else "0%"
+
     print(c(177, "■ This session") + dim(f"  {os.path.basename(path)[:8]}  {len(calls)} API calls over {span / 3600:.1f} h  ·  "
                                          + ", ".join(f"{m} ×{n}" for m, n in models.most_common())))
     print(f"  {c(255, f'${usd:.2f}')} list price   {dim(f'(same tokens without caching: ${nocache:.2f})')}")
     print(f"  {bar([('read', tot['read'], 75), ('write', writes, 221), ('out', tot['output'], 177)])}")
-    print(f"  {c(75, '█')} cache reads ${tot['read']:.2f} ({tot['read'] / usd:.0%})   "
-          f"{c(221, '█')} cache writes ${writes:.2f} ({writes / usd:.0%})   "
-          f"{c(177, '█')} output+thinking ${tot['output']:.2f} ({tot['output'] / usd:.0%})")
+    print(f"  {c(75, '█')} cache reads ${tot['read']:.2f} ({share(tot['read'])})   "
+          f"{c(221, '█')} cache writes ${writes:.2f} ({share(writes)})   "
+          f"{c(177, '█')} output+thinking ${tot['output']:.2f} ({share(tot['output'])})")
     if cold:
         print(f"  {c(203, f'{len(cold)} cold rewrites')} cost ${sum(t for t, _, _ in cold):.2f} "
               + dim("(whole context re-cached after the cache expired or was invalidated)"))

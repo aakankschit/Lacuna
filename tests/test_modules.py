@@ -405,6 +405,11 @@ class TestSpend(Sandbox):
         self.assertIn("subagents: 3 runs, $0.25", line)
         self.assertIn("haiku-5-5 ×2 $0.15", line)
         self.assertIn("sonnet-5-5 ×1 $0.10", line)
+        # 13 of 309 real transcripts: a session that died on its first call, with all-zero usage.
+        died = jsonl(os.path.join(self.proj, "dead0000.jsonl"), [call("d0", "claude-opus-5-5", datetime.now(timezone.utc), usage())])
+        s, _ = self.spend("--session", died)
+        self.assertIn("1 API calls", s)
+        self.assertIn("$0.00 list price", s)
 
     def test_fleet_report_agrees_with_the_session_and_honours_the_window(self):
         """The session report skipped a session's first call when counting cold rewrites and the

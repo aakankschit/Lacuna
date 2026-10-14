@@ -18,7 +18,7 @@ usage:
   lit_pipeline.py synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT]
   lit_pipeline.py verify --target FILE --repo DIR [--notes DIR]
 """
-import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, shutil, subprocess, sys, time
+import argparse, concurrent.futures as cf, glob, hashlib, json, os, re, shlex, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -92,10 +92,16 @@ def claude(agent, model, prompt, dirs, effort=None, cwd=None):
         cmd += ["--add-dir", d]
     t0 = time.time()
     # the prompt goes on stdin: --add-dir is variadic and would swallow a trailing positional prompt
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True, input=prompt, cwd=cwd)
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, input=prompt, cwd=cwd)
+    except OSError as e:          # `claude` is not on PATH: no model ran and nothing was spent
+        return {"is_error": True, "result": f"could not run claude ({e}); run `lacuna doctor`",
+                "wall_s": round(time.time() - t0)}
     try:
         res = json.loads(r.stdout)
     except ValueError:
+        res = None
+    if not isinstance(res, dict):  # not JSON, or JSON that is not a reply object
         res = {"is_error": True, "result": (r.stdout + r.stderr)[-400:]}
     res["wall_s"] = round(time.time() - t0)
     return res
@@ -130,8 +136,10 @@ def after(stage, out_path):
     try:
         if isinstance(cmd, str):
             argv = ["sh", "-c", cmd + ' "$1"', "sh", out_path]
-        else:
+        elif isinstance(cmd, list) and all(isinstance(x, str) for x in cmd):
             argv = [*cmd, out_path]
+        else:
+            raise ValueError("not a command: give a string or a list of strings")
         r = subprocess.run(argv, capture_output=True, text=True)
     except (OSError, ValueError) as e:
         print(f"  after_{stage}: could not run {cmd!r} — {e}. The output is unaffected: {out_path}")
@@ -143,9 +151,14 @@ def after(stage, out_path):
               f"    The output is unaffected: {out_path}")
 
 
-def books_block():
-    idx = sorted(f"{BOOKS_DIR}/{d}/toc.md" for d in os.listdir(BOOKS_DIR)
-                 if os.path.exists(f"{BOOKS_DIR}/{d}/toc.md")) if os.path.isdir(BOOKS_DIR) else []
+def book_indexes():
+    """The toc.md of every split book, sorted."""
+    return sorted(f"{BOOKS_DIR}/{d}/toc.md" for d in os.listdir(BOOKS_DIR)
+                  if os.path.exists(f"{BOOKS_DIR}/{d}/toc.md")) if os.path.isdir(BOOKS_DIR) else []
+
+
+def books_block(idx=None):
+    idx = book_indexes() if idx is None else idx
     if not idx:
         return ""
     return ("Textbooks you may consult (grep first, then read only the lines you need; never a whole chapter):\n"
@@ -187,6 +200,9 @@ def need_venv():
         sys.exit(EX_PARSE)
 
 
+TEXT_EXTS = (".md", ".markdown", ".txt", ".text", ".rst")
+
+
 def to_markdown(path, out_dir, equations=False, parser=None):
     """See below. Raises SystemExit(2) when the document does not exist."""
     """Parse a PDF to reference-stripped markdown; return the .md path (cached by content hash).
@@ -197,14 +213,14 @@ def to_markdown(path, out_dir, equations=False, parser=None):
     if not os.path.isfile(path):
         print(f"ERROR: no such document: {path}", file=sys.stderr)
         sys.exit(EX_INPUT)
-    if path.endswith((".md", ".txt")):
+    if path.lower().endswith(TEXT_EXTS):
         return path
     need_venv()
     h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
     os.makedirs(f"{CACHE}/md", exist_ok=True)
     tag = f"_{parser}" if parser else ("_marker" if equations else "")
     md = f"{CACHE}/md/{os.path.basename(path)[:-4]}_{h}_p{PARSE_VERSION}{tag}.md"
-    if not os.path.exists(md):
+    if not os.path.exists(md) or os.path.getsize(md) == 0:   # 0 bytes: an interrupted parse
         cmd = [VENV, "-I", f"{HERE}/prep_md.py", path, md]
         if equations:
             cmd.append("--equations")
@@ -229,19 +245,44 @@ def cmd_read(a):
         print(f"ERROR: --out {a.out!r} is a file; it must be a directory for notes.", file=sys.stderr)
         sys.exit(EX_INPUT)
     os.makedirs(out_dir, exist_ok=True)
-    a.papers = [os.path.abspath(p) for p in a.papers]
     os.makedirs(f"{CACHE}/notes", exist_ok=True)
+    # Each document's note is <out>/<its name>.md. Settle every name before anything is parsed or
+    # paid for: two documents with one name once shared a note path, and the parallel readers then
+    # cached one paper's note under the other's key, permanently.
+    papers, by_note = [], {}
+    for src in map(os.path.abspath, a.papers):
+        stem = os.path.splitext(os.path.basename(src))[0]
+        note = f"{out_dir}/{stem}.md"
+        other = by_note.get(note.casefold())          # casefold: macOS treats Paper.md as paper.md
+        if other and os.path.realpath(other) == os.path.realpath(src):
+            continue                                  # the same document twice: read it once
+        if other:
+            print(f"ERROR: {other} and {src} would both be noted as {note}. Rename one, or read "
+                  f"them into separate --out directories. Nothing was sent to a model.", file=sys.stderr)
+            sys.exit(EX_INPUT)
+        # A note may only replace a note this tool wrote. Anything else at that path is the user's:
+        # a hand-edited note, an unrelated file in a vault, or the document itself.
+        if os.path.lexists(note) and not lacuna_wrote(note, stem):
+            why = ("is inside --out, so its note would replace the document itself"
+                   if os.path.realpath(note) == os.path.realpath(src) else
+                   f"would overwrite {note}, which Lacuna did not write (or which has been edited since)")
+            print(f"ERROR: {src} {why}. Move it, or choose another --out. Nothing was sent to a model.",
+                  file=sys.stderr)
+            sys.exit(EX_INPUT)
+        by_note[note.casefold()] = src
+        papers.append((src, stem, note))
     reader_model = a.model or lacuna_config.model("reader")
-    books = "" if a.no_books else books_block()
+    idx = [] if a.no_books else book_indexes()
+    books = books_block(idx)
     # The cache key must cover every input that changes what the note says. A boolean "books on"
     # is not enough: adding or removing a book changed nothing, so the old note came back as
     # "cached (free)" still citing a book that was no longer there. Nor is the list of books:
     # a book re-split into new chapters is a different book, so the indexes themselves count.
-    indexes = "".join(open(t, "rb").read().decode(errors="ignore") for t in re.findall(r"- index: (\S+)", books))
+    indexes = "".join(open(t, "rb").read().decode(errors="ignore") for t in idx)
     books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]
     reader_effort = lacuna_config.effort("reader")
     jobs = []
-    for src in a.papers:
+    for src, stem, note in papers:
         md = to_markdown(src, out_dir, equations=a.equations, parser=a.parser)
         body = open(md, "rb").read()
         content_h = hashlib.sha256(body).hexdigest()[:12]
@@ -249,9 +290,7 @@ def cmd_read(a):
         key = hashlib.sha256("\0".join(
             [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
-        # md may be "<name>_<pdf-hash>[_<parser>].md" from the parse cache; the note is just <name>.
-        stem = re.sub(r"_[0-9a-f]{12}(_p\d+)?(_[a-z0-9]+)?$", "", os.path.splitext(os.path.basename(md))[0])
-        jobs.append((md, f"{out_dir}/{stem}.md", f"{CACHE}/notes/{stem}_{key}.md"))
+        jobs.append((md, note, f"{CACHE}/notes/{stem}_{key}.md"))
 
     def one(md, out, cached):
         if os.path.exists(cached) and os.path.getsize(cached) > 400:
@@ -259,6 +298,7 @@ def cmd_read(a):
             return os.path.basename(out), "cached (free)", 0.0
         # Remove any earlier note first, so "the file exists" can only mean this call wrote it.
         # Otherwise a refusal on a re-run reports success and caches the stale note under a new key.
+        # (Only ever a note this tool wrote: anything else at this path stopped the run above.)
         if os.path.exists(out):
             os.remove(out)
         prompt = "\n\n".join(x for x in [
@@ -273,14 +313,15 @@ def cmd_read(a):
         # docs/extending.md, which is per model x effort.
         ledger({"stage": "read", "model": reader_model, "effort": reader_effort,
                 "paper": os.path.basename(md), "cost": usd(res), "wall_s": res["wall_s"],
-                "books": not a.no_books, "wrote_note": ok,
+                "books": bool(idx), "wrote_note": ok,
                 "source_tokens": round(os.path.getsize(md) / 2.9), "is_error": res.get("is_error")})
         if ok:
             shutil.copy(out, cached)
             return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
+        why = (str(res.get("result"))[:120] if res.get("is_error") else
+               "the file it wrote is not a note (see above)" if os.path.exists(out) else "agent produced no note file")
         if os.path.exists(out):
             os.remove(out)      # an apology left in --out would be read as a note by the next synth
-        why = str(res.get("result"))[:120] if res.get("is_error") else "agent produced no note file"
         return os.path.basename(out), f"FAILED ${usd(res):.4f} — {why}", usd(res)
 
     t0, total, failed = time.time(), 0.0, 0
@@ -303,7 +344,39 @@ REFUSAL_MARKERS = (
     "not completed", "cannot complete", "could not complete", "unable to complete",
     "i can't help", "i cannot help", "i'm unable to", "i am unable to", "no files were found",
     "unable to read", "could not read any", "i don't have access",
+    "could not check any", "cannot check any", "unable to check any", "could not verify any",
 )
+
+
+def refusal(head):
+    """The apology a model's output opens with, or None.
+
+    Only the opening counts: the text before the first section heading or list item, which is where
+    a model that could not do the job says so. Inside a section the same words are findings: a
+    correct note was discarded, and paid for again on every retry, for "37 had not completed
+    follow-up". Bare words are not safe either: "blocked" once discarded a note about blocked sampling.
+    """
+    opening = head[:1200]
+    first = re.search(r"(?m)^(?:#{2,6}\s|\s*(?:[-*+]|\d+[.)])\s)", opening)
+    if first:
+        opening = opening[:first.start()]
+    hit = next((m for m in REFUSAL_MARKERS if m in opening.lower()), None)
+    if "BLOCKED" in head[:400]:      # a status marker in capitals, as a blocked agent writes it
+        hit = "BLOCKED"
+    return hit
+
+
+def lacuna_wrote(path, stem):
+    """True when `path` is byte-for-byte a note in the cache: one this tool wrote, and may replace."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        return False
+    with open(path, "rb") as f:
+        body = f.read()
+    for c in glob.glob(f"{glob.escape(CACHE)}/notes/{glob.escape(stem)}_*.md"):
+        with open(c, "rb") as f:
+            if f.read() == body:
+                return True
+    return False
 
 
 def usable_output(path, min_bytes, what, must_contain=()):
@@ -311,8 +384,7 @@ def usable_output(path, min_bytes, what, must_contain=()):
 
     Size alone is not evidence: a model that cannot do the job writes a fluent paragraph saying so.
     Structure is the strongest evidence: a note that lacks the template's headings is not a note,
-    whatever it says. The phrases are the ones an apology uses; bare words are not safe, since
-    "blocked" once discarded a paid note whose claim was about blocked sampling.
+    whatever it says. After that, see refusal().
     """
     if not os.path.exists(path) or os.path.getsize(path) < min_bytes:
         return False
@@ -322,9 +394,7 @@ def usable_output(path, min_bytes, what, must_contain=()):
     if missing:
         print(f"  ! the {what} has no {missing!r} section — treating it as a failed run, not output", file=sys.stderr)
         return False
-    hit = next((m for m in REFUSAL_MARKERS if m in head.lower()), None)
-    if "BLOCKED" in head[:400]:      # a status marker in capitals, as a blocked agent writes it
-        hit = "BLOCKED"
+    hit = refusal(head)
     if hit:
         print(f"  ! the {what} opens with {hit!r} — treating it as a failed run, not output",
               file=sys.stderr)
@@ -354,6 +424,8 @@ def cmd_synth(a):
     need_dir(a.repo, "--repo")
     if a.digest:
         need_file(a.digest, "--digest")
+    if a.status:
+        need_file(a.status, "--status")    # silently ignored, a dead end would be proposed again
     # The agent runs with cwd set to the output directory, so relative inputs would resolve
     # against the wrong place and it would silently read nothing.
     if os.path.isdir(a.out):
@@ -366,6 +438,8 @@ def cmd_synth(a):
         a.notes = os.path.abspath(a.notes)
     if a.digest:
         a.digest = os.path.abspath(a.digest)
+    if a.status:
+        a.status = os.path.abspath(a.status)
     notes = []
     if a.notes:
         if not os.path.isdir(a.notes):
@@ -378,12 +452,21 @@ def cmd_synth(a):
         sys.exit(EX_INPUT)
     out_dir = os.path.dirname(os.path.abspath(a.out)) or "."
     os.makedirs(out_dir, exist_ok=True)
-    tree = subprocess.run(["git", "-C", a.repo, "ls-files"], capture_output=True, text=True).stdout
+    try:
+        tree = subprocess.run(["git", "-C", a.repo, "ls-files"], capture_output=True, text=True).stdout
+    except OSError:                            # no git on this machine
+        tree = ""
     if not tree.strip():
         tree = "\n".join(walk_files(a.repo))   # not a git repo: list it ourselves
     status = find_status(a.repo, a.status)
     tree_path = f"{a.out}.filelist.txt"
     open(tree_path, "w").write(tree)
+    # The agent writes beside --out, never over it. Judged at --out, an earlier run's plan passed for
+    # this run's when the model refused; and an apology written there was taken as input by the next
+    # command. --out is replaced only by output that passed the content check.
+    part = f"{a.out}.partial"
+    if os.path.exists(part):
+        os.remove(part)      # left by an interrupted run; never this run's output
     role = "digester" if a.kind == "digest" else "planner"
     model = a.model or lacuna_config.model(role)
 
@@ -413,19 +496,25 @@ def cmd_synth(a):
         ("Read the README and the main source directories" +
          (f", and the project status file {status} in full — anything it records as tried, rejected or a dead "
           "end must not be re-proposed" if status else "") + "."),
-        task, f"Write the result to {a.out}. Under 2,000 words."])
+        task, f"Write the result to {part}. Under 2,000 words."])
     dirs = [a.repo, out_dir] + ([a.notes] if a.notes else []) + \
            ([os.path.dirname(os.path.abspath(a.digest))] if a.digest else [])
     res = claude("synth", model, prompt, dirs, effort=lacuna_config.effort(role), cwd=out_dir)
-    ok = usable_output(a.out, 800, a.kind)
+    ok = usable_output(part, 800, a.kind)
     ledger({"stage": "synth", "kind": a.kind, "model": model, "effort": lacuna_config.effort(role),
             "notes": len(notes),
             "from_digest": bool(a.digest), "cost": usd(res), "wall_s": res["wall_s"], "wrote": ok,
             "is_error": res.get("is_error")})
     print(f"{a.kind} ({model}): ${usd(res):.3f}, {res['wall_s']}s -> {a.out}")
     if not ok:
-        print(f"ERROR: {model} wrote no output. {str(res.get('result'))[:400]}", file=sys.stderr)
+        for f in (part, tree_path):
+            if os.path.exists(f):
+                os.remove(f)
+        kept = (f"{a.out} was left as it was, and holds an earlier run's output, not this one's."
+                if os.path.exists(a.out) else "Nothing was written.")
+        print(f"ERROR: {model} wrote no usable output. {kept}\n{str(res.get('result'))[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
+    os.replace(part, a.out)
     after("synth", a.out)
 
 
@@ -435,6 +524,13 @@ def cmd_verify(a):
     need_dir(a.repo, "--repo")
     if a.notes:
         need_dir(a.notes, "--notes")
+    # The prompt is all the verifier knows: a relative path there checked nothing and exited 0.
+    a.target, a.repo = os.path.abspath(a.target), os.path.abspath(a.repo)
+    if a.notes:
+        a.notes = os.path.abspath(a.notes)
+    out = f"{a.target}.unverified.md"
+    with open(a.target, "rb") as f:
+        checked = f"sha256 {hashlib.sha256(f.read()).hexdigest()[:12]}"
     prompt = "\n\n".join([
         f"Fact-check this document: {a.target}",
         f"Codebase: {a.repo}" + (f"\nSource notes: {a.notes}" if a.notes else ""),
@@ -453,13 +549,26 @@ def cmd_verify(a):
             "target": os.path.basename(a.target), "cost": usd(res),
             "wall_s": res["wall_s"], "is_error": res.get("is_error")})
     report = str(res.get("result") or "")
-    if res.get("is_error") or not report.strip():
-        print(f"ERROR: the verifier ({vmodel}) returned no usable report. Nothing was written, and "
-              f"{os.path.basename(a.target)} has NOT been fact-checked.\n{report[:400]}", file=sys.stderr)
+
+    def failed(why):
+        # An earlier report may stay only while the document is still the version it checked.
+        stale = os.path.exists(out) and checked not in open(out, errors="ignore").read(400)
+        if stale:
+            os.remove(out)
+        print(f"ERROR: the verifier ({vmodel}) {why}. Nothing was written, and "
+              f"{os.path.basename(a.target)} has NOT been fact-checked."
+              + (" The earlier report described another version of it and was removed." if stale else "")
+              + f"\n{report[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
-    out = f"{a.target}.unverified.md"
+
+    if res.get("is_error") or not report.strip():
+        failed("returned no usable report")
+    hit = refusal(report)     # a reply that checked nothing arrives with is_error: false
+    if hit:
+        failed(f"replied with {hit!r} rather than a report")
     try:
-        open(out, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n{report}\n")
+        open(out, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n"
+                             f"_Checked the version with {checked}._\n\n{report}\n")
         where = out
     except OSError:
         where = "(not saved; printed below)"

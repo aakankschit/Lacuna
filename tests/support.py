@@ -21,8 +21,11 @@ for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
 # The fake model. Logs argv and prompt, then does what FAKE_MODE says: "ok" writes a plausible note
 # or plan so the pipeline's own bookkeeping is exercised; "refuse" and "garbage" are the two ways a
 # real run fails; "apology" is the dangerous one — a long, fluent failure that clears a size check.
+# "reply" is how a real model declines: is_error false, FAKE_REPLY as its text, nothing written.
+# "notdict" does the work but replies with JSON that is not an object; "hang" does the work and
+# never returns, so a test can interrupt a run part-way.
 FAKE_CLAUDE = r'''#!{py}
-import json, os, re, sys
+import json, os, re, sys, time
 prompt = sys.stdin.read()
 argv = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as f:
@@ -34,6 +37,16 @@ if mode == "refuse":
 if mode == "garbage":
     print("overloaded, not json")
     sys.exit(1)
+if mode == "reply":
+    print(json.dumps({{"is_error": False, "result": os.environ["FAKE_REPLY"], "total_cost_usd": 0.002}}))
+    sys.exit(0)
+
+def done(reply):
+    if mode == "hang":
+        time.sleep(60)
+    print(json.dumps([reply] if mode == "notdict" else reply))
+    sys.exit(0)
+
 note = re.search(r"(?m)^- (\S+) -> (\S+)$", prompt)
 plan = re.search(r"Write the result to (\S+)\.", prompt)
 target = (note and note.group(2)) or (plan and plan.group(1))
@@ -58,13 +71,13 @@ if note:
     with open(target, "w") as f:
         f.write("# A note ({{}})\n\n## Claim\n{{}}\n{{}}\nmodel={{}}\n\n## Key results\n".format(
             os.path.basename(note.group(1)), brief, books, model) + ("Finding with a number, 42 units. " * 40))
-    print(json.dumps({{"is_error": False, "result": target, "total_cost_usd": 0.012}}))
-    sys.exit(0)
+    done({{"is_error": False, "result": target, "total_cost_usd": 0.012}})
 if plan:
+    objective = next((l for l in prompt.splitlines() if l.startswith("Objective:")), "")
     with open(target, "w") as f:
-        f.write("# Development plan\n\n## 1. A real proposal\n\n" + ("Substantive plan content naming src/widget/sampler.py. " * 60))
-    print(json.dumps({{"is_error": False, "result": target, "total_cost_usd": 0.3}}))
-    sys.exit(0)
+        f.write("# Development plan\n\n{{}}\n\n## 1. A real proposal\n\n".format(objective)
+                + ("Substantive plan content naming src/widget/sampler.py. " * 60))
+    done({{"is_error": False, "result": target, "total_cost_usd": 0.3}})
 print(json.dumps({{"is_error": False, "result": "nothing to do", "total_cost_usd": 0.0}}))
 '''
 
