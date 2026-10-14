@@ -28,6 +28,7 @@ for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
 # gives. "clobber" writes its plan over --out itself instead of the .partial it was given.
 # "body" writes exactly FAKE_BODY to the note or plan path and replies FAKE_REPLY (default: the path).
 # In any mode, FAKE_EDIT names a file the fake appends a line to while it runs: a user editing it then.
+# FAKE_REFUSE_IF refuses any prompt that contains it, so one document of a run can fail.
 FAKE_CLAUDE = r'''#!{py}
 import json, os, re, sys, time
 prompt = sys.stdin.read()
@@ -41,6 +42,8 @@ if _d:
 if os.environ.get("FAKE_EDIT"):
     with open(os.environ["FAKE_EDIT"], "a") as f:
         f.write("EDITED WHILE THE MODEL RAN\n")
+if os.environ.get("FAKE_REFUSE_IF") and os.environ["FAKE_REFUSE_IF"] in prompt:
+    mode = "refuse"
 if mode == "refuse":
     print(json.dumps({{"is_error": True, "result": "I can't help with that.", "total_cost_usd": 0.002}}))
     sys.exit(0)

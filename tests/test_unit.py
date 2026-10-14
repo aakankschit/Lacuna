@@ -552,6 +552,28 @@ class TestOwnershipRecord(unittest.TestCase):
                     self.assertFalse(any("pending" in e for e in files.values()), "a reservation holds nothing now")
                     L.not_ours(note, source=os.path.join(d, "doc.md"))
 
+    def test_recording_never_raises_and_a_moved_file_leaves_the_record(self):
+        """record() runs after the stage has been paid for: a record that cannot be written costs a
+        question on the next run, never this run's output. A file an after.* hook moved away is no
+        longer Lacuna's to account for."""
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as d:
+            note = write(os.path.join(d, "n.md"), "note")
+            if os.geteuid() != 0:
+                os.chmod(d, 0o555)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    L.record(note)
+                os.chmod(d, 0o755)
+                self.assertIn("could not record", err.getvalue())
+            L.record(note)
+            before = L.as_recorded(d)
+            os.remove(note)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                L.rerecord(d, before)
+            self.assertEqual((L._owners(d)[0], err.getvalue()), ({}, ""))
+
     def test_two_processes_recording_into_one_directory_lose_nothing(self):
         """Two `lit read` runs into one --out kept 9 of 16 entries: each read the record, added its
         own and replaced the file. The next run refused the other 7 notes as not Lacuna's."""
@@ -687,7 +709,11 @@ class TestCacheWritesAreAtomic(unittest.TestCase):
                 lit_pipeline._atomic_copy(__file__, dst)
             self.assertFalse(os.path.exists(dst))
             self.assertEqual([f for f in os.listdir(d) if f.endswith(".part")], [])
-
+            dst = os.path.join(d, "c.md")              # the copy is made, then cannot be renamed
+            with mock.patch.object(lit_pipeline.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    lit_pipeline._atomic_copy(__file__, dst)
+            self.assertEqual(os.listdir(d), [], "the temporary was left beside the cache entry")
 
 
 class TestStatusMarkerEdges(unittest.TestCase):

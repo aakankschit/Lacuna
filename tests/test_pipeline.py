@@ -156,6 +156,22 @@ class TestNoteCache(Pipeline):
         self.assertEqual(len(self.calls()), 6)
         self.assertEqual(read(os.path.join(other, "alpha.md")), self.note(), "a hit reaches a new --out directory")
 
+    def test_a_cache_entry_is_whole_or_absent(self):
+        """An interrupted copy into the cache left a truncated note, served as a free hit from then
+        on. A copy that fails partway now leaves no entry; the note itself is paid for and placed."""
+        torn = ("import os, shutil\n_copy = shutil.copyfile\n"
+                "def torn(a, b, **k):\n"
+                "    _copy(a, b, **k)\n"
+                "    if os.sep + 'cache' + os.sep in b:\n"
+                "        d = open(b).read(); open(b, 'w').write(d[:500]); raise OSError('interrupted')\n"
+                "shutil.copyfile = torn\n")
+        r = self.read(prelude=torn)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("could not cache the note", r.stderr)
+        r = self.read()
+        self.assertNotIn("cached (free)", r.stdout, "a torn cache entry was served as a free hit")
+        self.assertEqual(len(self.calls()), 2)
+
     def test_one_note_per_document_and_only_over_its_own_notes(self):
         """Note names were taken from the parse-cache file name with any 12-hex "hash" stripped, so
         notes_3f2a9c1b7d4e.md and notes.md shared one note path, and the parallel readers cached
@@ -316,6 +332,24 @@ class TestOwnership(Pipeline):
         self.assertIn("EDITED", read(note + ".rejected"), "a note that changed during a failed run is moved aside")
         self.assertFalse(os.path.exists(note), "and not left for the next synth to read")
 
+    def test_each_note_is_recorded_when_it_is_written(self):
+        """A run where one document is refused exits 4 and never reaches the after.read hook. The
+        notes it did write, read or served from the cache, must be recorded all the same: otherwise
+        deleting the cache made the next read refuse them as not Lacuna's."""
+        beta = os.path.join(self.docs, "beta.md")
+        self.assertEqual(self.lacuna("lit", "read", self.alpha, "--out", self.p("first")).returncode, 0)
+        for label in ("read by the model", "served from the cache"):
+            with self.subTest(label):
+                out = self.p(label.split()[0])
+                if label == "read by the model":
+                    shutil.rmtree(os.path.join(self.data, "cache"))
+                r = self.lacuna("lit", "read", self.alpha, beta, "--out", out, FAKE_REFUSE_IF="beta.md")
+                self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+                self.assertIn("cached (free)" if label != "read by the model" else "1/2 notes written", r.stdout)
+                shutil.rmtree(os.path.join(self.data, "cache"))
+                r = self.lacuna("lit", "read", self.alpha, "--out", out)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_a_document_inside_out_under_another_spelling_survives_overwrite(self):
         """macOS folds case and Unicode form: Paper.MD inside --out is the note path Paper.md. The
         self-check compared realpaths, which differ, so --overwrite deleted the document and the
@@ -380,6 +414,13 @@ class TestOwnership(Pipeline):
         self.assertEqual(read(note), first, "the first paper's note was replaced by the second's")
         self.assertEqual(read_(paper, "--overwrite").returncode, 0, "--overwrite is the way forward")
         self.assertIn("Paper B", read(note))
+        copy = write(self.p("copy.md"), read(note))       # a link is the user's, even to the same bytes
+        os.remove(note)
+        os.symlink(copy, note)
+        calls = len(self.calls())
+        self.assertEqual((read_(paper).returncode, len(self.calls())), (2, calls))
+        os.remove(note)
+        write(note, read(copy))
 
         self.assertEqual(self.read().returncode, 0)               # notes for synth to read
         plan, x = os.path.join(lit, "plan.md"), write(os.path.join(lit, "x.md"), "# X\n" + "x " * 300)
@@ -572,6 +613,7 @@ class TestMoneyGuarantees(Pipeline):
         venv_py = write(self.p("venv", "python"), FAKE_PARSER_PY, 0o755)
         long_pdf = write(self.p("long", "x" * nm), "%PDF")       # no extension: parsed, noted as <name>.md
         long_target = write(self.p("long", "t" * (nm - 8) + ".md"), "# Plan\n" + "x" * 500)
+        os.makedirs(self.p("dirnote", "alpha.md", "inner"))
         cases = [
             ("two documents, one name", ("lit", "read", *twins, "--out", self.notes)),
             ("a .txt and a .pdf, one name", ("lit", "read", txt, pdf, "--out", self.notes)),
@@ -589,6 +631,10 @@ class TestMoneyGuarantees(Pipeline):
             ("synth from notes it cannot read", ("lit", "synth", "--notes", os.path.dirname(locked), "--repo",
                                                  self.repo, "--out", plan)),
             ("read into a directory it cannot write", ("lit", "read", self.alpha, "--out", self.p("readonly"))),
+            ("synth into a directory it cannot write", ("lit", "synth", "--notes", self.notes, "--repo", self.repo,
+                                                       "--out", self.p("readonly", "plan.md"))),
+            ("a directory at the note path, even with --overwrite", ("lit", "read", self.alpha, "--out",
+                                                                     self.p("dirnote"), "--overwrite")),
             ("synth missing --status", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out", plan,
                                         "--status", gone)),
             ("missing document", ("lit", "read", f"{self.docs}/nope.md", "--out", self.notes)),
@@ -702,7 +748,16 @@ class TestMoneyGuarantees(Pipeline):
         write(plan, read(plan) + "\nA new proposal.\n")
         self.assertEqual(self.verify(plan, mode="refuse").returncode, 4)
         self.assertFalse(os.path.exists(report), "a report must not sit beside a version it never checked")
-
+        victim = write(self.p("victim.md"), "keep me\n")
+        os.symlink(victim, report)
+        self.assertEqual(self.verify(plan, "--overwrite").returncode, 0)
+        self.assertEqual(read(victim), "keep me\n", "--overwrite wrote the report through a symlink")
+        os.remove(report)
+        os.makedirs(report)                               # where a recorded report was
+        calls = len(self.calls())
+        for extra in ((), ("--overwrite",)):
+            r = self.verify(plan, *extra)
+            self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stdout + r.stderr)
 
     def test_a_missing_tool_or_an_odd_reply_stays_inside_the_exit_codes(self):
         """0, 2, 3, 4 is the contract a caller branches on. A traceback (exit 1) after a paid call

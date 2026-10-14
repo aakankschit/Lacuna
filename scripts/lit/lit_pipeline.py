@@ -1167,6 +1167,10 @@ def cmd_verify(a):
     out = f"{a.target}.unverified.md"
     need_short_names([out], "Rename --target, or copy it under a shorter name.")
     need_hold(out, "writing a verify report to")
+    if os.path.isdir(out) and not os.path.islink(out):      # read and synth refuse one too
+        print(f"ERROR: {out} is a directory, so the report has nowhere to go. Nothing was sent to a model.",
+              file=sys.stderr)
+        sys.exit(EX_INPUT)
     why = not_ours(out, stage="verify")       # a report annotated by hand is the user's
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "
