@@ -501,3 +501,31 @@ class TestShippedExampleIsActuallyShipped(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0,
                                 "a .gitignore rule excludes examples/notes, so it will never "
                                 "reach a user even though it is present locally")
+
+
+class TestAliasPricing(unittest.TestCase):
+    """`claude --model` and config.json both accept bare aliases, but a price table is keyed by
+    concrete ids and matched by substring — so "sonnet" matched nothing and every cost involving
+    an alias came out as zero or "unpriced". Found by an independent mutation battery: the 193-test
+    suite that existed when this was fixed did not catch its removal."""
+
+    def test_every_alias_resolves_to_a_real_price(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "cost"))
+        import lacuna_config, ccost
+        for alias in ("haiku", "sonnet", "opus", "fable"):
+            with self.subTest(alias):
+                concrete = lacuna_config.resolve(alias)
+                self.assertNotEqual(concrete, alias, f"{alias} must resolve to a concrete id")
+                self.assertIn(concrete, lacuna_config.prices(), f"{concrete} is not in the table")
+                row = ccost.price(alias)
+                self.assertEqual(row, ccost.price(concrete),
+                                 f"{alias} must price the same as {concrete}")
+        # an alias must not silently fall through to the generic fallback
+        self.assertNotEqual(ccost.price("haiku"), ccost.price("totally-unknown-model"),
+                            "an alias priced as the fallback is the zero-cost bug returning")
+
+    def test_a_pinned_id_still_works(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "cost"))
+        import ccost
+        self.assertGreater(ccost.price("claude-opus-5-20260101")[0], 0)
