@@ -58,7 +58,13 @@ if os.path.exists(_user_cal):
             _cal = json.load(f)
         if cal_problem(_cal):
             raise ValueError(cal_problem(_cal))
-        CAL_PATH = _user_cal
+        if _cal.get("_source") == "upstream":
+            # `doctor` used to copy the shipped file here, which then beat every later release's
+            # numbers. A copy still tagged upstream is the plugin's, not the user's.
+            print(f"note: {_user_cal} is a stale copy of the shipped calibration; using the plugin's "
+                  f"({os.path.join(HERE, 'calibration.json')}). You can delete it.", file=sys.stderr)
+        else:
+            CAL_PATH = _user_cal
     except (OSError, ValueError, RecursionError) as e:   # a deeply nested file recurses, not ValueErrors
         CAL_WARNING = f"your calibration {_user_cal} is unusable ({e}); using the shipped one instead"
 with open(CAL_PATH) as f:

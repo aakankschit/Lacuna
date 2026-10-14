@@ -183,7 +183,15 @@ class TestEstimate(Sandbox):
         self.assertEqual(doc["calibration"], {"source": "upstream", "path": os.path.realpath(SHIPPED_CAL),
                                               "measured": self.shipped()["_measured"]})
         self.assertIn("Calibration: upstream", self.est(self.doc("a.md")).stdout)
-        for src, want in (("upstream", "upstream"), (None, "yours"), ("somebody", "yours")):
+        # a data-directory copy still tagged upstream is a stale copy of the shipped file (doctor
+        # used to make one): the plugin's current numbers win, and the user is told it can go
+        self.cal({"_source": "upstream", "old": {"low": {"usd_per_ktok": .007, "minutes_per_paper": 1.5}}})
+        r = self.est(self.doc("a.md"), "--json")
+        doc = json.loads(r.stdout)
+        self.assertEqual(doc["calibration"]["path"], os.path.realpath(SHIPPED_CAL))
+        self.assertNotIn("old", {e["model"] for e in doc["estimates"]})
+        self.assertIn("stale copy", r.stderr)
+        for src, want in ((None, "yours"), ("somebody", "yours")):
             with self.subTest(src=src):
                 self.cal({**({"_source": src} if src else {}), "mine": {"low": {"usd_per_ktok": .007, "minutes_per_paper": 1.5}}})
                 doc = self.est_json(self.doc("a.md"))

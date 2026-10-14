@@ -389,6 +389,7 @@ MUTANTS = [
     ("config-empty-string-is-a-value", CFG, "            if v is None or (isinstance(v, str) and not v.strip()):", "            if v is None:"),
     ("config-json-allows-nan", CFG, '            shown["budget_warn_usd"] = None', "            pass"),
     ("price-key-keeps-claude-prefix", CFG, "    return k[len(\"claude-\"):] if k.startswith(\"claude-\") else k", "    return k"),
+    ("estimate-stale-upstream-copy-wins", COST, '        if _cal.get("_source") == "upstream":', "        if False:"),
     # ---- the gate itself: a stale anchor read as a test gap at 0.2.0
     ("stale-anchor-runs-anyway", MUTATE, "    if stale:\n        print(f\"STALE ANCHORS", "    if False:\n        print(f\"STALE ANCHORS"),
     ("battery-skips-pass", "tools/mutation_battery.py", "return 1 if missed else 2 if skipped and not allow_skips else 0",
