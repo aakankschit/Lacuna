@@ -363,7 +363,7 @@ MUTANTS = [
     ("pricing-not-an-object-not-recorded", CFG, "        if src and doc not in ({}, None):", "        if False:"),
     ("config-types-unchecked", CFG, "    _validate(cfg)\n", "    pass\n"),
     ("config-empty-string-is-a-value", CFG, "            if v is None or (isinstance(v, str) and not v.strip()):", "            if v is None:"),
-    ("config-json-allows-nan", CFG, "print(json.dumps(shown, indent=2, allow_nan=False))", "print(json.dumps(shown, indent=2))"),
+    ("config-json-allows-nan", CFG, '            shown["budget_warn_usd"] = None', "            pass"),
     ("price-key-keeps-claude-prefix", CFG, "    return k[len(\"claude-\"):] if k.startswith(\"claude-\") else k", "    return k"),
     # ---- the gate itself: a stale anchor read as a test gap at 0.2.0
     ("stale-anchor-runs-anyway", MUTATE, "    if stale:\n        print(f\"STALE ANCHORS", "    if False:\n        print(f\"STALE ANCHORS"),
