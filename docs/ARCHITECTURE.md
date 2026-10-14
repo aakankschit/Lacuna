@@ -67,12 +67,23 @@ Other invariants:
 - **Agents run with `cwd` set to the output directory**, so every path handed to one must be
   absolute. Relative paths produce an agent that can read nothing and writes an apology.
 - **Success is judged by content, not size** (`usable_output`). A model that cannot do the job
-  writes a long, fluent explanation that passes any byte threshold. An honest one may say it has
-  nothing ("PARTIAL: literature notes unreadable"): a status marker on the opening line (`BLOCKED`,
-  `PARTIAL:`, `INCOMPLETE:`, after headings and furniture) fails the stage — only there, because the
-  same words lower down are findings, and `synth`/`verify` agents are told to reply
-  `INCOMPLETE: <reason>` rather than write a document about failing — their own word wins.
-- A failed stage must exit non-zero and cache nothing. A refusal must never become a note.
+  writes a long, fluent explanation that passes any byte threshold; an honest one may say it has
+  nothing ("PARTIAL: literature notes unreadable"). Only the **opening** is judged: the first
+  statement below any YAML frontmatter, headings and furniture (a callout tag, a quote mark, a list
+  number, a code fence, `Status:`), and the headings above it. The same words lower down are
+  findings. At the opening, a status word standing alone (`BLOCKED`, `PARTIAL:`, `INCOMPLETE:`, "Not
+  completed.") or the agent saying it cannot do the job ("I couldn't open any of the notes",
+  "Unfortunately, I was unable to access…", "I'm sorry, but I can't help…") fails the stage. A verify
+  finding in its `claim -> what you found` form never does. The comment above `refusal()` gives the
+  rule, and what it deliberately lets through ("we", a numbered part such as "Table 3").
+- **Every agent is told to reply `INCOMPLETE: <reason>`** (reader, `synth`, `verify`) rather than
+  write a document about failing, and its reply is read: a line that opens with `INCOMPLETE` fails the
+  stage wherever it stands in the reply. Its own word wins.
+- A failed stage must exit non-zero and cache nothing. A refusal must never become a note: a read
+  whose note or reply declares failure files nothing, caches nothing and exits 4. A cached note is
+  judged by the current check on every hit, so a note cached before the check learned a shape is read
+  again (paid) rather than served free. The check covers the shapes models have been seen to use. A
+  refusal phrased outside them is still filed, so the reply is the channel to rely on.
 - **Lacuna replaces a file in a user's directory only if it wrote it** — for the same document, in
   the case of a note — and nobody has edited it since. The evidence is `.lacuna.json` beside the
   files (`record`, `not_ours`), never the cache: the cache knows that Lacuna wrote some note, not
