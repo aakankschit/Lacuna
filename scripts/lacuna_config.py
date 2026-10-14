@@ -127,7 +127,9 @@ def _validate(cfg):
     recorded. config.json is hand-edited: `"cache": true` made a directory named ./True, and a
     number for a model crashed `estimate`, `read` and `synth`. Empty means "use the default"."""
     for section, body in DEFAULTS.items():
-        if not isinstance(body, dict):
+        # `after` is not checked here: a hook may be a command string or an argv list, and
+        # lit_pipeline.after() reports one it cannot run.
+        if not isinstance(body, dict) or section == "after":
             continue
         got = cfg.get(section)
         if not isinstance(got, dict):

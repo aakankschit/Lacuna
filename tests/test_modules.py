@@ -1021,7 +1021,7 @@ class TestConfigReport(Sandbox):
         doc = self.doc_file()
         for cfg in ({"models": {"planner": 5}}, {"models": {"planner": ["sonnet"]}}, {"models": {"reader": {"id": "x"}}},
                     {"effort": {"reader": 5}}, {"paths": {"cache": True}}, {"paths": {"python": ["a"]}},
-                    {"after": {"read": 5}}, {"paths": {"cache": "a\u0000b"}}, {"models": {"reader": "  "}}):
+                    {"after": {"read": 5}}, {"after": {"read": ["/bin/echo", "x"]}}, {"paths": {"cache": "a\u0000b"}}, {"models": {"reader": "  "}}):
             with self.subTest(cfg):
                 self.config(cfg)
                 for args in (("config",), ("config", "--json"), ("lit", "estimate", doc, "--json"), ("lit", "estimate", doc)):
