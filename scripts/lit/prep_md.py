@@ -18,8 +18,11 @@ import lacuna_config
 DATA = lacuna_config.DATA
 # A reference-list heading. The leading junk covers numbered headings, bold markers and ACS's
 # "■ REFERENCES", which pymupdf4llm renders as "# ■<sup>**REFERENCES**</sup>" — hence the tags.
-REF = re.compile(r"\n[#*\s■□●▪•]*(?:<[^>\n]*>)*\**\s*(?:\d+[.)]\s*)?(References|Bibliography|"
-                 r"References and Notes|Literature Cited)\**(?:<[^>\n]*>)*[:\s]*\n", re.I)
+# The heading is the whole line, so "References to prior work" is a section, not a list. A bare
+# "Literature" is left out on purpose: it is as often a literature review as a reference list.
+REF = re.compile(r"\n[#*\s■□●▪•]*(?:<[^>\n]*>)*\**\s*(?:\d+[.)]\s*)?(References?(?: and Notes| Cited| List)?|"
+                 r"Notes and References|Bibliography|Literature Cited|Cited Literature|Works Cited|"
+                 r"List of References)\**(?:<[^>\n]*>)*[:\s]*\n", re.I)
 # One citation entry. Measured on three journal papers, the list cannot be cut as a block: a
 # "Publisher's Note" box lands between entries 2 and 3, Nature puts a second list before Methods,
 # and acknowledgements and Extended Data legends follow the last. So each paragraph is judged.

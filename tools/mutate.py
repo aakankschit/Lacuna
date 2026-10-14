@@ -122,6 +122,8 @@ MUTANTS = [
     ("parse-error-keeps-traceback-noise", PREP, 'if l.strip() and not l.startswith((" ", "\\t")) and not l.lstrip().startswith(\'File "\')]', 'if l.strip() and not l.lstrip().startswith(("File \\"", "  "))]'),
     ("wrap-drops-words", PREP, "textwrap.wrap(ln, 300, break_long_words=False) or [\"\"]", "[ln[:300]]"),
     ("parser-flag-ignored", PREP, '    if "--parser" in sys.argv:', "    if False:"),
+    ("refs-sibling-headings-missed", PREP, '(References?(?: and Notes| Cited| List)?|"\n                 r"Notes and References|Bibliography|Literature Cited|Cited Literature|Works Cited|"\n                 r"List of References)',
+     '(References|Bibliography|"\n                 r"References and Notes|Literature Cited)'),
     ("refs-list-never-ends", PREP, "            in_list = False\n", "            in_list = True\n"),
     ("refs-entry-is-number-and-year", PREP, "return bool(m and YEAR.search(rest) and (AUTHOR.match(rest) or VENUE.search(rest)))",
      "return bool(m and YEAR.search(rest))"),

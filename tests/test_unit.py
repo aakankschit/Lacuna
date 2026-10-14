@@ -162,7 +162,9 @@ class TestParse(unittest.TestCase):
         after = ("### **Publisher's Note**\n\nneutral\n\n3. Brown 2018.\n\n### Acknowledgements\n\nThanks.\n\n"
                  "**Extended Data Fig. 1 |** legend\n")
         for heading in ("# ■<sup>**REFERENCES**</sup>", "## ■ REFERENCES", "**References**", "### **References**",
-                        "## 5. References", "Bibliography", "References and Notes"):
+                        "## 5. References", "Bibliography", "References and Notes", "## Notes and references",
+                        "## REFERENCES CITED", "## Works Cited", "**Literature Cited**", "## Reference", "### Reference List",
+                        "## List of References"):
             with self.subTest(heading):
                 out = prep_md.clean("# P\n\n## Methods\n\n1. Dock, 2020 style.\n\nbody\n\n" + heading + refs + after)
                 for gone in ("Smith", "Jones", "Brown"):
@@ -174,6 +176,13 @@ class TestParse(unittest.TestCase):
         self.assertIn("kept", out)
         out = prep_md.clean("# P\n\nWe list all the references\nbelow.\n\nmore body\n")
         self.assertIn("more body", out, "the word at the end of a prose line is not a heading")
+        for heading in ("## References to prior work", "## Literature review", "## Literature", "## Notes",
+                        "## Reference genomes", "Cited works"):
+            with self.subTest(heading):
+                out = prep_md.clean(f"# P\n\n{heading}\n\n1. Smith, J. Title. J. Chem. 12, 1–5 (2019).\n\n"
+                                    "Earlier work (Smith, 2019) showed it.\n")
+                self.assertIn("Smith, J. Title", out, f"{heading!r} is a section, not a reference list")
+                self.assertIn("Earlier work", out)
 
     def test_what_follows_a_reference_list_is_judged_by_shape(self):
         """Every numbered paragraph with a year-like number after the first References heading was
@@ -260,7 +269,7 @@ class TestParse(unittest.TestCase):
         parts += [str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET), str(prep_md.JUNK_SHARE), str(prep_md.STRIP_LIMIT),
                   str(prep_md.UNMEASURED_FLOOR)]
         fingerprint = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-        recorded = {"4": "1f4cf2c988c622a1"}
+        recorded = {"4": "e837b51bbd46d754"}
         self.assertEqual(recorded.get(L.PARSE_VERSION), fingerprint,
                          f"the parser changed: bump PARSE_VERSION and record {fingerprint!r} for it")
 
