@@ -71,11 +71,14 @@ Other invariants:
   nothing ("PARTIAL: literature notes unreadable"). Only the **opening** is judged: the first
   statement below any YAML frontmatter, headings and furniture (a callout tag, a quote mark, a list
   number, a code fence, `Status:`), and the headings above it. The same words lower down are
-  findings. At the opening, a status word standing alone (`BLOCKED`, `PARTIAL:`, `INCOMPLETE:`, "Not
-  completed.") or the agent saying it cannot do the job ("I couldn't open any of the notes",
-  "Unfortunately, I was unable to access…", "I'm sorry, but I can't help…") fails the stage. A verify
-  finding in its `claim -> what you found` form never does. The comment above `refusal()` gives the
-  rule, and what it deliberately lets through ("we", a numbered part such as "Table 3").
+  findings. At the opening, two things fail the stage. One is a status word set off as the
+  document's state: `(BLOCKED)`, `— Blocked by …`, `PARTIAL:`, `INCOMPLETE:`, "Not completed.". A
+  status word inline, in code or in a name such as PARTIAL LEAST SQUARES does not count, and neither
+  does "Blocked: none". The other is the agent saying it cannot do the job ("I couldn't open any of
+  the notes", "Unfortunately, I was unable to access…", "I'm sorry, but I can't help…"). A verify
+  finding in its `claim -> what you found` form never fails it. The comments above `refusal()` and
+  `_STATUS_WORD` give the rules, and what they deliberately let through ("we", a numbered part such
+  as "Table 3", a status tag on a list item).
 - **Every agent is told to reply `INCOMPLETE: <reason>`** (reader, `synth`, `verify`) rather than
   write a document about failing, and its reply is read: a line that opens with `INCOMPLETE` fails the
   stage wherever it stands in the reply. Its own word wins.

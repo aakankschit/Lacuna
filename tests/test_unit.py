@@ -704,19 +704,109 @@ class TestStatusMarkerEdges(unittest.TestCase):
         import lit_pipeline
         self.declared = lit_pipeline.declared_failure
 
-    def test_a_marker_reporting_none_is_a_clean_result(self):
-        for text in ("# Blocked: none. All dependencies are in the tree.",
-                     "Blocked: none. All dependencies are in the tree.",
-                     "# Plan — PARTIAL: 0", "INCOMPLETE: nil"):
-            with self.subTest(text[:40]):
-                self.assertIsNone(self.declared(text), "a count of none is not a declared failure")
+    # The rows are the 0.3.1 fix review's table (F = must fail, P = must pass; the ids are its own),
+    # each a shape a real model could write. Each is judged as the opening of a plan and as a reply.
+    BODY = "\n\n## 1. A real proposal\n\n" + "Substantive plan content naming src/widget/sampler.py. " * 60
 
-    def test_a_standalone_marker_in_a_title_is_a_failure(self):
-        for text in ("# Development plan (BLOCKED)", "# Development plan — BLOCKED",
-                     "# Development plan: BLOCKED", "# Development plan (PARTIAL / BLOCKED)",
-                     "Status: INCOMPLETE — no literature was readable"):
-            with self.subTest(text[:40]):
-                self.assertTrue(self.declared(text), text)
+    def judged(self, text):
+        return L.refusal((text + self.BODY)[:1200]), L.reply_failure(text)
+
+    def test_a_status_word_set_off_in_the_opening_is_a_failure(self):
+        for text, cid in [
+            ('# Development plan (BLOCKED)', 'F01'),
+            ('# Development plan — BLOCKED', 'F02'),
+            ('# Development plan: BLOCKED', 'F03'),
+            ('# Development plan [BLOCKED]', 'F04'),
+            ('# Development plan **BLOCKED**', 'F05'),
+            ('# Development plan — BLOCKED.', 'F06'),
+            ('# Development plan (PARTIAL)', 'F07'),
+            ('# Development plan — PARTIAL', 'F08'),
+            ('Status: INCOMPLETE', 'F09'),
+            ('# Development plan (Blocked)', 'F10'),
+            ('# Development plan (blocked)', 'F11'),
+            ('# Development plan — Blocked', 'F12'),
+            ('# Development plan – BLOCKED', 'F13'),
+            ('# Development plan - BLOCKED', 'F14'),
+            ('# Development plan (BLOCKED).', 'F15'),
+            ('# Development plan 🚫 BLOCKED', 'F16'),
+            ('# 🚫 Development plan — BLOCKED 🚫', 'F17'),
+            ('# Development plan (*BLOCKED*)', 'F18'),
+            ('Development plan (BLOCKED)\n==========================', 'F19'),
+            ('# Development plan (BLOCKED) #', 'F20'),
+            ('# Development plan (BLOCKED: notes unreadable)', 'F21'),
+            ('# Development plan — BLOCKED by missing notes', 'F22'),
+            ('# Development plan (BLOCKED — see below)', 'F23'),
+            ('# Development plan (BLOCKED - see below)', 'F24'),
+            ('# Development plan: BLOCKED by unreadable notes', 'F25'),
+            ('# Development plan: INCOMPLETE: notes unreadable', 'F26'),
+            ('INCOMPLETE: notes unreadable', 'F27'),
+            ('BLOCKED by missing notes', 'F28'),
+            ('BLOCKED, notes unreadable', 'F29'),
+            ('[BLOCKED] Notes could not be read', 'F30'),
+            ('(BLOCKED) Notes could not be read', 'F31'),
+            ('**BLOCKED** — notes unreadable', 'F32'),
+            ('BLOCKED.', 'F33'),
+            ('INCOMPLETE: none of the literature notes could be read', 'F34'),
+            ('BLOCKED: none of the notes are readable', 'F35'),
+            ('PARTIAL: 0 of 5 notes were readable', 'F36'),
+            ('# Development plan — BLOCKED: none of the notes could be read', 'F37'),
+            ('# Development plan (FAILED)', 'F38'),
+            ('FAILED: the notes could not be read', 'F39'),
+            ('Status: Blocked — the notes are binary', 'F40'),
+            ('**Status:** BLOCKED by unreadable notes', 'F41'),
+            ('# Development plan (BLOCKED; notes unreadable)', 'F42'),
+            ('# Development plan (BLOCKED / PARTIAL)', 'F43'),
+            ('# Development plan — Status: BLOCKED', 'F44'),
+            ('> [!WARNING] BLOCKED', 'F45'),
+            ('# Development plan (status: blocked)', 'F46'),
+            ('# BLOCKED Development plan', 'F47'),
+            ('# Development plan (INCOMPLETE — notes unreadable)', 'F48'),
+            ('# Development plan (PARTIAL - 2 of 5 notes readable)', 'F49'),
+            ('# Development plan (PARTIAL, 2 of 5 notes readable)', 'F50'),
+            ('# Development plan (PARTIAL 2/5 notes)', 'F51'),
+            ('# Development plan (BLOCKED pending readable notes)', 'F52'),
+            ('# Development plan — BLOCKED until the notes are re-read', 'F53'),
+            ('# Development Plan: Blocked — Notes Unreadable', 'F54'),
+            ('# DEVELOPMENT PLAN (BLOCKED)', 'F55'),
+            ('# DEVELOPMENT PLAN — BLOCKED BY UNREADABLE NOTES', 'F56'),
+            ('# Development plan (PARTIAL / BLOCKED)', 'F57'),
+            ('INCOMPLETE: 0 of 12 claims could be checked; the repository is empty', 'F58'),
+            ('# Development plan: Incomplete', 'F59'),
+            ('# Development plan — BLOCKED (notes unreadable)', 'F60'),
+            ('## BLOCKED', 'F61'),
+            ('Development plan — BLOCKED', 'F62'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                doc, reply = self.judged(text)
+                self.assertTrue(doc and reply, f"{cid} {text!r}: document {doc!r}, reply {reply!r}")
+        self.assertEqual(self.declared("**Partial**: the notes were unreadable"), "PARTIAL", "the word, normalised")
+        self.assertEqual(self.declared("# Development plan (FAILED)"), "FAILED")
+
+    def test_a_status_reporting_none_is_a_clean_result(self):
+        """"none" must be the whole value: "INCOMPLETE: none of the files could be opened" is a reason."""
+        for text, cid in [
+            ('Blocked: none.', 'P06'),
+            ('BLOCKED: none', 'P08'),
+            ('PARTIAL: none', 'P09'),
+            ('Blocked: nothing. All dependencies are in the tree.', 'P11'),
+            ('Blocked: N/A', 'P12'),
+            ('Blocked: *none*', 'P13'),
+            ('Blocked — none', 'P14'),
+            ('Blocked: no', 'P15'),
+            ('Blocked: (none)', 'P16'),
+            ('# Development plan\n\n## Status\n\nBlocked: none.', 'P25'),
+            ('PARTIAL: 0', 'P31'),
+            ('Blocked: None — everything needed is in the repo', 'P32'),
+            ('Blocked: **none**', 'P36'),
+            ('Blocked: `none`', 'P37'),
+            ('Blocked: 0 items', 'P38'),
+            ('BLOCKED: no', 'P40'),
+            ('# Blocked: none. All dependencies are in the tree.', 'H1'),
+            ('# Plan — PARTIAL: 0', 'H2'),
+            ('INCOMPLETE: nil', 'H3'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
 
     def test_a_reply_is_searched_for_the_word_it_was_told_to_use(self):
         """Every agent is told to reply INCOMPLETE when it could not read its sources. A real planner
@@ -735,14 +825,47 @@ class TestStatusMarkerEdges(unittest.TestCase):
             with self.subTest(text[:40]):
                 self.assertIsNone(reply_failure(text), text)
 
-    def test_a_marker_inside_a_technique_name_is_not_a_failure(self):
-        """These are real papers. Discarding them is the false positive this keeps swinging into."""
-        for text in ("# PARTIAL LEAST SQUARES for batch correction\n\n## 1. Replace PCA",
-                     "# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim",
-                     "# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim",
-                     "# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA"):
-            with self.subTest(text[:40]):
-                self.assertIsNone(self.declared(text), text)
+    def test_a_status_word_in_a_name_is_not_a_failure(self):
+        """Real titles: a technique, a finding, a code constant. Discarding them is the false positive
+        this check keeps swinging into, and each one is a paid result thrown away."""
+        for text, cid in [
+            ('# PARTIAL LEAST SQUARES for batch correction', 'P01'),
+            ('# BLOCKED GIBBS SAMPLING (Smith 2020)', 'P02'),
+            ('# INCOMPLETE-DATA METHODS (Rubin 1976)', 'P03'),
+            ('# Development plan (PARTIAL LEAST SQUARES)', 'P04'),
+            ('# Development plan (Partial least squares)', 'P05'),
+            ('Status: no blockers', 'P07'),
+            ('# Development plan\n\nTwo proposals follow.\n\n## Blocked items', 'P10'),
+            ('# Development plan: handling INCOMPLETE, noisy labels', 'P17'),
+            ('# Development plan: when are the data INCOMPLETE?', 'P18'),
+            ('# Arithmetic is INCOMPLETE (Gödel 1931)', 'P19'),
+            ('# PARTIAL / FULL pooling for hierarchical models', 'P20'),
+            ('# Development plan: adopt PARTIAL pooling', 'P21'),
+            ('# PLS (PARTIAL LEAST SQUARES) regression', 'P22'),
+            ('# Why phase III trials FAILED (Smith 2020)', 'P23'),
+            ('# FAILED, PARTIAL and COMPLETE responses in oncology (Lee 2019)', 'P24'),
+            ('# Development plan (v2; PARTIAL rollout)', 'P26'),
+            ('Blocked items: none', 'P27'),
+            ('# Development plan — no blockers', 'P28'),
+            ('# PARTIAL-observation MDPs (Kaelbling 1998)', 'P29'),
+            ('# BLOCKED Gibbs (Smith 2020)', 'P30'),
+            ('# BLOCKED-Gibbs vs. collapsed samplers', 'P33'),
+            ('# ON THE INCOMPLETE BETA FUNCTION (Pearson 1934)', 'P34'),
+            ('# Missing data: complete vs. INCOMPLETE (Little 2002)', 'P35'),
+            ('# Development plan (no blockers; PARTIAL LEAST SQUARES first)', 'P39'),
+            ('# Development plan: from FAILED runs to a working sampler', 'P41'),
+            ('# Status of the sampler: PARTIAL', 'P42'),
+            ('# Development plan: retry jobs stuck in `FAILED`', 'A2 code'),
+            ('# Development plan: handle `JobState.PARTIAL` in the scheduler', 'A2 code'),
+            ('# Development plan (the `BLOCKED` state machine)', 'A2 code'),
+            ('# Development plan: emit `INCOMPLETE` when a batch is cut short', 'A2 code'),
+            ('# `FAILED` jobs and how to retry them', 'code at the start'),
+            ('# Missing data INCOMPLETE (Little 2002)', 'A2 inline'),
+            ('# **Blocked** Gibbs sampling (Smith 2020)', 'a bold name'),
+            ('# Plan\n\n- Port the scorer to CUDA (BLOCKED)\n- Add a --json flag', 'a tag on a proposal'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
 
 
 class TestReservationRecord(unittest.TestCase):

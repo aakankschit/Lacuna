@@ -413,8 +413,9 @@ def cmd_read(a):
 # This check has swung between false positives and false negatives three times, each time by adding or
 # removing phrases; it is a grammar now, and these are its three shapes:
 #
-#   1. A status word standing alone: BLOCKED, PARTIAL:, INCOMPLETE:, "Not completed." Followed by
-#      another word it is part of a name: PARTIAL LEAST SQUARES, "Not completed follow-up in 37 of 412".
+#   1. A status word set off as the document's state: "(BLOCKED)", "PARTIAL:", "— Incomplete", "Not
+#      completed." (the rule is above _STATUS_WORD). Inline, or followed by another word, it is part of
+#      a name: PARTIAL LEAST SQUARES, "Arithmetic is INCOMPLETE", "Not completed follow-up in 37 of 412".
 #   2. The agent saying it cannot do the job: an optional lead-in ("Unfortunately,", "I'm sorry, but"),
 #      "I" or no subject, an inability ("cannot", "could not", "was unable to", "was not able to", "do
 #      not have access") and a verb for the job or for getting at its inputs ("help", "complete",
@@ -529,31 +530,66 @@ def reply_failure(reply):
     return next(("INCOMPLETE" for line in reply.splitlines() if declared_failure(line) == "INCOMPLETE"), None)
 
 
-# A status marker opening a document or a reply: BLOCKED, as a blocked agent writes it, or PARTIAL: /
-# INCOMPLETE:, as a real digester titled its file ("PARTIAL: literature notes unreadable", filed as a
-# digest, exit 0) and as the agents are told to reply (INCOMPLETE_RULE). Only the OPENING line counts
-# — the first line that is not a heading, and any headings above it. Matched anywhere at a line
-# start, it discarded correct output: a `BLOCKED` status tag on a proposal, a constant in a code
-# block, an "INCOMPLETE-data" theme. The word must stand alone (a colon, a spaced dash, a full stop
-# or the end of the line after it), so "Blocked Gibbs sampling" and "PARTIAL LEAST SQUARES" are
-# titles. The furniture a model puts around it — backticks echoing the prompt, quotes, a list number,
-# an emoji, a callout, "Status:" — is stripped first.
-STATUS_MARKER = re.compile(r"(?i)^(BLOCKED(?=\**\s*(?:$|[:.\u2013\u2014-]))"
-                           r"|(?:PARTIAL|INCOMPLETE)\**(?=\s*[:.]|\s+[\u2013\u2014-]\s|\s*$))")
-# A heading that ENDS in a bracketed marker, as a real planner titled one: "# Development plan (PARTIAL /
-# BLOCKED)". The marker must be followed by a separator, so "(PARTIAL LEAST SQUARES)" is a title.
-# A status word SHOUTED in a title is a declared failure however it is punctuated: "(BLOCKED)",
-# "— BLOCKED", ": BLOCKED", "(PARTIAL / BLOCKED)". The previous pattern demanded a bracket, a
-# separator AND a second bracket, so it caught only the one form that happened to be in a test —
-# the third time narrowing this check let a refusal through.
-# A status marker stands alone: it ends the title or is followed by punctuation. When another word
-# follows it, it is part of a technique's name — PARTIAL LEAST SQUARES, BLOCKED GIBBS SAMPLING,
-# INCOMPLETE-DATA METHODS — and discarding those papers is the false positive this check keeps
-# swinging back into.
-_TITLE_MARKER = re.compile(r"\b(BLOCKED|PARTIAL|INCOMPLETE|FAILED)\b(?!\s*[-\w])")
-# ...unless the title is reporting that there were none: "Blocked: none", "PARTIAL: 0".
-_MARKER_NEGATED = re.compile(r"(?i)\s*[:=]?\s*(none|nil|0)\b")
+# A status word in the opening — BLOCKED, PARTIAL, INCOMPLETE or FAILED, in any case — declares the
+# document's state, or is part of a name. Only the headings above the opening statement and that
+# statement's first line are read (see above), and there the rule is one rule for both, because the
+# line rule and the title rule each disagreed with the other on hyphens, brackets and FAILED:
+#
+#   It is SET OFF: at the start (after furniture and a `Status:` label), or after an opening bracket,
+#   a dash, a colon, semicolon, comma, slash, an emphasis mark or an emoji: "(BLOCKED)", "— Blocked",
+#   ": INCOMPLETE", "**BLOCKED**", "🚫 BLOCKED".
+#   And it then ENDS, or gives a reason: punctuation ("BLOCKED.", "(PARTIAL, 2 of 5 readable)",
+#   "BLOCKED - see below"), a word that introduces one ("by", "until", "pending"), a count ("PARTIAL
+#   2/5 notes"), or the document's own name ("BLOCKED Development plan") — after any list of other
+#   status words ("(PARTIAL / BLOCKED)").
+#
+# Otherwise it is part of a name: inline in running text ("Arithmetic is INCOMPLETE", "adopt PARTIAL
+# pooling", "complete vs. INCOMPLETE"), in code ("`FAILED`", "`JobState.PARTIAL`"), joined by a hyphen
+# ("INCOMPLETE-DATA", "BLOCKED-Gibbs"), or followed by another word ("PARTIAL LEAST SQUARES", "BLOCKED
+# Gibbs", "Blocked items: none", "FAILED, PARTIAL and COMPLETE responses"). A value that is none
+# ("Blocked: none.", "PARTIAL: 0", "Blocked — N/A") is a clean result, but "none of the notes could be
+# read" is a reason. "Status of the sampler: PARTIAL" is the sampler's status, not the document's.
+# A list item is one entry, a proposal or a finding: there only the status line itself counts, the
+# word at the item's start and punctuated ("1. Incomplete: every note returned EACCES"), so "- **BLOCKED**
+# until the CUDA build lands: port the scorer" is that proposal's precondition.
+_STATUS_WORD = re.compile(r"(?i)\b(blocked|partial|incomplete|failed)\b")
+_NOT_SET_OFF = "`'\".)]"          # code, a quotation, `JobState.PARTIAL` or "vs.", a closing bracket
+_REASON = re.compile(r"(?i)(?:by|until|till|pending|because|due|on|as|since|awaiting|for|while|without|after)\b"
+                     r"|\d|(?:development\s+)?(?:plan|digest|note|report|draft)\b")
+_ALSO = re.compile(r"\s*(?:[/&]|vs\.?)\s*[*_]*[A-Za-z][\w-]*[*_]*|\s*(?:,|\band\b|\bor\b)\s*[*_]*[A-Z]{2,}\b[*_]*")
+_NONE_VALUE = re.compile(r"(?i)\s*[:=\u2013\u2014-]?\s*[*_`(\[]*(?:none|nil|nothing|no|n/a|0)[*_`)\]]*(?:\s+items?)?"
+                         r"\s*(?:$|[.;,!?)\]\u2013\u2014]|-\s)")
 _FURNITURE = re.compile(r"^(?:\[![^\]]*\]|\d+[.)](?=\s)|[^\w])*(?:status\s*[:\u2013\u2014-](?:[^\w])*)?", re.I)
+
+
+def _status_word(line, item=False):
+    """The status word `line` sets off as the document's state, upper-cased, or None (rule above)."""
+    if "->" in line:
+        return None                     # `claim -> what you found`: a verify finding, graded or not
+    text = _FURNITURE.sub("", line, count=1)
+    for m in _STATUS_WORD.finditer(text):
+        before = text[:m.start()].rstrip()
+        if item and before:
+            continue                    # on a list item, only the item's own status line counts
+        last = before[-1:]
+        if last and (last.isalnum() or last in _NOT_SET_OFF or last == "-" and not before[-2:-1].isspace()):
+            continue                    # running text, code, a quotation, "vs.", a hyphenated word
+        if re.search(r"(?i)\bstatus\s+of\b", before):
+            continue                    # "Status of the sampler: PARTIAL"
+        after = text[m.end():]
+        if re.match(r"-\w|`", after):
+            continue                    # INCOMPLETE-DATA, BLOCKED-Gibbs; `FAILED` in code
+        after = after.lstrip("*_")
+        also = _ALSO.match(after)
+        while also and also.group(0):
+            after = after[also.end():]
+            also = _ALSO.match(after)
+        if _NONE_VALUE.match(after):
+            continue                    # "Blocked: none." is a clean result, not a failure
+        rest = after.lstrip()
+        if not rest or not rest[0].isalnum() or not item and _REASON.match(rest):
+            return m.group(1).upper()
+    return None
 
 # An honest model that could not read its sources says so; it must say so where a program can see
 # it, not in a fluent document that passes every check.
@@ -562,23 +598,15 @@ INCOMPLETE_RULE = ("If you could not read {what}, do not write a document explai
 
 
 def declared_failure(text):
-    """The status marker a document or reply opens with (BLOCKED, PARTIAL, INCOMPLETE), or None.
+    """The status word a document or reply opens with (BLOCKED, PARTIAL, INCOMPLETE, FAILED), or None.
     Frontmatter and lines that are only furniture are passed over (_lines)."""
     for line in _lines(text)[:40]:
         if not line.strip():
             continue
         heading = line.lstrip().startswith("#")
-        # "claim -> what you found" is the verify report's format: a finding graded PARTIAL is a finding.
-        stripped = _FURNITURE.sub("", line, count=1)
-        m = None if "->" in line else STATUS_MARKER.match(stripped)
-        if m and _MARKER_NEGATED.match(stripped[m.end():]):
-            m = None                          # "Blocked: none" is a clean result, not a failure
-        m2 = _TITLE_MARKER.search(line) if heading else None
-        if m2 and _MARKER_NEGATED.match(line[m2.end():]):
-            m2 = None
-        m = m or m2
-        if m:
-            return m.group(1).rstrip("*").upper()
+        word = _status_word(line, item=not heading and bool(_ITEM.match(line)))
+        if word:
+            return word
         if not heading:
             return None                       # the opening line was not a marker
     return None

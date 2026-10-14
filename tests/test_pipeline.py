@@ -470,6 +470,7 @@ class TestMoneyGuarantees(Pipeline):
         write(plan, "# Plan\n" + "content " * 200)
         for mode, reply in [("refuse", None), ("garbage", None), ("incomplete", None),
                             ("reply", "I cannot help with that request."),
+                            ("reply", "INCOMPLETE: none of the files in the codebase could be opened"),
                             ("reply", "I could not check any claims because the document is not in the codebase.\n"
                                       "- `runs/real/plan.md` -> not found.")]:
             with self.subTest(mode, reply=reply):
