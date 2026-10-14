@@ -7,7 +7,7 @@ CLI, a hook, the pipeline) belongs in test_modules.py or test_pipeline.py. See T
 
 Run: python3 -m unittest discover -s tests
 """
-import json, os, shutil, subprocess, sys, tempfile, unittest
+import json, os, re, shutil, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -356,6 +356,12 @@ class TestShippedState(unittest.TestCase):
             self.assertEqual(subprocess.run([cli, *argv], capture_output=True).returncode, 2, argv)
 
     def test_no_absolute_user_paths_shipped(self):
+        """One hardcoded home directory in a shipped file ends a reader's evaluation.
+
+        Matches an ABSOLUTE path only: the slash must not follow a word character, so a relative
+        path that merely contains the word (`v1/home/lacuna`, `scripts/home/x`) is not a finding.
+        """
+        absolute_home = re.compile(r"(?<![\w.~])/(?:Users|home)/\w")
         bad = []
         for dirpath, dirnames, filenames in os.walk(ROOT):
             dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__", "tests"}]
@@ -363,7 +369,7 @@ class TestShippedState(unittest.TestCase):
                 if fn.endswith((".md", ".py", ".json", ".sh")) or fn in ("lacuna", "ccsplit"):
                     with open(os.path.join(dirpath, fn), errors="ignore") as f:
                         bad += [f"{os.path.relpath(dirpath, ROOT)}/{fn}:{i}" for i, line in enumerate(f, 1)
-                                if "/Users/" in line or "/home/" in line]
+                                if absolute_home.search(line)]
         self.assertEqual(bad, [], f"absolute home paths found: {bad}")
 
     def test_example_notes_exist_and_are_not_ignored(self):

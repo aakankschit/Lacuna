@@ -95,6 +95,11 @@ def last_call(path):
     except OSError:
         return None
     for ln in reversed(lines):
+        # Claude Code records an API failure (a session limit, an overload) as a <synthetic>
+        # assistant line whose usage is all zeros. Taken as the newest call it reports 0 tokens of
+        # context, so the guard stays silent exactly when the next prompt will re-cache everything.
+        if "<synthetic>" in ln:
+            continue
         try:
             e = json.loads(ln)
         except ValueError:

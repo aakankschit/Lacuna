@@ -16,7 +16,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ONE data directory, whoever is asking. It deliberately does not fall back to CLAUDE_PLUGIN_DATA:
 # hooks get that variable and a shell does not, so the two would read different config files and a
 # setting made in one would be silently ignored by the other.
-DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")
+# expanduser/expandvars because this is typed by hand and exported in shell profiles. Without it
+# "~/lacuna" became a literal "./~/lacuna" next to the cwd while config.json was looked for
+# elsewhere: two data directories, and `doctor` reported every step OK.
+DATA = os.path.expanduser(os.path.expandvars(
+    os.environ.get("LACUNA_DATA") or "~/.lacuna"))
 
 # Claude Code's own transcript directory. Not configurable by us — this is where it writes.
 TRANSCRIPTS = os.path.expanduser("~/.claude/projects")
@@ -197,11 +201,16 @@ def prices():
 
 
 def price_meta():
-    """When the shipped table was retrieved, for honest reporting."""
+    """When the shipped table was retrieved, for honest reporting.
+
+    `overridden` means the user's file actually contributed prices — not merely that a file
+    exists. A malformed override that yields nothing must not be reported as in effect, or the
+    user is told their edit took when the shipped table is what is being used.
+    """
     d, u = (x if isinstance(x, dict) else {} for x in (_read_json(os.path.join(ROOT, "scripts", "pricing.json")),
                                                        _read_json(os.path.join(DATA, "pricing.json"))))
     return {"retrieved": (u.get("_retrieved") or d.get("_retrieved") or "unknown"),
-            "overridden": bool(u)}
+            "overridden": bool(_price_table(u))}
 
 
 if __name__ == "__main__":

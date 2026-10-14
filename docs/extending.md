@@ -74,14 +74,18 @@ default, and `lacuna config` marks which layer each value came from. The full li
 ## 3. `after.*` — run your own command when a stage finishes
 
 The cleanest seam, and the one to reach for first. Each value is a shell command, run with the
-stage's output appended as `$1`:
+stage's output appended as the final argument:
 
 ```json
 { "after": { "synth": "/path/to/my-notebook-import --kind plan",
              "verify": "/path/to/my-notebook-attach" } }
 ```
 
-**What `$1` is differs by stage**, so check before writing an importer:
+The output path is **appended as the final argument**. A command with no arguments of its own
+therefore receives it as `$1` — but with the example above (`--kind plan`) the path is `$3`.
+Write the importer to read its *last* argument, or keep the command argument-free.
+
+**What it is given differs by stage**, so check before writing an importer:
 
 | Hook | `$1` is |
 |---|---|

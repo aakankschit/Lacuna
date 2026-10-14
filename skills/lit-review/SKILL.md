@@ -129,7 +129,9 @@ configured warning threshold (`budget_warn_usd`, default $2), and wait for appro
   synthesiser already reads one if it finds it and is told not to re-propose anything recorded as a
   dead end.
 - Configure `after.read` / `after.synth` / `after.verify` in `config.json` to file outputs anywhere
-  else automatically; each runs with the output path as `$1`.
+  else automatically. Each runs through a shell with the output path **appended as the final
+  argument**, so a command with no arguments of its own sees it as `$1`; one that carries its
+  own arguments must read the last.
 - Recalibrate from the cost ledger once it has more runs than the calibration was built on.
 
 ## If a model refuses
