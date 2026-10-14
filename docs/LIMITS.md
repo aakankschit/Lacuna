@@ -22,7 +22,8 @@ Say "on this benchmark" when repeating these numbers. Never "in general".
 | Effort is a cost multiplier | 30 runs across 5 effort levels | solid on cost, weaker on quality |
 | Books halve factual errors | **2 cells, one run each** | suggestive only |
 | Strong tier adds one mechanism-level proposal | single runs per cell | **within noise** |
-| Mid tier matches strong tier on code | **1 task, 1 run per model** | suggestive only |
+| Mid tier matches strong tier on code | 2 tasks, 1 run per model | suggestive; replicated once |
+| Strong tier is worth paying for as test author | 2 tasks | **did not replicate** — see code-writing.md |
 | Parser fact recall | 9 parsers, 3 documents, 12-fact quiz | holds for those documents |
 
 ## The silent-no-op story is one case

@@ -23,7 +23,8 @@ lacuna — find the gaps in a literature and build against them
   lacuna lit read   <pdf|md> [...] [--out DIR] [--brief TEXT] [--model M] [--no-books]
   lacuna lit synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT]
   lacuna lit verify --target FILE --repo DIR [--notes DIR]
-  lacuna lit estimate <files> [--per-agent N]      Cost and wall time before you spend anything.
+  lacuna lit estimate <files> [--per-agent N] [--model M] [--effort E] [--json]
+        Cost and wall time before you spend anything. --json for a machine-readable report.
   lacuna lit split-book <pdf> <out-dir>            Chapter files plus a grep-able index.
 
   lacuna config [--json]             The effective configuration and where it came from.

@@ -112,6 +112,32 @@ Then the suite was attacked, by mutating the implementation and counting failure
 Every defect class the blind review had found in *any* tier was caught. A suite that merely passes
 proves nothing; this is the step that tells you it would have noticed.
 
+## A second task, which did not replicate the test-author half
+
+*October 2026 · one CLI task (`lacuna lit estimate --json`), built by executing the `dev-cycle`
+skill end to end · $8.18 all in*
+
+The claim above — that the strong tier is worth paying for as the **test author** — was tested
+again on a different kind of task. It did not hold.
+
+| test author | cost | mutations caught (of 22) |
+|---|---|---|
+| strong tier (`claude-opus-5`) | $1.88 | 21 |
+| mid tier (`sonnet`) | $0.78 | 21 |
+| cheap tier (`haiku`) | $0.30 | 21 |
+
+The mid and cheap suites each also caught a defect the strong tier's suite missed. The
+implementer half did replicate: the mid tier produced a correct implementation for $0.20 in 55 s,
+and 69 of 69 independent tests passed on first contact.
+
+Two tasks is not a result either way, and the tasks differ in kind — the first mirrors a numerical
+class, this one is argument parsing and a JSON schema. But a single run is what the original claim
+rested on too, and the honest reading is that **the test-author tier is an open question**, not a
+settled default. The skill now says so.
+
+Worth recording from the same run: the orchestration cost more than both agents combined ($2.48
+against $2.08), which no routing comparison here had been counting.
+
 ## What this does not show
 
 - **One task, one run per model.** An algorithm-mirroring task in Python. Nothing here generalises

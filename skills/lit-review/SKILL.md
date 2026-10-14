@@ -19,7 +19,9 @@ default, and read `docs/LIMITS.md` before quoting a number to anyone.
 LAC=${CLAUDE_PLUGIN_ROOT}/bin/lacuna
 
 # 0. estimate — free, local token count against the calibration. Do this first.
-$LAC lit estimate <pdfs-or-mds> --per-agent 1
+#    --json gives a machine-readable report: read `any_over_budget` and `cheapest_over_budget`
+#    rather than parsing the table, and show the user the figure before spending anything.
+$LAC lit estimate <pdfs-or-mds> --per-agent 1 --json
 
 # 1. read — one slim cheap-tier agent per document, in parallel. ~$0.015/document, ~60-100 s for up to 8 documents (they run 8 at a time, then in waves).
 $LAC lit read <pdfs-or-mds> --out <project>/lit/notes \
