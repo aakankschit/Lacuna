@@ -133,7 +133,8 @@ def load():
             SOURCES[(section, key)] = f"$LACUNA_{env}"
     # Paths are written by hand in config.json, so "~/books" and "$HOME/books" must work.
     # Without this a tilde becomes a literal directory named "~" and the error is baffling.
-    cfg["paths"] = {k: os.path.expanduser(os.path.expandvars(v)) if isinstance(v, str) else v
+    # They are made absolute too: they are handed to agents, which run in another directory.
+    cfg["paths"] = {k: os.path.abspath(os.path.expanduser(os.path.expandvars(v))) if isinstance(v, str) and v else v
                     for k, v in (cfg.get("paths") or {}).items()}
     return cfg
 
@@ -168,7 +169,10 @@ def resolve(model):
 def _price_table(doc):
     """The {model: 5-tuple} map out of a pricing file, ignoring _comment-style metadata."""
     out = {}
-    for k, v in (doc.get("models") or doc).items():
+    table = (doc.get("models") or doc) if isinstance(doc, dict) else None
+    if not isinstance(table, dict):       # hand-edited: a list here crashed every price lookup
+        return out
+    for k, v in table.items():
         if k.startswith("_"):
             continue
         try:
@@ -194,8 +198,8 @@ def prices():
 
 def price_meta():
     """When the shipped table was retrieved, for honest reporting."""
-    d = _read_json(os.path.join(ROOT, "scripts", "pricing.json"))
-    u = _read_json(os.path.join(DATA, "pricing.json"))
+    d, u = (x if isinstance(x, dict) else {} for x in (_read_json(os.path.join(ROOT, "scripts", "pricing.json")),
+                                                       _read_json(os.path.join(DATA, "pricing.json"))))
     return {"retrieved": (u.get("_retrieved") or d.get("_retrieved") or "unknown"),
             "overridden": bool(u)}
 

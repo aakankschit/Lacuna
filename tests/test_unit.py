@@ -41,6 +41,11 @@ class TestPrices(unittest.TestCase):
             self.assertEqual(lacuna_config.prices()["haiku-5-5"], (9.0,) * 5)
             self.assertIn("opus-5-5", lacuna_config.prices(), "an override layers over the table, not replaces it")
             self.assertEqual(lacuna_config.price_meta(), {"retrieved": "2099-01-01", "overridden": True})
+            for doc in ([["haiku-5-5", 1, 1, 1, 1, 1]], {"models": [1, 2]}, "prices"):    # hand-edited, wrongly
+                with self.subTest(doc):
+                    write(os.path.join(d, "pricing.json"), json.dumps(doc))
+                    self.assertIn("opus-5-5", lacuna_config.prices(), "a malformed override must not take the table down")
+                    self.assertFalse(lacuna_config.price_meta()["overridden"])
 
 
 class TestConfig(unittest.TestCase):
@@ -219,6 +224,11 @@ class TestParse(unittest.TestCase):
                 ok, _, text = self.convert(outputs, pages=20, **kw)
                 self.assertFalse(ok, f"{name}: a parse that failed validation was accepted")
                 self.assertIsNone(text, f"{name}: the bad parse was written")
+        # A write that dies part-way (here, on a character it cannot encode; in life, a kill or a full
+        # disk) must leave no file: the pipeline serves whatever is at that path as a finished parse.
+        with self.assertRaises(UnicodeEncodeError):
+            self.convert({"pymupdf4llm": self.GOOD + "\ud800"})
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "out.md")), "a partial parse was left in the cache")
 
 
 class TestPipelineHelpers(unittest.TestCase):
@@ -277,6 +287,10 @@ class TestPipelineHelpers(unittest.TestCase):
             write(p, "# Blocked Gibbs sampling (Smith 2024)\n\n## Claim\nBlocked updates converge faster.\n\n"
                      "## Key results\n" + ("Finding, 42 units (Table 2). " * 60))
             self.assertTrue(L.usable_output(p, 400, "note"), "ordinary prose is not a refusal")
+            write(p, "# Follow-up in a cohort (Lee 2025)\n\n## Claim\nOf 412 patients, 37 had not completed follow-up "
+                     "(Table 2), and the authors were unable to read 5 records.\n\n## Key results\n" + ("Finding. " * 80))
+            self.assertTrue(L.usable_output(p, 400, "note", must_contain=("## Claim",)),
+                            "an apology's words inside a section are a finding: the note was paid for, keep it")
             write(p, "# Plan\n")
             self.assertFalse(L.usable_output(p, 800, "plan"))
 

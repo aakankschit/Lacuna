@@ -167,7 +167,11 @@ def convert(pdf, out, forced=None, equations=False, quiet=False):
                       + (f" -> trying {nxt}" if nxt else " -> no parser left"), file=sys.stderr)
             continue
         text = clean(md)
-        open(out, "w").write(text)
+        # Write aside, then rename: the pipeline treats a file at `out` as a finished parse, so a
+        # write cut short (a kill, a full disk) must never leave one there.
+        with open(out + ".partial", "w") as f:
+            f.write(text)
+        os.replace(out + ".partial", out)
         if not quiet:
             print(f"{out}  {len(text):,} chars  ~{len(text) / 2.9:,.0f} tok  via {parser}")
         return True, []
