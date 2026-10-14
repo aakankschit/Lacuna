@@ -329,7 +329,17 @@ def cmd_read(a):
     def one(src, md, out, cached):
         if os.path.islink(out):
             os.remove(out)                # only with --overwrite; never write through a link
-        if os.path.exists(cached) and os.path.getsize(cached) > 400:
+        # A hit is judged by today's content check, not by the one that cached it: a note cached before
+        # the check learned a shape (an apology, a status marker) was otherwise served free forever.
+        fresh = os.path.exists(cached) and usable_output(cached, 400, f"cached note for {os.path.basename(out)}",
+                                                         ("## Claim",), then="removed from the cache; reading the "
+                                                         "document again (paid)")
+        if os.path.exists(cached) and not fresh:
+            try:
+                os.remove(cached)
+            except OSError:
+                pass
+        if fresh:
             shutil.copy(cached, out)      # always refresh: --out may hold another run's note
             record(out, src)
             written.append((out, src))
@@ -793,7 +803,7 @@ def not_ours(path, source=None, namespaced=False):
     return None
 
 
-def usable_output(path, min_bytes, what, must_contain=()):
+def usable_output(path, min_bytes, what, must_contain=(), then="treating it as a failed run, not output"):
     """True when a stage produced real output, not a short file or an explanation of failure.
 
     Size alone is not evidence: a model that cannot do the job writes a fluent paragraph saying so.
@@ -806,12 +816,11 @@ def usable_output(path, min_bytes, what, must_contain=()):
         head = f.read(1200)
     missing = next((m for m in must_contain if m not in head), None)
     if missing:
-        print(f"  ! the {what} has no {missing!r} section — treating it as a failed run, not output", file=sys.stderr)
+        print(f"  ! the {what} has no {missing!r} section — {then}", file=sys.stderr)
         return False
     hit = refusal(head)
     if hit:
-        print(f"  ! the {what} opens with {hit!r} — treating it as a failed run, not output",
-              file=sys.stderr)
+        print(f"  ! the {what} opens with {hit!r} — {then}", file=sys.stderr)
         return False
     return True
 

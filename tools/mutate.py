@@ -249,6 +249,8 @@ MUTANTS = [
     ("reply-incomplete-below-opening-ignored", PIPE,
      '    return next(("INCOMPLETE" for line in reply.splitlines() if declared_failure(line) == "INCOMPLETE"), None)',
      "    return None"),
+    ("cache-hit-not-rechecked", PIPE, "fresh = os.path.exists(cached) and usable_output(cached,",
+     "fresh = os.path.exists(cached) and (lambda *a, **k: True)(cached,"),
     ("callout-tag-line-is-the-opening", PIPE, '    return ["" if _furniture_only(l) else l for l in lines]', "    return lines"),
     ("frontmatter-is-the-opening", PIPE, "            lines = lines[end + 1:]", "            pass"),
     ("statement-is-its-first-line", PIPE, "        elif statement and _ITEM.match(line):", "        elif statement:"),

@@ -408,6 +408,19 @@ class TestMoneyGuarantees(Pipeline):
         self.assertEqual(r.returncode, 4, "a refusal must fail even when an older note is present")
         self.assertNotIn("1/1 notes written", r.stdout)
         self.assertEqual(len(self.cached_notes()), 1, "the stale note must not be cached under the new key")
+        # A note cached before the check learned a shape was served free forever (VERDICT3 N10b): a hit
+        # is judged by today's check, and one that fails it is read again, and paid for, not served.
+        (cached,) = self.cached_notes()
+        cached = os.path.join(self.data, "cache", "notes", cached)
+        write(cached, "# A note (alpha.md)\n\n## Claim\nI\u2019m unable to complete this: I could not read any of "
+                      "the paper.\n\n## Key results\n" + "Nothing. " * 80)
+        calls = len(self.calls())
+        r = self.lacuna("lit", "read", self.alpha, "--out", self.p("elsewhere"), "--brief", "BRIEF:one")
+        self.assertEqual((r.returncode, len(self.calls())), (0, calls + 1), r.stdout + r.stderr)
+        self.assertNotIn("cached (free)", r.stdout)
+        self.assertIn("removed from the cache", r.stderr, "say why a hit was paid for")
+        self.assertNotIn("unable to complete", read(cached), "the failed note must not stay cached")
+        self.assertNotIn("unable to complete", read(self.p("elsewhere", "alpha.md")))
 
     def test_a_failed_synth_files_nothing_and_leaves_the_last_plan_alone(self):
         """synth judged success by the file at --out, so over an earlier plan a refusal exited 0 and
