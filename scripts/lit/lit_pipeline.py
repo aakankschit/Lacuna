@@ -1195,6 +1195,7 @@ def cmd_verify(a):
 
 
 def main():
+    lacuna_config.warn_config_errors()   # a config.json that was not used as written, before any money is spent
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("read")

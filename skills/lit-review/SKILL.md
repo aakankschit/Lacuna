@@ -19,8 +19,10 @@ default, and read `docs/LIMITS.md` before quoting a number to anyone.
 LAC=${CLAUDE_PLUGIN_ROOT}/bin/lacuna
 
 # 0. estimate — free, local token count against the calibration. Do this first.
-#    --json gives a machine-readable report: read `any_over_budget` and `cheapest_over_budget`
-#    rather than parsing the table, and show the user the figure before spending anything.
+#    --json gives a machine-readable report: read `configured` (the model/effort row `lit read`
+#    will actually use: its `usd` and `over_budget`) rather than parsing the table, and show the
+#    user the figure before spending anything. `any_over_budget` is true if ANY row of the table
+#    is, including models you will not use: do not gate on it.
 $LAC lit estimate <pdfs-or-mds> --per-agent 1 --json
 
 # 1. read — one slim cheap-tier agent per document, in parallel. ~$0.015/document, ~60-100 s for up to 8 documents (they run 8 at a time, then in waves).
@@ -122,7 +124,9 @@ familiar material. (Two cells, one run each — suggestive, not established.)
 
 `lacuna lit estimate` prints cost and wall time per model × effort and says whether the calibration is
 yours or upstream. Show the user the plan and the estimate before starting anything above the
-configured warning threshold (`budget_warn_usd`, default $2), and wait for approval.
+configured warning threshold (`budget_warn_usd`, default $2), and wait for approval. The test is
+`configured.over_budget` in the `--json` report (the row for the configured reader model and effort);
+`any_over_budget` and `cheapest_over_budget` describe the whole table, not the run you are about to start.
 
 ## After the run
 
