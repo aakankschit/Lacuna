@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from support import ROOT, read, write
-import lacuna_config, ccost, prep_md
+import lacuna_config, ccost, prep_md, split_book
 import lit_pipeline as L
 
 
@@ -328,6 +328,44 @@ class TestParse(unittest.TestCase):
         with self.assertRaises(UnicodeEncodeError):
             self.convert({"pymupdf4llm": self.GOOD + "\ud800"})
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "out.md")), "a partial parse was left in the cache")
+
+
+class TestBookPlan(unittest.TestCase):
+    """Which pages go in which chapter file. A page in no file is a page no reader can find."""
+
+    def chapters(self, toc, pages):
+        with mock.patch("sys.stderr"):
+            return split_book.plan(toc, pages)
+
+    def test_every_page_lands_in_one_chapter(self):
+        """Split at level 2, a book lost its level-1 List of Symbols and filed its Appendix under
+        the last chapter; pages before the first bookmark were dropped at any level."""
+        toc = [[1, "List of Symbols", 1], [1, "Part I", 5]] + [[2, f"Chapter {c}", 5 + (c - 1) * 19] for c in range(1, 6)]
+        toc += [[1, "Part II", 100]] + [[2, f"Chapter {c}", 100 + (c - 6) * 18] for c in range(6, 11)]
+        toc += [[1, "Appendix A", 191]]
+        sections = toc[:-1] + [[1, "Appendix A", 191], [2, "A.1 Integrals", 195]]
+        for name, book, pages, first, last in (
+                ("level 2 beside level-1 leaves", toc, 200, ("List of Symbols", 1, 4), ("Appendix A", 191, 200)),
+                ("a level-1 appendix with sections", sections, 200, ("List of Symbols", 1, 4), ("A.1 Integrals", 195, 200)),
+                ("first bookmark on page 15", [[1, "Chapter 1", 15], [1, "Chapter 2", 40]], 60,
+                 ("Before the first bookmark", 1, 14), ("Chapter 2", 40, 60))):
+            with self.subTest(name):
+                level, chapters = self.chapters(book, pages)
+                self.assertEqual((chapters[0], chapters[-1]), (first, last))
+                covered = [p for _, a, b in chapters for p in range(a, b + 1)]
+                self.assertEqual(covered, list(range(1, pages + 1)), "every page once, in order")
+        level, chapters = self.chapters(toc, 200)
+        self.assertEqual(level, 2)
+        self.assertIn(("Chapter 10", 172, 190), chapters, "the appendix is not filed under the last chapter")
+        self.assertNotIn("Part I", [t for t, _, _ in chapters], "a Part that starts with its first chapter is not a chapter")
+        self.assertIn(("Appendix A", 191, 194), self.chapters(sections, 200)[1], "its pages before A.1 are its own")
+
+    def test_titles_are_one_clean_line(self):
+        """A NUL in a bookmark title went into toc.md and its chapter's first line, and `rg` then
+        skipped the chapter as binary."""
+        self.assertEqual(split_book.one_line("Chapter 1\x00"), "Chapter 1")
+        self.assertEqual(split_book.one_line("Chapter 2\rKernels\n\tand priors"), "Chapter 2 Kernels and priors")
+        self.assertEqual(split_book.one_line(None), "")
 
 
 class TestPipelineHelpers(unittest.TestCase):

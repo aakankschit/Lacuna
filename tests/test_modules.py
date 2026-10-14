@@ -760,10 +760,10 @@ class TestSplitBook(Sandbox):
 
     PAGES = ["alpha page", "beta page", "gamma page", "delta page", "epsilon page"]
 
-    def split(self, toc, pages=None, title="My Book"):
+    def split(self, toc, pages=None, title="My Book", outdir=None):
         write(self.p("fake", "pymupdf.py"), FAKE_PYMUPDF)
         write(self.p("spec.json"), json.dumps({"pages": pages or self.PAGES, "toc": toc, "title": title}))
-        self.outdir = self.p("books", "mybook")
+        self.outdir = outdir or self.p("books", "mybook")
         return self.run_py([os.path.join(LIT, "split_book.py"), write(self.p("book.pdf"), "%PDF"), self.outdir],
                            PYTHONPATH=self.p("fake"), FAKE_PDF_SPEC=self.p("spec.json"))
 
@@ -805,6 +805,49 @@ class TestSplitBook(Sandbox):
         g = subprocess.run(["grep", "-c", "page", os.path.join(self.outdir, "00_Introduction.txt")], capture_output=True, text=True)
         self.assertEqual(g.returncode, 0, "grep found nothing in the chapter file")
         self.assertNotIn("Binary file", g.stdout + g.stderr)
+        # The same, from a bookmark title: it is the chapter file's first line and a row of toc.md.
+        r = self.split([[1, "Chapter 1\x00", 1], [1, "Chapter 2\rKernels | Priors", 3]], title="Bayes\x00Opt")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        toc = self.chapter("toc.md")
+        self.assertEqual(re.findall(r"[\x00-\x08\x0b-\x1f\x7f]", toc + self.chapter("00_Chapter_1.txt")), [])
+        self.assertIn("| Chapter 2 Kernels \\| Priors | `01_Chapter_2_Kernels_Priors.txt` |", toc,
+                      "a `|` in a title must not start a new column")
+        g = subprocess.run(["grep", "-c", "alpha", os.path.join(self.outdir, "00_Chapter_1.txt")], capture_output=True, text=True)
+        self.assertEqual((g.returncode, g.stdout.strip()), (0, "1"), g.stdout + g.stderr)
+
+    def test_warns_of_a_chapter_with_no_readable_text(self):
+        """A font with no Unicode map extracts as U+FFFD: a long chapter that no grep can match."""
+        r = self.split([[1, "Readable", 1], [1, "Garbled", 3]],
+                       pages=["alpha page " * 40, "beta page " * 40, "\ufffd" * 400, "\ue012" * 400, "epsilon page"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("'Garbled' (pp. 3-5): 800 unreadable glyphs", r.stderr)
+        self.assertNotIn("'Readable'", r.stderr)
+
+    def test_resplit_replaces_its_own_chapters_and_nothing_else(self):
+        """Re-splitting into the same directory left the old chapters beside the new toc.md, and
+        every grep over the book found them."""
+        r = self.split([[1, f"Old chapter {i}", i] for i in range(1, 6)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mine = [write(os.path.join(self.outdir, n), "my own notes") for n in ("notes.txt", "99_mine.txt")]
+        r = self.split([[1, "New one", 1], [1, "New two", 3]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.outdir)),
+                         ["00_New_one.txt", "01_New_two.txt", "99_mine.txt", "index.json", "notes.txt", "toc.md"],
+                         "the old split's chapters go; files it did not write stay")
+        self.assertEqual([read(m) for m in mine], ["my own notes"] * 2)
+
+    def test_says_whether_readers_are_offered_the_book(self):
+        """Readers are offered <books>/<name>/toc.md and nothing else; a book split anywhere else
+        exited 0 and was silently never offered."""
+        books = os.path.join(self.data, "books")
+        r = self.split([[1, "Only", 1]], outdir=os.path.join(books, "gp"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"offered it as {os.path.join(books, 'gp', 'toc.md')}", r.stdout)
+        self.assertNotIn("NOT offered", r.stderr)
+        r = self.split([[1, "Only", 1]], outdir=self.p("mybooks", "gp"))
+        self.assertEqual(r.returncode, 0, "the chapters are fine; only the offer is missing")
+        self.assertIn("NOT offered", r.stderr)
+        self.assertIn(os.path.join(books, "gp"), r.stderr, "and it says where to put the book instead")
 
     def test_picks_a_useful_toc_level_and_tolerates_unsorted_or_shared_pages(self):
         """A book organised in Parts has a handful of level-1 entries over hundreds of pages;
