@@ -294,6 +294,9 @@ MUTANTS = [
      "word = _status_word(line)"),
     ("list-item-tag-counts", PIPE, "        if item and before:\n            continue", "        if False:\n            continue"),
     ("status-word-not-normalised", PIPE, "            return m.group(1).upper()", "            return m.group(1)"),
+    ("lead-ins-not-repeated", PIPE, '(?:but\\b[^\\w]*)?)+")', '(?:but\\b[^\\w]*)?)")'),
+    ("lead-in-sentence-uncapped", PIPE, 'low[len(first):].lstrip() if len(first) < 90 else ""',
+     'low[len(first):].lstrip() if True else ""'),
     # ---- the status line and the guard read what the CLI reads, as the CLI reads it (N7, F2, F3)
     ("cfg-data-not-expanded", CFG, 'DATA = os.path.expanduser(os.path.expandvars(\n    os.environ.get("LACUNA_DATA") or "~/.lacuna"))',
      'DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")'),

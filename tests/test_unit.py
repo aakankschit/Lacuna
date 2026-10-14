@@ -496,6 +496,7 @@ class TestRefusalPosition(unittest.TestCase):
             ("> [!NOTE]\n> I don't have access to the notes directory.", "no access, in a callout"),
             ("Both notes are binary garbage. I could not read either of them.", "after one short sentence"),
             ("Unfortunately,\nI could not read any of the notes.", "wrapped over two lines"),
+            ("Sorry, unfortunately, I could not read any of the notes.", "two lead-ins"),
             ("No files were found at the given path.", "a verifier that resolved nothing"),
             ("I could not check any claims because the document is not in the codebase.\n- `runs/real/plan.md` -> not found.",
              "a real verifier's reply, its finding below the apology"),
@@ -531,6 +532,9 @@ class TestRefusalPosition(unittest.TestCase):
              "the estimate (Table 2).", "the paper's authors, as 'we'"),
             ("# A note (Vaswani 2017)\n\n## Claim\nUnable to process long sequences in parallel, recurrent models are "
              "slow to train (Section 1).", "a participial phrase with no subject"),
+            ("# Digest\n\nThe three papers agree that warm starts cut sampler burn-in by about 40% on the benchmarks "
+             "they share (Table 2). I could not read the supplementary tables, so per-benchmark figures are omitted.",
+             "a caveat after a long first sentence of content"),
         ]:
             with self.subTest(label):
                 self.assertIsNone(self.refusal(text), f"{label} must not be discarded")
