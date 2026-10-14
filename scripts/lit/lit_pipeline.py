@@ -280,6 +280,14 @@ def cmd_read(a):
         why = not_ours(note, src)
         if why:
             blocked[note] = why
+        # Reserve only a note we may actually write. Reserving one we are about to refuse
+        # overwrote the rightful owner's record with this run's claim; the document still goes
+        # through, because an unrecorded note may yet be adopted as this document's cached note.
+        taken = reserve(note, src) if a.overwrite or not why else None
+        if taken:
+            print(f"ERROR: another Lacuna run is reading {taken} into {note} right now. Wait for it, "
+                  f"or use a different --out. Nothing was sent to a model.", file=sys.stderr)
+            sys.exit(EX_INPUT)
         by_note[name_key(note)] = src
         papers.append((src, stem, note))
     reader_model = a.model or lacuna_config.model("reader")
@@ -447,7 +455,17 @@ STATUS_MARKER = re.compile(r"(?i)^(BLOCKED(?=\**\s*(?:$|[:.\u2013\u2014-]))"
                            r"|(?:PARTIAL|INCOMPLETE)\**(?=\s*[:.]|\s+[\u2013\u2014-]\s|\s*$))")
 # A heading that ENDS in a bracketed marker, as a real planner titled one: "# Development plan (PARTIAL /
 # BLOCKED)". The marker must be followed by a separator, so "(PARTIAL LEAST SQUARES)" is a title.
-_TITLE_MARKER = re.compile(r"(?i)[(\[]\s*(BLOCKED|PARTIAL|INCOMPLETE)\s*[/:)\],][^()\[\]]*[)\]]\s*$")
+# A status word SHOUTED in a title is a declared failure however it is punctuated: "(BLOCKED)",
+# "— BLOCKED", ": BLOCKED", "(PARTIAL / BLOCKED)". The previous pattern demanded a bracket, a
+# separator AND a second bracket, so it caught only the one form that happened to be in a test —
+# the third time narrowing this check let a refusal through.
+# A status marker stands alone: it ends the title or is followed by punctuation. When another word
+# follows it, it is part of a technique's name — PARTIAL LEAST SQUARES, BLOCKED GIBBS SAMPLING,
+# INCOMPLETE-DATA METHODS — and discarding those papers is the false positive this check keeps
+# swinging back into.
+_TITLE_MARKER = re.compile(r"\b(BLOCKED|PARTIAL|INCOMPLETE|FAILED)\b(?!\s*[-\w])")
+# ...unless the title is reporting that there were none: "Blocked: none", "PARTIAL: 0".
+_MARKER_NEGATED = re.compile(r"(?i)\s*[:=]?\s*(none|nil|0)\b")
 _FURNITURE = re.compile(r"^(?:\[![^\]]*\]|\d+[.)](?=\s)|[^\w])*(?:status\s*[:\u2013\u2014-](?:[^\w])*)?", re.I)
 
 # An honest model that could not read its sources says so; it must say so where a program can see
@@ -463,8 +481,14 @@ def declared_failure(text):
             continue
         heading = line.lstrip().startswith("#")
         # "claim -> what you found" is the verify report's format: a finding graded PARTIAL is a finding.
-        m = None if "->" in line else STATUS_MARKER.match(_FURNITURE.sub("", line, count=1))
-        m = m or (_TITLE_MARKER.search(line) if heading else None)
+        stripped = _FURNITURE.sub("", line, count=1)
+        m = None if "->" in line else STATUS_MARKER.match(stripped)
+        if m and _MARKER_NEGATED.match(stripped[m.end():]):
+            m = None                          # "Blocked: none" is a clean result, not a failure
+        m2 = _TITLE_MARKER.search(line) if heading else None
+        if m2 and _MARKER_NEGATED.match(line[m2.end():]):
+            m2 = None
+        m = m or m2
         if m:
             return m.group(1).rstrip("*").upper()
         if not heading:
@@ -547,7 +571,10 @@ def _owners(d):
         return {}, f"{OWNERS} could not be read ({type(e).__name__})"
     good = {}
     for k, v in files.items():
-        if isinstance(v, dict) and isinstance(v.get("sha256"), str):
+        # A completed entry carries the note's checksum. A reservation, written before the model
+        # runs, cannot: the note does not exist yet. Dropping those silently let two concurrent
+        # runs each believe the path was free.
+        if isinstance(v, dict) and (isinstance(v.get("sha256"), str) or v.get("pending") is True):
             good[k] = {**v, "source": v["source"] if isinstance(v.get("source"), str) else None}
     return good, None
 
@@ -588,6 +615,35 @@ def _save_owners(d, files):
                             "replaces its own. Deleting this makes Lacuna ask (--overwrite) before "
                             "replacing any of them.", "files": files}, f, indent=1, sort_keys=True)
     os.replace(tmp, os.path.join(d, OWNERS))
+
+
+def reserve(path, source):
+    """Claim `path` for `source` before any model call, atomically across processes.
+
+    Returns the source that already holds it, or None on success. The collision guard and the
+    ownership check both ran before any lock, so two concurrent `read`s of same-named documents
+    into one --out each cached whatever was at the note path when its own agent returned: one
+    note silently replaced the other, and one paper's cache key could end up holding the other
+    paper's note, served free from then on.
+    """
+    d = os.path.dirname(path)
+    try:
+        with _locked(d):
+            files = _owners(d)[0]
+            held = files.get(name_key(path))
+            if held and held.get("source") and os.path.realpath(held["source"]) != os.path.realpath(source):
+                if held.get("pending"):
+                    return held["source"]          # another process is reading it right now
+            entry = dict(held) if held and held.get("source") and \
+                os.path.realpath(held["source"]) == os.path.realpath(source) else \
+                {"name": os.path.basename(path), "source": source,
+                 "written": time.strftime("%Y-%m-%d %H:%M")}
+            entry["pending"] = True          # keep sha256 etc. so a re-read of the same document
+            files[name_key(path)] = entry    # is not locked out of its own note
+            _save_owners(d, files)
+    except OSError:
+        return None          # cannot reserve: fall through to the existing per-run guard
+    return None
 
 
 def record(path, source=None):

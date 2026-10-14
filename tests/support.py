@@ -33,6 +33,9 @@ argv = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as f:
     f.write(json.dumps({{"argv": argv, "prompt": prompt}}) + "\n")
 mode = os.environ.get("FAKE_MODE", "ok")
+_d = float(os.environ.get("FAKE_DELAY", 0))      # lets a test overlap two real processes
+if _d:
+    import time as _t; _t.sleep(_d)
 if mode == "refuse":
     print(json.dumps({{"is_error": True, "result": "I can't help with that.", "total_cost_usd": 0.002}}))
     sys.exit(0)

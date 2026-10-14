@@ -664,3 +664,99 @@ class TestCacheWritesAreAtomic(unittest.TestCase):
                 lit_pipeline._atomic_copy(__file__, dst)
             self.assertFalse(os.path.exists(dst))
             self.assertEqual([f for f in os.listdir(d) if f.endswith(".part")], [])
+
+
+class TestStatusMarkerEdges(unittest.TestCase):
+    """This check has swung between false positives and false negatives three times. Both
+    directions are pinned here so the next narrowing cannot pass silently."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_pipeline
+        self.declared = lit_pipeline.declared_failure
+
+    def test_a_marker_reporting_none_is_a_clean_result(self):
+        for text in ("# Blocked: none. All dependencies are in the tree.",
+                     "Blocked: none. All dependencies are in the tree.",
+                     "# Plan — PARTIAL: 0", "INCOMPLETE: nil"):
+            with self.subTest(text[:40]):
+                self.assertIsNone(self.declared(text), "a count of none is not a declared failure")
+
+    def test_a_standalone_marker_in_a_title_is_a_failure(self):
+        for text in ("# Development plan (BLOCKED)", "# Development plan — BLOCKED",
+                     "# Development plan: BLOCKED", "# Development plan (PARTIAL / BLOCKED)",
+                     "Status: INCOMPLETE — no literature was readable"):
+            with self.subTest(text[:40]):
+                self.assertTrue(self.declared(text), text)
+
+    def test_a_marker_inside_a_technique_name_is_not_a_failure(self):
+        """These are real papers. Discarding them is the false positive this keeps swinging into."""
+        for text in ("# PARTIAL LEAST SQUARES for batch correction\n\n## 1. Replace PCA",
+                     "# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim",
+                     "# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim",
+                     "# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA"):
+            with self.subTest(text[:40]):
+                self.assertIsNone(self.declared(text), text)
+
+
+class TestReservationRecord(unittest.TestCase):
+    """A reservation is written before the model runs, so it has no checksum yet. Dropping those
+    from the record let two concurrent runs each believe the note path was free."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_pipeline
+        self.L = lit_pipeline
+
+    def test_a_pending_reservation_survives_a_read_of_the_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            note = os.path.join(d, "main.md")
+            a, b = os.path.join(d, "a.md"), os.path.join(d, "b.md")
+            for f in (a, b):
+                with open(f, "w") as fh:
+                    fh.write("x" * 600)
+            self.assertIsNone(self.L.reserve(note, a), "the first claim must succeed")
+            entries = self.L._owners(d)[0]
+            self.assertIn(self.L.name_key(note), entries,
+                          "a reservation without a checksum must stay in the record")
+            self.assertEqual(self.L.reserve(note, b), a,
+                             "a second document must be told who holds the note path")
+
+    def test_the_same_document_may_re_reserve_its_own_note(self):
+        with tempfile.TemporaryDirectory() as d:
+            note, a = os.path.join(d, "main.md"), os.path.join(d, "a.md")
+            for f, body in ((a, "x" * 600), (note, "n" * 600)):
+                with open(f, "w") as fh:
+                    fh.write(body)
+            self.L.record(note, a)
+            before = self.L._owners(d)[0][self.L.name_key(note)]["sha256"]
+            self.assertIsNone(self.L.reserve(note, a))
+            self.assertEqual(self.L._owners(d)[0][self.L.name_key(note)]["sha256"], before,
+                             "re-reserving must keep the completed record's checksum")
+
+
+class TestNameKeyFolding(unittest.TestCase):
+    """macOS treats Paper.MD and paper.md as one file, and café typed as one character the same as
+    café typed as two. The collision guard and the ownership record both key on name_key, so if it
+    stops folding either, two documents quietly share one note path again."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_pipeline
+        self.key = lit_pipeline.name_key
+
+    def test_case_is_folded(self):
+        self.assertEqual(self.key("/x/Paper.MD"), self.key("/y/paper.md"),
+                         "a case-folding filesystem gives these one note path")
+
+    def test_unicode_form_is_normalised(self):
+        import unicodedata
+        nfc = unicodedata.normalize("NFC", "café.md")      # é as one character
+        nfd = unicodedata.normalize("NFD", "café.md")      # e + combining accent
+        self.assertNotEqual(nfc, nfd, "the fixture must really differ before normalisation")
+        self.assertEqual(self.key("/x/" + nfc), self.key("/y/" + nfd),
+                         "APFS stores one and returns the other; they are one name")
+
+    def test_different_names_stay_different(self):
+        self.assertNotEqual(self.key("/x/alpha.md"), self.key("/x/beta.md"))

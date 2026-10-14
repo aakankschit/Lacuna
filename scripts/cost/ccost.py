@@ -111,10 +111,13 @@ def is_cold(c, prev=None):
     read = u.get("cache_read_input_tokens", 0)
     if u.get("cache_creation_input_tokens", 0) <= 40_000:
         return False
-    if read < 40_000:
-        return True
     if prev is None:
-        return False
+        # Nothing to compare against: a large write with almost no read is the only safe signal.
+        return read < 40_000
+    # Against the previous call is the only honest test, at every size. "read under 40k" alone
+    # counted a warm cache as waste whenever a small session added a large tool result: measured,
+    # 54 of 72 flagged calls on one machine had read ~all of the previous context (one read 11,115
+    # of 11,117 and wrote 43,903, 45 s later). That is the cache working, not idling.
     # A /model switch re-writes the cache too, minutes after the last call: that is not idling.
     return (read < split(prev)[1] / 2 and ts(c["ts"]) - ts(prev["ts"]) >= IDLE_S
             and c["model"] == prev["model"])

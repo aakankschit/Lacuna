@@ -592,3 +592,34 @@ class TestPdfPlumbing(Pipeline):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestConcurrentReads(Pipeline):
+    """Two Lacuna processes reading same-named documents into one --out.
+
+    The collision guard and the ownership check both ran before any lock, so each process cached
+    whatever was at the note path when its own agent returned: one note silently replaced the
+    other, and one paper's cache key could end up holding the other paper's note, served free
+    from then on.
+    """
+
+    def test_one_run_wins_and_the_other_is_refused_before_paying(self):
+        import subprocess
+        a = write(self.p("a", "main.md"), "Title A\n\n" + "body " * 300)
+        b = write(self.p("b", "main.md"), "Title B\n\n" + "body " * 300)
+        out = self.p("notes")
+        os.makedirs(out, exist_ok=True)
+        env = self.env(FAKE_DELAY="2")
+        procs = [subprocess.Popen([LACUNA, "lit", "read", doc, "--out", out],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                 for doc in (a, b)]
+        outs = [p.communicate() for p in procs]
+        codes = sorted(p.returncode for p in procs)
+        self.assertEqual(codes, [0, 2], f"one must win and one must be refused:\n{outs}")
+        note = read(os.path.join(out, "main.md"))
+        self.assertGreater(len(note), 400, "the winner's note must be complete")
+        keys = [f for f in os.listdir(os.path.join(self.data, "cache", "notes")) if f.endswith(".md")]
+        self.assertLessEqual(len(keys), 1, f"only the winner may cache a note, got {keys}")
+        for k in keys:
+            cached = read(os.path.join(self.data, "cache", "notes", k))
+            self.assertEqual(cached, note, "a cache key must hold its own document's note")
