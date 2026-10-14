@@ -119,7 +119,7 @@ a pinned id such as `claude-opus-5` is rejected.
 |---|---|
 | `tests/test_lacuna.py` | configuration, pricing, cache keys, hooks, the CLI contract |
 | `tests/test_coverage.py` | per-module behaviour: spend, prep_md, split_book, doctor, statusline |
-| `tests/test_integration.py` | whole flows end to end against a fake `claude` |
+| `tests/test_integration.py` | whole flows end to end against a fake `claude`: the full read→synth→verify journey, the money guarantees (bad input never reaches a model; a refusal is never filed as output), cache behaviour, `after.*` hooks, and that the cost tools work with nothing installed |
 
 **No test may call a model.** Tests that drive the pipeline put a fake `claude` first on a
 restricted `PATH` and assert it resolved to the fake before running. That is what lets a test prove

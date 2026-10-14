@@ -31,7 +31,8 @@ code, one writing tests for the untested surface. ~120 claims checked, 37 defect
 after averaging. The effort multiplier is 47× from the shipped calibration. Three parsers reached
 100% recall, not one. The strong tier is not flat across effort levels.
 
-Tests: 31 → 95.
+Tests: 31 → 119, now in three suites — unit, per-module, and a new
+`tests/test_integration.py` covering whole journeys against a fake `claude`. All mutation-tested.
 
 ## 0.1.0 — 2026-10-13
 
