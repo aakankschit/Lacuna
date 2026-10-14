@@ -529,6 +529,8 @@ class TestRefusalPosition(unittest.TestCase):
              "by 12% (Section 4).", "a caveat about a numbered part"),
             ("# A note (Lee 2025)\n\n## Claim\n\nWe could not complete follow-up for 37 of 412 patients, which biases "
              "the estimate (Table 2).", "the paper's authors, as 'we'"),
+            ("# A note (Vaswani 2017)\n\n## Claim\nUnable to process long sequences in parallel, recurrent models are "
+             "slow to train (Section 1).", "a participial phrase with no subject"),
         ]:
             with self.subTest(label):
                 self.assertIsNone(self.refusal(text), f"{label} must not be discarded")

@@ -419,9 +419,12 @@ def cmd_read(a):
 #      "I" or no subject, an inability ("cannot", "could not", "was unable to", "was not able to", "do
 #      not have access") and a verb for the job or for getting at its inputs ("help", "complete",
 #      "summarise", "open", "read", "access", "process"…). Not "we": in a note "we" are the paper's
-#      authors ("We could not complete follow-up for 37 patients"). Not a numbered part of the input
-#      ("I could not read Table 3"): that is a caveat about the part. And the verifier's own verbs
-#      ("check", "verify") only with "any": "I could not verify the following claims:" opens a report.
+#      authors ("We could not complete follow-up for 37 patients"). With no subject, only about a
+#      definite thing ("Unable to read the supplied directory", "Could not open any of the notes"), as
+#      an agent's inputs always are: "Unable to process long sequences, earlier models…" and "Cannot
+#      complete in polynomial time" open findings. Not a numbered part of the input ("I could not read
+#      Table 3"): that is a caveat about the part. And the verifier's own verbs ("check", "verify")
+#      only with "any": "I could not verify the following claims:" opens a report.
 #   3. "No files were found", what an agent given paths it cannot resolve replies.
 #
 # A line in the verify report's `claim -> what you found` form is a finding whatever its first words:
@@ -433,8 +436,10 @@ _UNABLE = (r"(?:(?:am|was|were|have been|had been)\s+)?(?:unable|not able)\s+to"
 _JOB = (r"help|assist|complete|finish|fulfil|fulfill|comply|proceed|continue|summari[sz]e|write|produce|generate"
         r"|provide|perform|do|open|read|access|load|parse|process|view|retrieve|extract|decode")
 _PART = r"\s+(?:the\s+)?(?!any\b|all\b|the\b|of\b)[a-z]+\.?\s*\(?\d"      # "Table 3", "pages 3-12"
+_DEFINITE = r"\s+(?:any|all|the|this|these|those|that|it|them|your|either|both|anything)\b"
 _DECLINE = re.compile(
-    rf"(?:i\s+)?(?:(?:{_UNABLE})\s+(?:(?:{_JOB})\b(?!{_PART})|(?:check|verify|confirm|fact-check)\s+(?:any|a single)\b)"
+    rf"(?:i\s+(?:{_UNABLE})\s+(?:{_JOB})\b|(?:{_UNABLE})\s+(?:{_JOB})(?={_DEFINITE}))(?!{_PART})"
+    rf"|(?:i\s+)?(?:(?:{_UNABLE})\s+(?:check|verify|confirm|fact-check)\s+(?:any|a single)\b"
     r"|(?:do|did) not have access\b|(?:have|had) no access\b)"
     r"|no (?:files?|notes?|documents?) (?:were|was|could be) found\b"
     r"|not completed(?=\s*(?:[^\w\s]|$))")

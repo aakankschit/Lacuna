@@ -265,8 +265,9 @@ MUTANTS = [
     ("no-access-not-a-refusal", PIPE, '    r"|(?:do|did) not have access\\b|(?:have|had) no access\\b)"', '    r")"'),
     ("no-files-found-not-a-refusal", PIPE, '    r"|no (?:files?|notes?|documents?) (?:were|was|could be) found\\b"\n', ""),
     ("not-completed-need-not-stand-alone", PIPE, 'r"|not completed(?=\\s*(?:[^\\w\\s]|$))")', 'r"|not completed")'),
-    ("numbered-part-is-a-refusal", PIPE, "(?:{_JOB})\\b(?!{_PART})", "(?:{_JOB})\\b"),
-    ("we-is-the-agent", PIPE, 'rf"(?:i\\s+)?(?:(?:{_UNABLE})', 'rf"(?:(?:i|we)\\s+)?(?:(?:{_UNABLE})'),
+    ("numbered-part-is-a-refusal", PIPE, "(?={_DEFINITE}))(?!{_PART})", "(?={_DEFINITE}))"),
+    ("we-is-the-agent", PIPE, 'rf"(?:i\\s+(?:{_UNABLE})', 'rf"(?:(?:i|we)\\s+(?:{_UNABLE})'),
+    ("subject-less-inability-about-anything", PIPE, "(?:{_JOB})(?={_DEFINITE})", "(?:{_JOB})\\b"),
     ("check-verbs-without-any", PIPE, "(?:check|verify|confirm|fact-check)\\s+(?:any|a single)\\b",
      "(?:check|verify|confirm|fact-check)\\b"),
     # ---- the status line and the guard read what the CLI reads, as the CLI reads it (N7, F2, F3)
