@@ -54,7 +54,8 @@ case "$cmd" in
       estimate)          exec "$PY" "$ROOT/scripts/lit/lit_cost.py" "$@" ;;
       split-book)
         # needs pymupdf, which lives in the parser venv rather than the system python
-        BOOKPY="$("$PY" -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import lacuna_config; print(lacuna_config.path('python'))")"
+        # $ROOT goes in as argv, never into the code: a quote in the plugin path was a SyntaxError here
+        BOOKPY="$("$PY" -c "import sys; sys.path.insert(0, sys.argv[1] + '/scripts'); import lacuna_config; print(lacuna_config.path('python'))" "$ROOT")"
         [ -x "$BOOKPY" ] || BOOKPY="$PY"
         exec "$BOOKPY" "$ROOT/scripts/lit/split_book.py" "$@" ;;
       ""|-h|--help)      usage; exit 0 ;;
