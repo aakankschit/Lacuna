@@ -197,7 +197,16 @@ MUTANTS = [
     ("pane-needs-rich", PANE, "except ImportError:                 # plain text", "except ():                 # plain text"),
     # ---- ownership: a file in the user's directory is replaced only if Lacuna wrote it, for this
     # document, unedited (N1/N6 at 0.2.0: proven by cache bytes, blind to which document)
-    ("ownership-ignores-document", PIPE, "    if source and theirs and not (", "    if False and not ("),
+    ("ownership-ignores-document", PIPE, "    if source and was and os.path.isfile(source):", "    if False:"),
+    # B1: a changed document at the same path may be another one (a new download, same name)
+    ("ownership-same-path-is-same-document", PIPE, "        if (_sha(source) == recorded) if isinstance(recorded, str) else here:",
+     "        if here or _sha(source) == recorded:"),
+    # B15: a note is not a plan, and a plan's record names no document to compare
+    ("ownership-ignores-stage", PIPE, "    if theirs != stage:", "    if False:"),
+    ("legacy-plan-taken-for-note", PIPE, '    if not entry.get("source"):\n        return "synth"',
+     '    if not entry.get("source"):\n        return "read"'),
+    ("legacy-report-taken-for-note", PIPE, '    return "verify" if entry.get("name") == os.path.basename(entry["source"]) + ".unverified.md" else "read"',
+     '    return "read"'),
     ("ownership-never-recorded", PIPE, "            files[name_key(path)] = entry\n            _save_owners(d, files)\n    except OSError as e:",
      "            files[name_key(path)] = entry\n            pass\n    except OSError as e:"),
     ("edited-note-replaced", PIPE, '    if entry.get("sha256") != _sha(path):', "    if False:"),
@@ -214,8 +223,11 @@ MUTANTS = [
      'unicodedata.normalize("NFC", os.path.basename(path))'),
     ("collision-ignores-unicode-form", PIPE, 'unicodedata.normalize("NFC", os.path.basename(path)).casefold()',
      "os.path.basename(path).casefold()"),
-    ("synth-out-unguarded", PIPE, "    why = not_ours(a.out)\n", "    why = None\n"),
-    ("verify-report-unguarded", PIPE, "    why = not_ours(out, namespaced=True)", "    why = None"),
+    ("synth-out-unguarded", PIPE, '    why = not_ours(a.out, stage="synth")\n', "    why = None\n"),
+    ("verify-report-unguarded", PIPE, '    why = not_ours(out, stage="verify")', "    why = None"),
+    # B12: with the record deleted, a report annotated by hand was "ours" because of its name
+    ("unrecorded-report-replaced", PIPE, '    why = not_ours(out, stage="verify")',
+     '    why = not_ours(out, stage="verify") if os.path.exists(os.path.join(os.path.dirname(out), OWNERS)) else None'),
     ("clobbered-out-kept", PIPE, "        if os.path.isfile(a.out) and _sha(a.out) != before:", "        if False:"),
     ("hook-edit-not-rerecorded", PIPE, "    before = as_recorded(d)\n", "    before = {}\n"),
     # B10: a hook that edits every file in the directory changes earlier runs' files too
@@ -224,6 +236,9 @@ MUTANTS = [
     ("hook-adopts-user-edits", PIPE, '                    and os.path.isfile(p) and _sha(p) == e["sha256"]:',
      "                    and os.path.isfile(p):"),
     ("clobbered-out-deleted", PIPE, '            os.replace(a.out, f"{a.out}.rejected")', "            os.remove(a.out)"),
+    # B28: a damaged record was silently rewritten with only this run's entries
+    ("damaged-record-silently-replaced", PIPE, "    if damaged:\n        kept = free_name(", "    if False:\n        kept = free_name("),
+    ("refusal-silent-about-damage", PIPE, 'was kept as {kept[-1]})" if kept else "")', 'was kept as {kept[-1]})" if False else "")'),
     # B13/B14: a name the filesystem refuses after the model call costs the call
     ("atomic-copy-temp-longer-than-name", PIPE,
      '    tmp = os.path.join(os.path.dirname(dst), f".{os.getpid()}.{threading.get_ident()}.part")',

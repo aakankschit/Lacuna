@@ -578,6 +578,15 @@ def need_short_names(paths, how):
         sys.exit(EX_INPUT)
 
 
+def free_name(base, ext=""):
+    """base+ext, or base-2+ext, base-3+ext …, whichever does not exist yet. What an earlier run set
+    aside for the user to look at is never replaced by a later one."""
+    n = 1
+    while os.path.lexists(f"{base}-{n}{ext}" if n > 1 else f"{base}{ext}"):
+        n += 1
+    return f"{base}-{n}{ext}" if n > 1 else f"{base}{ext}"
+
+
 def _sha(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -618,6 +627,35 @@ def _owners(d):
         if isinstance(v, dict) and (isinstance(v.get("sha256"), str) or v.get("pending") is True):
             good[k] = {**v, "source": v["source"] if isinstance(v.get("source"), str) else None}
     return good, None
+
+
+WHAT = {"read": "a note", "synth": "a plan or digest", "verify": "a verify report"}
+
+
+def _stage(entry):
+    """The stage that wrote a recorded file. A plan and a note are not interchangeable: a paper
+    named plan.md once replaced the plan recorded beside it (B15). Records written before the stage
+    was recorded do not say; a synth output was the only file recorded without a source, and a
+    verify report is named after the document it checked."""
+    if entry.get("stage") in WHAT:
+        return entry["stage"]
+    if not entry.get("source"):
+        return "synth"
+    return "verify" if entry.get("name") == os.path.basename(entry["source"]) + ".unverified.md" else "read"
+
+
+def _owners_to_update(d):
+    """The record, for a writer that holds the lock. A damaged one is set aside, never silently
+    replaced: it was the only evidence of which files here are Lacuna's, and rewriting it with this
+    run's entries alone left every later refusal unable to say why (B28)."""
+    files, damaged = _owners(d)
+    if damaged:
+        kept = free_name(os.path.join(d, f"{OWNERS}.damaged-{time.strftime('%Y%m%d-%H%M%S')}"))
+        os.replace(os.path.join(d, OWNERS), kept)
+        print(f"  ! {damaged}; it was kept as {kept} and a new record started. Files it listed are no "
+              f"longer known to be Lacuna's, so a later run asks (--overwrite) before replacing them.",
+              file=sys.stderr)
+    return files
 
 
 class _locked:
@@ -670,14 +708,14 @@ def reserve(path, source):
     d = os.path.dirname(path)
     try:
         with _locked(d):
-            files = _owners(d)[0]
+            files = _owners_to_update(d)
             held = files.get(name_key(path))
             if held and held.get("source") and os.path.realpath(held["source"]) != os.path.realpath(source):
                 if held.get("pending"):
                     return held["source"]          # another process is reading it right now
             entry = dict(held) if held and held.get("source") and \
                 os.path.realpath(held["source"]) == os.path.realpath(source) else \
-                {"name": os.path.basename(path), "source": source,
+                {"name": os.path.basename(path), "source": source, "stage": "read",
                  "written": time.strftime("%Y-%m-%d %H:%M")}
             entry["pending"] = True          # keep sha256 etc. so a re-read of the same document
             files[name_key(path)] = entry    # is not locked out of its own note
@@ -687,18 +725,19 @@ def reserve(path, source):
     return None
 
 
-def record(path, source=None):
-    """Record that Lacuna wrote `path`, as it is now, from the document `source`.
+def record(path, source=None, stage="read"):
+    """Record that Lacuna's `stage` wrote `path`, as it is now, from the document `source`.
 
     The stage has already succeeded and been paid for, so this never raises: a record that cannot
     be written costs a question (--overwrite) on the next run, not this run's output."""
     d = os.path.dirname(path)
     try:
-        entry = {"name": os.path.basename(path), "sha256": _sha(path), "written": time.strftime("%Y-%m-%d %H:%M")}
+        entry = {"name": os.path.basename(path), "sha256": _sha(path), "stage": stage,
+                 "written": time.strftime("%Y-%m-%d %H:%M")}
         if source:
             entry.update(source=source, source_sha256=_sha(source))
         with _locked(d):
-            files = _owners(d)[0]
+            files = _owners_to_update(d)
             files[name_key(path)] = entry
             _save_owners(d, files)
     except OSError as e:
@@ -710,7 +749,7 @@ def forget(path):
     d = os.path.dirname(path)
     try:
         with _locked(d):
-            files = _owners(d)[0]
+            files = _owners_to_update(d)
             if files.pop(name_key(path), None) is not None:
                 _save_owners(d, files)
     except OSError:
@@ -743,7 +782,7 @@ def rerecord(d, before):
         return
     try:
         with _locked(d):
-            files, changed = _owners(d)[0], False
+            files, changed = _owners_to_update(d), False
             for k, sha in before.items():
                 e = files.get(k)
                 if not e or e.get("sha256") != sha:
@@ -762,34 +801,51 @@ def rerecord(d, before):
               f"replacing those files", file=sys.stderr)
 
 
-def not_ours(path, source=None, namespaced=False):
-    """None when Lacuna may replace `path`; otherwise (kind, why), `why` a sentence for the user.
+def not_ours(path, source=None, stage="read"):
+    """None when Lacuna's `stage` may replace `path`; otherwise (kind, why), `why` a sentence for the user.
 
-    `source` is the document the new file is written from. When given, a file Lacuna wrote from a
-    *different* document is not ours to replace either. A document is the same one when it is at
-    the same path (and may have changed) or has the same bytes (and may have moved).
-    `namespaced` is for names only Lacuna makes (plan.md.unverified.md): an unrecorded file there
-    was written by an earlier Lacuna, so only an edit since it was recorded makes it the user's."""
+    Only the stage that wrote a file replaces it: a note is never written over a plan or a report,
+    nor a plan over a note. `source` is the document a note is written from; a note Lacuna wrote
+    from a *different* document is not ours to replace either. A document is the same one when it
+    has the same bytes, wherever it is now. Same path, different bytes is not enough: a new
+    download saved as fulltext.pdf over the last one is another paper, and its note silently
+    replaced the first paper's (B1); a revised copy of the same paper asks too.
+    A file with no record is not ours either, whatever its name: a report annotated by hand was
+    replaced once its record was deleted (B12)."""
     if not os.path.lexists(path):
         return None
     if os.path.islink(path) or not os.path.isfile(path):
         return "other", f"{path} is a {'symbolic link' if os.path.islink(path) else 'directory'}, not a file Lacuna wrote."
-    files, damaged = _owners(os.path.dirname(path))
+    d = os.path.dirname(path)
+    files, damaged = _owners(d)
     entry = files.get(name_key(path))
     if not isinstance(entry, dict):
-        if namespaced:
-            return None
+        try:
+            kept = sorted(f for f in os.listdir(d) if f.startswith(f"{OWNERS}.damaged-"))
+        except OSError:
+            kept = []
         return UNRECORDED, (f"{path} has no record in {OWNERS} of being written by Lacuna"
-                            + (f" ({damaged})" if damaged else "") + ". It may be your own file, one "
-                            f"written before Lacuna kept that record (0.2.0 and earlier), or one left by an "
-                            f"interrupted run.")
+                            + (f" ({damaged})" if damaged else
+                               f" (an earlier record here was damaged, and was kept as {kept[-1]})" if kept else "")
+                            + ". It may be your own file, one written before Lacuna kept that record (0.2.0 and "
+                            "earlier), or one left by an interrupted run.")
+    theirs = _stage(entry)
+    if theirs != stage:
+        return "other", f"{path} is {WHAT[theirs]} written by `lacuna lit {theirs}`, not {WHAT[stage]}."
     if entry.get("sha256") != _sha(path):
         return "edited", (f"{path} was written by Lacuna on {entry.get('written', 'an earlier run')}, and has "
                           f"been edited since.")
-    theirs = entry.get("source")
-    if source and theirs and not (os.path.realpath(source) == os.path.realpath(theirs)
-                                  or (os.path.isfile(source) and _sha(source) == entry.get("source_sha256"))):
-        return "other", (f"{path} is the note for {theirs}; {source} is a different file with the same name "
+    was = entry.get("source")
+    if source and was and os.path.isfile(source):
+        here = os.path.realpath(source) == os.path.realpath(was)
+        recorded = entry.get("source_sha256")
+        if (_sha(source) == recorded) if isinstance(recorded, str) else here:
+            return None
+        if here:
+            return "other", (f"{path} is the note for {was}, which has changed since that note was written: it "
+                             f"may now be another document saved under the same name, and reading it would "
+                             f"replace that note.")
+        return "other", (f"{path} is the note for {was}; {source} is a different file with the same name "
                          f"(another document, or a changed copy of that one elsewhere), and reading it would "
                          f"replace that note.")
     return None
@@ -854,7 +910,7 @@ def cmd_synth(a):
                      "Choose a shorter --out.")
     # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
     # plan was once replaced without a word: the ownership rule covered read's notes only.
-    why = not_ours(a.out)
+    why = not_ours(a.out, stage="synth")
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it "
               f"or choose another --out; to replace it anyway, run the same command with --overwrite.",
@@ -984,7 +1040,7 @@ def cmd_synth(a):
     if os.path.islink(a.out):
         os.remove(a.out)     # only with --overwrite; replacing the link, not writing through it
     os.replace(part, a.out)
-    record(a.out)
+    record(a.out, stage="synth")
     after("synth", a.out)
 
 
@@ -1000,7 +1056,7 @@ def cmd_verify(a):
         a.notes = os.path.abspath(a.notes)
     out = f"{a.target}.unverified.md"
     need_short_names([out], "Rename --target, or copy it under a shorter name.")
-    why = not_ours(out, namespaced=True)       # a report annotated by hand is the user's
+    why = not_ours(out, stage="verify")       # a report annotated by hand is the user's
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "
               f"to replace it anyway, run the same command with --overwrite.", file=sys.stderr)
@@ -1048,7 +1104,7 @@ def cmd_verify(a):
             os.remove(out)     # only with --overwrite; never write through a link
         open(out, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n"
                              f"_Checked the version with {checked}._\n\n{report}\n")
-        record(out, a.target)
+        record(out, a.target, stage="verify")
         where = out
     except OSError:
         where = "(not saved; printed below)"
@@ -1091,7 +1147,8 @@ def main():
     v.add_argument("--repo", required=True)
     v.add_argument("--notes")
     v.add_argument("--model", help="override the verifier model for this run")
-    v.add_argument("--overwrite", action="store_true", help="replace the report even if it has been edited")
+    v.add_argument("--overwrite", action="store_true",
+                   help="replace the report even if Lacuna cannot show it wrote it (edited, or not recorded)")
     a = ap.parse_args()
     {"read": cmd_read, "synth": cmd_synth, "verify": cmd_verify}[a.cmd](a)
 

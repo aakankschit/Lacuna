@@ -138,13 +138,15 @@ class TestNoteCache(Pipeline):
         self.assertEqual(len(self.calls()), 5, "a new reader effort")
         os.remove(os.path.join(self.data, "config.json"))
         write(self.alpha, read(self.alpha) + "\nOne more finding.\n")
-        self.assertEqual(self.read().returncode, 0)
+        # A changed document may be another one saved under the same name, so replacing its note
+        # takes --overwrite (TestOwnership); what is asked here is only whether it misses the cache.
+        self.assertEqual(self.read("--overwrite").returncode, 0)
         self.assertEqual(len(self.calls()), 6, "a changed document")
         models = [c["argv"][c["argv"].index("--model") + 1] for c in self.calls()]
         self.assertEqual(models, ["haiku", "haiku", "sonnet", "haiku", "haiku", "haiku"], "--model reaches that run only")
 
         write(self.alpha, read(self.alpha).replace("\nOne more finding.\n", ""))
-        r = self.read("--brief", "BRIEF:other")           # back to step 3's inputs
+        r = self.read("--brief", "BRIEF:other", "--overwrite")      # back to step 3's inputs
         self.assertIn("cached (free)", r.stdout)
         self.assertEqual(len(self.calls()), 6, "unchanged inputs must not call the model again")
         self.assertIn("BRIEF:other", self.note(), "a hit must restore the cached note over whatever --out held")
@@ -330,6 +332,64 @@ class TestOwnership(Pipeline):
         self.assertIn("wrote", r.stderr)
         self.assertNotIn("earlier run's output", r.stderr, "the file held this run's output, not an earlier one")
 
+    def test_a_file_is_replaced_only_by_the_stage_and_document_that_wrote_it(self):
+        """Same path is not same document: a new download saved as fulltext.md over the last one is
+        another paper, and its note silently replaced the first paper's. Nor is a note a plan: a
+        paper named plan.md replaced the plan synth had recorded beside it, because a plan's record
+        names no document to compare. Records written before the stage was recorded must hold."""
+        lit = self.p("lit")
+        note = os.path.join(lit, "fulltext.md")
+        paper = write(self.p("downloads", "fulltext.md"), "# Paper A about kinases\n\n" + "A. " * 300)
+        read_ = lambda doc, *extra: self.lacuna("lit", "read", doc, "--out", lit, *extra)
+        self.assertEqual(read_(paper).returncode, 0)
+        first = read(note)
+        write(paper, "# Paper B about glaciers\n\n" + "B. " * 300)
+        calls = len(self.calls())
+        r = read_(paper)
+        self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stderr)
+        self.assertIn(f"{note} is the note for {paper}, which has changed since that note was written", r.stderr)
+        self.assertIn("--overwrite", r.stderr)
+        self.assertEqual(read(note), first, "the first paper's note was replaced by the second's")
+        self.assertEqual(read_(paper, "--overwrite").returncode, 0, "--overwrite is the way forward")
+        self.assertIn("Paper B", read(note))
+
+        self.assertEqual(self.read().returncode, 0)               # notes for synth to read
+        plan, x = os.path.join(lit, "plan.md"), write(os.path.join(lit, "x.md"), "# X\n" + "x " * 300)
+        y = write(os.path.join(lit, "y.md"), "# Y\n" + "y " * 300)
+        self.assertEqual(self.synth(plan).returncode, 0)
+        self.assertEqual(self.verify(plan).returncode, 0)
+        self.assertEqual(self.synth(x + ".unverified.md").returncode, 0)
+        self.assertEqual(read_(write(self.p("papers", "y.md.unverified.md"), "# Y paper\n" + "w " * 300)).returncode, 0)
+        named_like = [write(self.p("papers", n), f"# A paper called {n}\n" + "z " * 300)
+                      for n in ("plan.md", "plan.md.unverified.md")]
+        clashes = [
+            ("a note over a plan", ("lit", "read", named_like[0], "--out", lit), plan),
+            ("a note over a verify report", ("lit", "read", named_like[1], "--out", lit), plan + ".unverified.md"),
+            ("a plan over a note", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out", note), note),
+            ("a report over a plan", ("lit", "verify", "--target", x, "--repo", self.repo), x + ".unverified.md"),
+            ("a report over a note", ("lit", "verify", "--target", y, "--repo", self.repo), y + ".unverified.md"),
+        ]
+        same = [("read", (paper,)), ("synth", (plan,)), ("verify", (plan,))]
+        record = os.path.join(lit, ".lacuna.json")
+        for version in ("0.3.2", "0.3.1, which did not record the stage"):
+            if version != "0.3.2":
+                entries = json.loads(read(record))
+                for e in entries["files"].values():
+                    del e["stage"]
+                write(record, json.dumps(entries))
+            for label, argv, kept in clashes:
+                with self.subTest(version=version, clash=label):
+                    before, calls = read(kept), len(self.calls())
+                    r = self.lacuna(*argv)
+                    self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stdout + r.stderr)
+                    self.assertIn(" written by `lacuna lit ", r.stderr)
+                    self.assertEqual(read(kept), before)
+            for stage, args in same:
+                with self.subTest(version=version, same_stage=stage):
+                    r = {"read": lambda: read_(*args), "synth": lambda: self.synth(*args),
+                         "verify": lambda: self.verify(*args)}[stage]()
+                    self.assertEqual(r.returncode, 0, f"its own {stage} output is Lacuna's to replace: {r.stderr}")
+
     def test_what_an_after_hook_leaves_is_still_lacunas(self):
         """A hook that prepends frontmatter to every note in the directory, as extending.md
         suggests, edits earlier runs' notes as well as this run's; only this run's were re-recorded,
@@ -374,6 +434,41 @@ class TestOwnership(Pipeline):
         r = self.verify(plan)
         self.assertEqual(r.returncode, 0, f"a report after.synth edited was refused as edited:\n{r.stderr}")
         self.assertEqual(self.synth(plan, "--objective", "and again").returncode, 0)
+
+    def test_deleting_or_damaging_the_record_makes_every_stage_ask(self):
+        """extending.md says deleting .lacuna.json is safe: Lacuna then asks before replacing
+        anything. verify did not ask, and replaced a report annotated by hand. And a damaged record
+        was silently rewritten with only that run's entries, so later refusals could not say why."""
+        target = write(self.p("lit", "plan.md"), "# Plan\n" + "content " * 200)
+        report = target + ".unverified.md"
+        self.assertEqual(self.verify(target).returncode, 0)
+        write(report, read(report) + "- checked by hand: fine\n")
+        os.remove(self.p("lit", ".lacuna.json"))
+        calls = len(self.calls())
+        r = self.verify(target)
+        self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stdout + r.stderr)
+        self.assertIn("has no record", r.stderr)
+        self.assertIn("checked by hand", read(report))
+        self.assertEqual(self.verify(target, "--overwrite").returncode, 0)
+        self.assertEqual(self.read().returncode, 0)
+        plan = self.p("lit", "digest.md")
+        self.assertEqual(self.synth(plan).returncode, 0)
+        os.remove(self.p("lit", ".lacuna.json"))
+        self.assertEqual(self.synth(plan).returncode, 2, "an unrecorded plan was replaced")
+        os.remove(os.path.join(self.notes, ".lacuna.json"))
+        self.assertEqual(self.read().returncode, 0, "an unrecorded note equal to its cached note is adopted")
+
+        record = os.path.join(self.notes, ".lacuna.json")
+        write(record, "{ not json")
+        r = self.lacuna("lit", "read", os.path.join(self.docs, "beta.md"), "--out", self.notes)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (kept,) = [f for f in os.listdir(self.notes) if f.startswith(".lacuna.json.damaged-")]
+        self.assertEqual(read(os.path.join(self.notes, kept)), "{ not json", "the damaged record was not kept")
+        self.assertIn(f".lacuna.json could not be read (JSONDecodeError); it was kept as {self.notes}/{kept}", r.stderr)
+        write(os.path.join(self.notes, "alpha.md"), self.note() + "\nMy own annotation.\n")
+        r = self.read()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(f"an earlier record here was damaged, and was kept as {kept}", r.stderr)
 
 
 class TestMoneyGuarantees(Pipeline):
