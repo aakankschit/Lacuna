@@ -7,7 +7,7 @@ what it must survive. Whole journeys through the pipeline are in test_pipeline.p
 
 Run: python3 -m unittest discover -s tests
 """
-import json, os, re, subprocess, sys, time, unittest
+import json, os, re, shutil, subprocess, sys, time, unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -684,8 +684,11 @@ class TestDoctor(Sandbox):
         self.assertRegex(r.stdout, r"fix: \S*bin/lacuna doctor --install-pdf", "a new user has no `lacuna` on PATH yet")
         self.assertIn("1 BLOCKING", r.stdout)
         # NOT the count of optional pieces: it varies with whether rich and tmux are installed
-        for rel in ("cache", "books", "config.json", "calibration.json"):
+        for rel in ("cache", "books", "config.json"):
             self.assertTrue(os.path.exists(os.path.join(self.data, rel)), rel)
+        # a copy here would beat every later shipped calibration forever (lit_cost prefers the data dir)
+        self.assertFalse(os.path.exists(os.path.join(self.data, "calibration.json")),
+                         "doctor must not copy the shipped calibration into the data directory")
         self.assertFalse([d for d in os.listdir(self.data) if d.startswith("venv")], "no venv without --install-*")
         cfg = json.loads(read(os.path.join(self.data, "config.json")))
         self.assertEqual(cfg.get("models"), {}, "defaults are not baked in: a later release's better default must reach this user")
@@ -700,6 +703,41 @@ class TestDoctor(Sandbox):
                 self.assertNotIn("Traceback", r.stderr)
                 self.assertIn("left untouched", r.stdout)
                 self.assertEqual((read(cfg), read(cal)), (body, '{"_source": "mine"}'))
+
+    def test_reports_a_settings_file_it_could_not_use(self):
+        """A malformed config.json, pricing.json or calibration.json is ignored by every other
+        command, and doctor once printed [ok] beside each and exited 0."""
+        fake = write(self.p("bin2", "claude"), "#!/bin/sh\nexit 0\n", 0o755)
+        env = dict(PATH=f"{os.path.dirname(fake)}:{SAFE_PATH}")
+        self.assertEqual(self.doctor(**env).returncode, 0, "precondition: nothing else is wrong")
+        for name, body in (("config.json", '{"models": {"coder": "x",}}'), ("pricing.json", '{"models": {"a": [1,],}}'),
+                           ("calibration.json", '{"haiku": {')):
+            with self.subTest(name):
+                path = write(os.path.join(self.data, name), body)
+                r = self.doctor(**env)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertRegex(r.stdout, r"\[MISS\][^\n]*\n\s+" + re.escape(path), "the file is named, as a problem")
+                self.assertNotRegex(r.stdout, r"\[ok  \] " + re.escape(path), "an unusable file is not [ok]")
+                self.assertEqual(read(path), body, "doctor must not rewrite it")
+                os.remove(path)
+
+    def test_checks_the_directories_lacuna_resolves(self):
+        """cache and books follow config.json and LACUNA_CACHE/LACUNA_BOOKS; doctor checked, and
+        created, <data>/cache and <data>/books regardless."""
+        cache, books = self.p("elsewhere", "cache"), self.p("elsewhere", "books")
+        r = self.doctor(LACUNA_CACHE=cache, LACUNA_BOOKS=books)
+        for d in (cache, books):
+            self.assertTrue(os.path.isdir(d), d)
+            self.assertRegex(r.stdout, r"\[ok  \] " + re.escape(d))
+        self.assertEqual([x for x in ("cache", "books") if os.path.exists(os.path.join(self.data, x))], [])
+
+    def test_a_data_directory_that_is_a_file_is_a_problem_not_a_traceback(self):
+        blocker = write(self.p("afile"), "x")
+        r = self.doctor(LACUNA_DATA=blocker)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(r.stdout, r"\[MISS\] " + re.escape(blocker))
 
     def test_finds_claude_and_probes_a_parser_by_the_symbols_actually_used(self):
         """`import marker` succeeds for any marker version (a namespace package), so the probe
@@ -869,6 +907,39 @@ class TestResultsPane(Sandbox):
         self.assertIn("Title", r.stdout)
         self.assertIn("bold", r.stdout)
 
+    def test_plain_text_frame_fits_the_terminal(self):
+        """Without rich a long paragraph is one line the terminal wraps, so a 10-row frame needed
+        26 rows and scrolled the header away."""
+        block = self.blocked_rich()
+        probe = write(self.p("draw.py"),
+                      "import io, os, re, sys\nsys.path.insert(0, os.path.dirname(sys.argv[1]))\n"
+                      "import results_pane as RP\nassert not RP.HAVE_RICH\n"
+                      "RP.shutil.get_terminal_size = lambda *a, **k: os.terminal_size((40, 10))\n"
+                      "p = RP.Pane(sys.argv[2]); p.render(); out, real = io.StringIO(), sys.stdout\n"
+                      "sys.stdout = out; p.draw(); sys.stdout = real\n"
+                      "lines = re.sub(r'\\x1b\\[[0-9;?]*[A-Za-z]', '', out.getvalue()).split('\\n')\n"
+                      "print(len(lines), sum(max(1, -(-len(l) // 40)) for l in lines))\n")
+        doc = write(self.p("long.md"), "# Results\n\n" + "\n\n".join("A long paragraph is one line. " * 8 for _ in range(8)) + "\n")
+        r = self.run_py([probe, self.PANE, doc], PYTHONPATH=os.path.dirname(block))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.split(), ["10", "10"], "frame lines, physical rows: both must equal the terminal height")
+
+    def test_a_dangling_symlink_in_the_results_directory_is_skipped(self):
+        d = self.p("pane-dir")
+        write(os.path.join(d, "new.md"), "# Still here\n")
+        os.symlink(self.p("gone.md"), os.path.join(d, "old.md"))
+        r = self.run_py([self.PANE, d, "--once"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Still here", r.stdout)
+
+    def blocked_rich(self):
+        return write(self.p("block", "sitecustomize.py"),
+                     "import sys\nfrom importlib.abc import MetaPathFinder\n"
+                     "class Block(MetaPathFinder):\n"
+                     "    def find_spec(self, name, path=None, target=None):\n"
+                     "        if name == 'rich' or name.startswith('rich.'): raise ImportError('blocked for test')\n"
+                     "sys.meta_path.insert(0, Block())\n")
+
     def test_flags_and_typos_are_not_targets(self):
         """`--once` and `--help` were once taken as the target and created directories of that
         name; a mistyped file name became a directory too."""
@@ -892,6 +963,100 @@ class TestResultsPane(Sandbox):
         r = self.run_py([alone, "--once"], cwd=cwd, LACUNA_RESULTS="~/pane-results")
         self.assertEqual((r.returncode, os.listdir(cwd)), (0, []), r.stderr)
         self.assertTrue(os.path.isdir(os.path.join(self.home, "pane-results")))
+
+
+# --------------------------------------------------------------------------------------------
+# the plugin's own path: a quote or a space in it, and the pane protocol that prints commands
+# --------------------------------------------------------------------------------------------
+
+class TestPluginPath(Sandbox):
+    """The plugin is installed wherever the user's HOME is. `$ROOT` was interpolated into a
+    `python -c` string (a quote was a SyntaxError) and into the tmux pane command unquoted (a space
+    left `lacuna split` exiting 0 with a dead pane)."""
+
+    def plugin(self, name="O'Brien plugins"):
+        root = os.path.join(self.tmp, name, "lacuna")
+        for d in ("bin", "scripts", "hooks"):
+            shutil.copytree(os.path.join(ROOT, d), os.path.join(root, d), ignore=shutil.ignore_patterns("__pycache__"))
+        return root
+
+    def fake_tmux(self):
+        """Runs the pane command the way tmux does: one string, through a shell, no terminal."""
+        log = self.p("tmux.log")
+        write(os.path.join(self.bin, "tmux"),
+              '#!/bin/bash\necho "tmux $*" >> "$TMUX_LOG"\n'
+              'if [ "$1" = split-window ]; then sh -c "${@: -1}" </dev/null >> "$TMUX_LOG" 2>&1; '
+              'echo "pane exit=$?" >> "$TMUX_LOG"; fi\n', 0o755)
+        write(os.path.join(self.bin, "claude"), "#!/bin/sh\nexit 0\n", 0o755)
+        return log
+
+    def test_split_book_survives_quotes_and_spaces_in_the_plugin_path(self):
+        py = write(self.p("bookpy"), '#!/bin/sh\necho "$@" > "$BOOK_LOG"\n', 0o755)
+        for name in ("O'Brien plugins", 'say "hi" \\ $HOME'):
+            with self.subTest(name):
+                root, log = self.plugin(name), self.p("book.log")
+                r = subprocess.run([os.path.join(root, "bin", "lacuna"), "lit", "split-book", "b.pdf", "out"],
+                                   capture_output=True, text=True, cwd=self.tmp,
+                                   env=self.env(LACUNA_PYTHON=py, BOOK_LOG=log))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(os.path.join(root, "scripts", "lit", "split_book.py"), read(log))
+
+    def test_split_hands_tmux_a_pane_command_that_runs(self):
+        log = self.fake_tmux()
+        for name in ("O'Brien plugins", "My Plugins"):
+            with self.subTest(name):
+                root = self.plugin(name)
+                os.makedirs(self.p("proj dir"), exist_ok=True)
+                r = subprocess.run([os.path.join(root, "bin", "lacuna"), "split"], capture_output=True, text=True,
+                                   cwd=self.p("proj dir"), env=self.env(TMUX="/x,1,0", TMUX_LOG=log))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("pane exit=0", read(log), "the pane command died: " + read(log)[-400:])
+                os.remove(log)
+
+    def test_the_pane_commands_the_protocol_prints_run_with_spaces_in_both_paths(self):
+        """The model prints the `Results pane:` and tmux lines from the protocol, with the real
+        paths filled in. Unquoted, a space gave `expected one FILE or DIR` (exit 2)."""
+        root, log = self.plugin(), self.fake_tmux()
+        results = write(self.p("res dir", "My Project-1.md"), "# Findings here\n")
+        hook = self.run_py([os.path.join(root, "hooks", "results_hook.py")], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x")
+        sources = {"hook": json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]}
+        for rel in (("skills", "results-pane", "SKILL.md"), ("output-styles", "results-pane.md")):
+            sources[rel[-1]] = read(os.path.join(ROOT, *rel)).replace("${CLAUDE_PLUGIN_ROOT}", root)
+        for name, text in sources.items():
+            line = re.search(r"(?m)^\s*Results pane:\s+(.+)$", text).group(1).replace("<full path>", results)
+            tmux = re.search(r"(?m)^\s*tmux:\s+(tmux .+?)\s{2,}\(", text).group(1).replace("<full path>", results)
+            for what, cmd in (("open", line), ("tmux", tmux)):
+                with self.subTest(name, command=what):
+                    if os.path.exists(log):
+                        os.remove(log)             # each command must show the document itself
+                    r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, cwd=self.tmp,
+                                       env=self.env(TMUX_LOG=log), stdin=subprocess.DEVNULL)
+                    self.assertEqual(r.returncode, 0, f"{cmd}\n{r.stderr}")
+                    self.assertIn("Findings here", r.stdout + (read(log) if os.path.exists(log) else ""))
+
+    def test_results_hook_never_raises_and_says_the_real_path(self):
+        root = self.plugin()
+        hook, results = os.path.join(root, "hooks", "results_hook.py"), self.p("r.md")
+        proto = os.path.join(root, "scripts", "panes", "protocol.md")
+        shown = self.run_py([hook], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        ctx = json.loads(shown.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(shown.stdout.isascii(), "the output must not depend on the locale")
+        self.assertIn(results, ctx)
+        self.assertIn(os.path.join(root, "bin", "lacuna"), ctx, "${CLAUDE_PLUGIN_ROOT} is literal text to the model")
+        self.assertNotIn("${CLAUDE_PLUGIN_ROOT}", ctx)
+        # The protocol holds non-ASCII characters; the locale's codec must not decide whether it reads.
+        ascii_only = dict(LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
+        enc = self.run_py(["-c", "import locale; print(locale.getpreferredencoding(False))"], **ascii_only).stdout.strip()
+        if enc.upper().replace("_", "-") not in ("ASCII", "US-ASCII", "ANSI-X3.4-1968"):
+            self.skipTest(f"cannot force an ASCII locale here (got {enc})")
+        r = self.run_py([hook], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x", **ascii_only)
+        self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+        self.assertIn(results, r.stdout, "it must still say something, not just survive")
+        with open(proto, "wb") as f:                      # an unreadable protocol: still exit 0, quietly
+            f.write(b"\xff\xfe not utf-8")
+        r = self.run_py([hook], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x")
+        self.assertEqual((r.returncode, r.stdout, "Traceback" in r.stderr), (0, "", False))
 
 
 if __name__ == "__main__":

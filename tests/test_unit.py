@@ -253,11 +253,40 @@ class TestPipelineHelpers(unittest.TestCase):
     def test_find_status_order_and_explicit_path(self):
         self.assertIsNone(L.find_status(self.repo))
         for rel in ["NOTES.md", "docs/STATUS.md", "STATUS.md", "research/STATUS.md"]:   # lowest first
-            self.touch(rel)
+            self.touch(rel, "# Status\ndead end: X\n")
             self.assertEqual(L.find_status(self.repo), os.path.join(self.repo, rel), f"{rel} wins once it exists")
         mine = self.touch("elsewhere/MINE.md")
         self.assertEqual(L.find_status(self.repo, mine), mine)
         self.assertIsNone(L.find_status(self.repo, os.path.join(self.repo, "typo.md")))
+
+    def test_not_content_refuses_what_cannot_be_read_and_passes_real_text(self):
+        def check(data, **kw):
+            return L.not_content(write(os.path.join(self.repo, "f.txt"), data) if isinstance(data, str)
+                                 else self._raw(data), **kw)
+        for label, data in [("empty", ""), ("whitespace", " \n\t\n "), ("NUL byte", b"text\0text" * 50),
+                            ("all 256 byte values", bytes(range(256)) * 20),
+                            ("mostly control characters", "\x01\x02\x03\x04 ok" * 100)]:
+            with self.subTest(label):
+                self.assertTrue(check(data), f"{label} is not content")
+        # Both directions: odd but real text must pass.
+        for label, data in [("accents", "caf\u00e9 na\u00efve r\u00e9sum\u00e9 \u00fcber " * 40),
+                            ("CJK", "\u81ea\u7136\u8a00\u8a9e\u51e6\u7406\u306e\u7814\u7a76 " * 40),
+                            ("emoji and math", "\u2200x \u2208 \u211d: x\u00b2 \u2265 0 \U0001f600 " * 40),
+                            ("form feeds and tabs", "page one\n\f\npage two\t\ttabbed\r\n" * 40),
+                            ("a few stray controls", "A real paragraph about sampling. " * 60 + "\x1b[0m\x07"),
+                            ("latin-1 bytes in prose", ("Une \u00e9tude sur l'eau. " * 60).encode("latin-1")),
+                            ("one line", "# T\n")]:
+            with self.subTest(label):
+                self.assertIsNone(check(data), f"{label} is content")
+        self.assertIn("characters", check("hi\n", min_chars=400))
+        self.assertIsNone(check("x" * 400, min_chars=400))
+        self.assertIn("cannot be read", L.not_content(os.path.join(self.repo, "nope.txt")))
+
+    def _raw(self, data):
+        path = os.path.join(self.repo, "raw.bin")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
 
     def test_books_block_offers_only_books_with_a_toc(self):
         books = os.path.join(self.repo, "books")
