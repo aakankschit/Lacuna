@@ -30,6 +30,30 @@ PIPE, PREP, SPLIT, COST, CFG, CCOST, SPEND, GUARD, STATUS, DOCTOR, PANE, MUTATE 
     "scripts/doctor.py", "scripts/panes/results_pane.py", "tools/mutate.py")
 
 MUTANTS = [
+    # ---- inputs that are not content are refused before a model call (B3, B21-B27, B30, B36)
+    # (replaces synth-unreadable-input-crashes: not_content now refuses an unreadable input first, so
+    # the OSError handler in synth's refusal loop is reached only by a race and no test can see it)
+    ("input-unreadable-passes", PIPE, '        return f"cannot be read ({e.strerror or e})"', "        return None"),
+    ("input-binary-nul-passes", PIPE, 'if b"\\0" in raw:', "if False:"),
+    ("input-binary-ratio-off", PIPE, "if odd > BINARY_RATIO * len(text):", "if False:"),
+    ("input-binary-ratio-too-eager", PIPE, "if odd > BINARY_RATIO * len(text):", "if odd > 0:"),
+    ("input-blank-passes", PIPE, "    if not text.strip():\n        return", "    if False:\n        return"),
+    ("input-tiny-passes", PIPE, "if len(text.strip()) < min_chars:", "if False:"),
+    ("input-read-skips-content-check", PIPE, "            why = not_content(p)\n            if why:\n                bad.append(f\"{p} {why}\")",
+     "            why = None\n            if why:\n                bad.append(f\"{p} {why}\")"),
+    ("input-read-skips-readable-check", PIPE, '                open(p, "rb").close()', "                pass"),
+    ("input-status-unchecked", PIPE, "for why in [not_content(a.status)] if why", "for why in [None] if why"),
+    ("input-empty-repo-synth", PIPE, "    if not repo_files.strip():", "    if False:"),
+    ("input-empty-repo-verify", PIPE, "    if not repo_tree(a.repo).strip():", "    if False:"),
+    ("input-digest-no-minimum", PIPE, "not_content(a.digest, 400)", "not_content(a.digest)"),
+    ("input-notes-not-checked", PIPE, "[(n, not_content(n)) for n in notes]", "[]"),
+    ("input-notes-oserror-escapes", PIPE, "            except OSError as e:                   # a dangling link", "            except ZeroDivisionError as e:         # a dangling link"),
+    ("input-notes-dir-unlistable", PIPE, '            refuse_inputs([f"notes directory {a.notes} cannot be listed ({e.strerror})"])', "            raise"),
+    ("input-verify-notes-unlistable", PIPE, '            refuse_inputs([f"--notes {a.notes} cannot be listed ({e.strerror})"])', "            raise"),
+    ("input-verify-target-unchecked", PIPE, "for why in [not_content(a.target)] if why", "for why in [None] if why"),
+    ("input-guessed-status-not-checked", PIPE, "and not not_content(os.path.join(repo, c)):", ":"),
+    ("verify-status-relative", PIPE, "    status = find_status(a.repo)       # absolute", '    status = "research/STATUS.md"       # absolute'),
+    ("equations-needs-default-venv", PIPE, 'own_venv = (parser or ("marker" if equations else "pymupdf4llm")) != "pymupdf4llm"', "own_venv = False"),
     # ---- note cache key: every omission is a free, fast, wrong answer
     ("key-drops-content", PIPE, "[content_h, PROMPT_VERSION,", "[PROMPT_VERSION,"),
     ("key-drops-prompt-version", PIPE, "[content_h, PROMPT_VERSION,", "[content_h,"),
@@ -263,8 +287,6 @@ MUTANTS = [
     ("reservation-dropped-from-record", PIPE, 'isinstance(v.get("sha256"), str) or v.get("pending") is True',
      'isinstance(v.get("sha256"), str)'),
     ("synth-reply-not-judged", PIPE, "    if ok and said:", "    if False:"),
-    ("synth-unreadable-input-crashes", PIPE, '        except OSError as e:\n            empty.append(f"{f} cannot be read',
-     '        except () as e:\n            empty.append(f"{f} cannot be read'),
     ("synth-inputs-not-checked", PIPE, '    if empty:\n        print("ERROR: these inputs', '    if False:\n        print("ERROR: these inputs'),
     # ---- the status line and the guard read what the CLI reads, as the CLI reads it (N7, F2, F3)
     ("cfg-data-not-expanded", CFG, 'DATA = os.path.expanduser(os.path.expandvars(\n    os.environ.get("LACUNA_DATA") or "~/.lacuna"))',

@@ -125,7 +125,7 @@ def usd(res):
 
 
 def after(stage, out_path):
-    """Run the user's post-stage command, if configured, with the output path as $1.
+    """Run the user's post-stage command, if configured, with the output path as its final argument.
 
     This is the extension seam: a project-specific layer can file the output wherever it keeps
     records without this plugin knowing anything about it.
@@ -137,7 +137,8 @@ def after(stage, out_path):
     if not cmd:
         return
     # Run through a shell so "~", "$VAR" and shell syntax work. The output path is APPENDED as the
-    # final argument: a command with no arguments of its own therefore receives it as "$1".
+    # final argument (it is the command's "$1" only when it has no arguments of its own; the "$1"
+    # in the sh -c string below is this wrapper's).
     try:
         if isinstance(cmd, str):
             argv = ["sh", "-c", cmd + ' "$1"', "sh", out_path]
@@ -192,9 +193,58 @@ def find_status(repo, explicit=None):
     if explicit:
         return explicit if os.path.exists(explicit) else None
     for c in STATUS_CANDIDATES:
-        if os.path.exists(os.path.join(repo, c)):
+        # A guessed file that is empty, binary or unreadable is not a status file: skip it rather
+        # than refuse a run over a file the user never named.
+        if os.path.isfile(os.path.join(repo, c)) and not not_content(os.path.join(repo, c)):
             return os.path.join(repo, c)
     return None
+
+
+def repo_tree(repo):
+    """The file list an agent is given for a codebase: git's, else our own walk. Empty when the
+    repository has no files, or none we are allowed to list."""
+    try:
+        tree = subprocess.run(["git", "-C", repo, "ls-files"], capture_output=True, text=True).stdout
+    except OSError:                            # no git on this machine
+        tree = ""
+    return tree if tree.strip() else "\n".join(walk_files(repo))   # not a git repo: list it ourselves
+
+
+# What a file must be to count as content, whichever subcommand reads it. Every input that is not
+# content was once sent to a paid call and filed as a result (an empty document, a binary .txt, an
+# unreadable --status): the one rule is applied to every input file before any model is called.
+BINARY_RATIO = 0.30       # of the first 64 KB; real text with accents, CJK or symbols is far below it
+
+
+def not_content(path, min_chars=0):
+    """Why the file at `path` cannot be content (a sentence), or None when it can.
+
+    Conservative on purpose: only a NUL byte, or a head that is mostly control characters and
+    undecodable bytes, is called binary, so text in another script or encoding still passes."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(65536)
+    except OSError as e:
+        return f"cannot be read ({e.strerror or e})"
+    if b"\0" in raw:
+        return "is a binary file, not text"
+    text = raw.decode("utf-8", errors="replace")
+    if not text.strip():
+        return "is empty" if not raw else "holds only whitespace"
+    odd = sum(1 for c in text if c == "\ufffd" or (unicodedata.category(c) == "Cc" and c not in "\t\n\r\f\v"))
+    if odd > BINARY_RATIO * len(text):
+        return "is a binary file, not text"
+    if len(text.strip()) < min_chars:
+        return f"holds only {len(text.strip())} characters of text (under {min_chars})"
+    return None
+
+
+def refuse_inputs(problems):
+    """Exit 2, naming every input that is not content and why. Nothing has been sent to a model."""
+    if problems:
+        print("ERROR: these inputs cannot be used:\n" + "\n".join(f"  - {p}" for p in problems)
+              + "\nFix or remove them. Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
 
 
 def need_venv():
@@ -220,13 +270,23 @@ def to_markdown(path, out_dir, equations=False, parser=None):
         sys.exit(EX_INPUT)
     if path.lower().endswith(TEXT_EXTS):
         return path
-    need_venv()
+    # prep_md.py is standard-library only; it needs the default parser's venv to run pymupdf4llm and
+    # for the page and character counts that catch a truncated parse. The marker and docling parsers
+    # live in their own venvs, so `--equations` alone must not demand the default one.
+    own_venv = (parser or ("marker" if equations else "pymupdf4llm")) != "pymupdf4llm"
+    if not own_venv or os.path.exists(VENV):
+        need_venv()
+        py = VENV
+    else:
+        py = sys.executable
+        print(f"  ! no default parser venv at {VENV}: this parse is not checked against the PDF's own "
+              f"text for truncation. `lacuna doctor --install-pdf` adds the check.", file=sys.stderr)
     h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
     os.makedirs(f"{CACHE}/md", exist_ok=True)
     tag = f"_{parser}" if parser else ("_marker" if equations else "")
     md = f"{CACHE}/md/{os.path.basename(path)[:-4]}_{h}_p{PARSE_VERSION}{tag}.md"
     if not os.path.exists(md) or os.path.getsize(md) == 0:   # 0 bytes: an interrupted parse
-        cmd = [VENV, "-I", f"{HERE}/prep_md.py", path, md]
+        cmd = [py, "-I", f"{HERE}/prep_md.py", path, md]
         if equations:
             cmd.append("--equations")
         if parser:
@@ -245,6 +305,22 @@ def to_markdown(path, out_dir, equations=False, parser=None):
 def cmd_read(a):
     """One slim reader per paper, in parallel. The agent writes into --out (its cwd); Python does the
     caching, so a paper is never read twice and no agent needs write access outside --out."""
+    # Every document must be content before anything is parsed, reserved or paid for, and every bad
+    # one is named: an empty .md, a whitespace-only or binary .txt, an unreadable file.
+    bad = []
+    for p in a.papers:
+        if not os.path.isfile(p):
+            bad.append(f"{p} does not exist" if not os.path.lexists(p) else f"{p} is not a file")
+        elif p.lower().endswith(TEXT_EXTS):
+            why = not_content(p)
+            if why:
+                bad.append(f"{p} {why}")
+        else:
+            try:
+                open(p, "rb").close()
+            except OSError as e:
+                bad.append(f"{p} cannot be read ({e.strerror})")
+    refuse_inputs(bad)
     out_dir = os.path.abspath(a.out)
     if os.path.isfile(out_dir):
         print(f"ERROR: --out {a.out!r} is a file; it must be a directory for notes.", file=sys.stderr)
@@ -767,6 +843,10 @@ def cmd_synth(a):
         need_file(a.digest, "--digest")
     if a.status:
         need_file(a.status, "--status")    # silently ignored, a dead end would be proposed again
+        refuse_inputs([f"--status {a.status} {why}" for why in [not_content(a.status)] if why])
+    repo_files = repo_tree(a.repo)
+    if not repo_files.strip():
+        refuse_inputs([f"--repo {a.repo} has no files (or none Lacuna can list), so there is no codebase to read"])
     # The agent runs with cwd set to the output directory, so relative inputs would resolve
     # against the wrong place and it would silently read nothing.
     if os.path.isdir(a.out):
@@ -794,8 +874,19 @@ def cmd_synth(a):
         if not os.path.isdir(a.notes):
             print(f"ERROR: notes directory {a.notes!r} does not exist. Run `read` first.", file=sys.stderr)
             sys.exit(EX_INPUT)
-        notes = sorted(f"{a.notes}/{f}" for f in os.listdir(a.notes)
-                       if f.endswith(".md") and os.path.getsize(f"{a.notes}/{f}") > 400)
+        try:
+            names = sorted(f for f in os.listdir(a.notes) if f.endswith(".md"))
+        except OSError as e:
+            refuse_inputs([f"notes directory {a.notes} cannot be listed ({e.strerror})"])
+        bad = []
+        for f in names:
+            p = f"{a.notes}/{f}"
+            try:
+                if os.path.getsize(p) > 400:       # a stub is no note; skipped, as before
+                    notes.append(p)
+            except OSError as e:                   # a dangling link, a note in an unreadable place
+                bad.append(f"{p} cannot be read ({'a symbolic link to nothing' if os.path.islink(p) else e.strerror})")
+        refuse_inputs(bad)
     if not notes and not a.digest:
         print(f"ERROR: no usable notes in {a.notes!r} and no --digest. Run `read` first.", file=sys.stderr)
         sys.exit(EX_INPUT)
@@ -803,6 +894,9 @@ def cmd_synth(a):
     # the call, by the same test its output will face: a plan from it is paid for and empty.
     # One that cannot be read is refused too: the agent could not read it either, and a real
     # digester given unreadable notes was paid to file "PARTIAL: literature notes unreadable".
+    # A digest shorter than a note is no digest ("hi"); a note that is binary is no note.
+    checks = [(a.digest, not_content(a.digest, 400))] if a.digest else []
+    refuse_inputs([f"{f} {why}" for f, why in checks + [(n, not_content(n)) for n in notes] if why])
     empty = []
     for f in ([a.digest] if a.digest else []) + notes:
         try:
@@ -822,12 +916,7 @@ def cmd_synth(a):
     out_dir = os.path.dirname(os.path.abspath(a.out)) or "."
     os.makedirs(out_dir, exist_ok=True)
     need_writable(out_dir, "the directory of --out")
-    try:
-        tree = subprocess.run(["git", "-C", a.repo, "ls-files"], capture_output=True, text=True).stdout
-    except OSError:                            # no git on this machine
-        tree = ""
-    if not tree.strip():
-        tree = "\n".join(walk_files(a.repo))   # not a git repo: list it ourselves
+    tree = repo_files
     status = find_status(a.repo, a.status)
     tree_path = f"{a.out}.filelist.txt"
     if os.path.islink(tree_path):
@@ -918,6 +1007,13 @@ def cmd_verify(a):
     need_dir(a.repo, "--repo")
     if a.notes:
         need_dir(a.notes, "--notes")
+        try:
+            os.listdir(a.notes)
+        except OSError as e:
+            refuse_inputs([f"--notes {a.notes} cannot be listed ({e.strerror})"])
+    refuse_inputs([f"--target {a.target} {why}" for why in [not_content(a.target)] if why])
+    if not repo_tree(a.repo).strip():
+        refuse_inputs([f"--repo {a.repo} has no files (or none Lacuna can list), so there is no codebase to check against"])
     # The prompt is all the verifier knows: a relative path there checked nothing and exited 0.
     a.target, a.repo = os.path.abspath(a.target), os.path.abspath(a.repo)
     if a.notes:
@@ -928,6 +1024,7 @@ def cmd_verify(a):
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "
               f"to replace it anyway, run the same command with --overwrite.", file=sys.stderr)
         sys.exit(EX_INPUT)
+    status = find_status(a.repo)       # absolute: the agent runs in another directory
     with open(a.target, "rb") as f:
         checked = f"sha256 {hashlib.sha256(f.read()).hexdigest()[:12]}"
     prompt = "\n\n".join([
@@ -935,7 +1032,7 @@ def cmd_verify(a):
         f"Codebase: {a.repo}" + (f"\nSource notes: {a.notes}" if a.notes else ""),
         "For every claim of these three kinds, verify it mechanically and report ONLY failures:",
         "1. A named file, directory, class or function: grep the codebase. Report any that does not exist.",
-        "2. A quoted number: grep the notes and research/STATUS.md for it. Report any you cannot find at its "
+        "2. A quoted number: grep the notes" + (f" and {status}" if status else "") + " for it. Report any you cannot find at its "
         "claimed source, and give the value you did find.",
         "3. An attribution to a paper: check it against the note for that paper. Report mismatches.",
         "Reply with a markdown list: one line per failure, as `claim -> what you found`. "
