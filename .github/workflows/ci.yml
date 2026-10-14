@@ -20,8 +20,12 @@ jobs:
           python-version: ${{ matrix.python }}
 
       # No third-party dependencies: the cost tools and hooks must work on a bare Python.
-      - name: Unit tests
-        run: python -m unittest discover -s tests -v
+      # A scrubbed environment, matching tools/check.sh: no rich, no tmux, no author's HOME.
+      # The suite must not depend on what happens to be installed on the runner.
+      - name: Tests (unit, per-module, integration)
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/clean" LANG=en_US.UTF-8 \
+            "$(command -v python)" -m unittest discover -s tests -v
 
       - name: Every script imports and answers --help
         run: |

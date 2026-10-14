@@ -125,6 +125,11 @@ a pinned id such as `claude-opus-5` is rejected.
 restricted `PATH` and assert it resolved to the fake before running. That is what lets a test prove
 bad input exits *before* any money is spent, and that a cache hit really is free.
 
+`tools/check.sh` runs the whole suite on every Python on the machine in a scrubbed environment
+(`env -i`, a temporary `HOME`, `PATH=/usr/bin:/bin`, so no `rich` and no `tmux`). **Run it before
+pushing.** It exists because the suite was once red on every macOS CI job for one reason: a single
+test counted optional pieces, so its result depended on the host.
+
 **Tests must not depend on what happens to be installed** — not `rich`, not `tmux`, not a parser,
 not the user's own transcripts or home directory. A test whose result changes with the machine is
 worse than no test: it goes red in CI for reasons nobody can reproduce.
