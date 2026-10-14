@@ -682,15 +682,47 @@ class TestSplitBook(TempCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(self.chapter("toc.md").startswith("# mybook\n"))
 
-    def test_refuses_a_book_without_a_top_level_toc(self):
-        for toc in ([], [[2, "Only subsections", 1]]):
-            with self.subTest(toc=toc):
-                r = self.split(toc)
-                self.assertNotEqual(r.returncode, 0)
-                self.assertIn("no top-level table of contents", r.stderr)
-                self.assertFalse(os.path.exists(os.path.join(self.outdir, "toc.md")),
-                                 "a book that cannot be split must not be offered to readers")
-                self.assertFalse(os.path.exists(os.path.join(self.outdir, "index.json")))
+    def test_refuses_a_book_with_no_toc_at_all(self):
+        r = self.split([])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no table of contents", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.outdir, "toc.md")),
+                         "a book that cannot be split must not be offered to readers")
+        self.assertFalse(os.path.exists(os.path.join(self.outdir, "index.json")))
+
+    def test_falls_through_to_a_deeper_toc_level_when_the_top_is_too_coarse(self):
+        """A book organised in Parts has a handful of level-1 entries over hundreds of pages.
+        Splitting there gives 240-page "chapters" and a toc.md naming none of the real chapters."""
+        self.PAGES = [f"page {i} text" for i in range(1, 41)]
+        toc = [[1, "Part I", 1], [1, "Part II", 21]]
+        for i in range(1, 11):
+            toc.append([2, f"Chapter {i}", i * 4 - 3])
+        toc.sort(key=lambda e: e[2])
+        r = self.split(toc)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.outdir, "index.json")) as f:
+            index = json.load(f)
+        self.assertGreaterEqual(len(index), 10, "should split on the chapters, not the Parts")
+        self.assertIn("Chapter 1", self.chapter("toc.md"))
+        self.assertIn("TOC level 2", r.stderr)
+
+    def test_a_level_two_only_toc_is_usable(self):
+        r = self.split([[2, "Only subsections", 1], [2, "Another", 3]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.outdir, "toc.md")))
+
+    def test_out_of_order_and_same_page_entries_do_not_make_empty_chapters(self):
+        """Bookmarks are not guaranteed sorted, and two can claim one page. Before, that produced
+        chapters like `pp. 3-2` and `pp. 18-0` with the text attributed to the wrong one."""
+        r = self.split([[1, "Third", 4], [1, "First", 1], [1, "Also first", 1]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.outdir, "index.json")) as f:
+            index = json.load(f)
+        for row in index:
+            start, end = row["pages"]
+            self.assertLessEqual(start, end, f"{row['title']!r} has a backwards page range")
+            self.assertGreater(row["chars"], 0, f"{row['title']!r} is empty")
+        self.assertEqual([r["pages"][0] for r in index], sorted(r["pages"][0] for r in index))
 
 
 # --------------------------------------------------------------------------------------------
@@ -865,9 +897,20 @@ class TestStatusline(TempCase):
 
     def test_cold_cache_estimate_uses_the_exact_model_price(self):
         """opus-5-5 1h writes are $8/MTok; matching "opus-5" instead would say $1.50."""
-        r, (l1, _) = self.render(self.payload())
+        r, (l1, _) = self.render(self.payload(
+            prompt_cache={"expires_at": time.time() - 60, "ttl": "1h"}))
         self.assertIn("cold · next prompt re-caches ≈$1.20", l1)
         self.assertIn("/compact", l1)
+
+    def test_an_absent_prompt_cache_says_nothing_rather_than_guessing_cold(self):
+        """Claude Code omits prompt_cache before a process's first request, e.g. right after a
+        resume. Announcing a cold cache then is a guess, and the one it gets wrong is expensive to
+        believe: the docs promise the segment goes blank instead."""
+        r, (l1, _) = self.render(self.payload())      # no prompt_cache key at all
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("cold", l1)
+        self.assertNotIn("re-caches", l1)
+        self.assertIn("ctx", l1, "the rest of the line must still render")
 
     def test_warm_cache_and_plan_usage_segments(self):
         p = self.payload(prompt_cache={"expires_at": time.time() + 1800, "ttl": "1h", "hit_ratio": 0.93},
@@ -933,15 +976,23 @@ class TestDoctor(TempCase):
         self.assertRegex(r.stdout, r"\[note\] docling not installed")   # optional: not blocking
         # only a missing `claude` blocks; the three parsers are optional — audit finding W25
         self.assertIn("1 BLOCKING", r.stdout)
-        self.assertIn("5 optional piece(s) not installed", r.stdout)
+        # Deliberately NOT asserting the count of optional pieces: it varies with whether `rich`
+        # and `tmux` happen to be installed on the machine, which made this test fail in CI on
+        # macOS for reasons nobody could reproduce. A test whose result depends on the host is
+        # worse than no test.
+        self.assertRegex(r.stdout, r"\d+ optional piece\(s\) not installed")
         for rel in ("cache", "books", "config.json", "calibration.json"):
             self.assertTrue(os.path.exists(os.path.join(self.data, rel)), rel)
         self.assertFalse([d for d in os.listdir(self.data) if d.startswith("venv")],
                          "doctor without --install-* must not create any venv")
         with open(os.path.join(self.data, "config.json")) as f:
             cfg = json.load(f)
-        self.assertEqual(cfg["models"]["planner"], "claude-opus-5")
-        self.assertEqual(cfg["after"], {"read": "", "synth": "", "verify": ""})
+        # doctor writes an (almost) empty file on purpose: copying every default in would freeze
+        # them, so a later release improving a default would never reach this user, and `config`
+        # would report values as overrides they never made — audit finding D17.
+        self.assertEqual(cfg.get("models", {}), {}, "doctor must not bake defaults into config.json")
+        self.assertNotIn("effort", cfg)
+        self.assertIn("_comment", cfg)
 
     def test_is_idempotent(self):
         self.doctor()

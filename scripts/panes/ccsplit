@@ -17,10 +17,12 @@ viewer="$HERE/ccresults $(printf '%q' "$CLAUDE_RESULTS_FILE")"
 if [ -n "${TMUX:-}" ]; then
   tmux split-window -h -l 45% -c "$PWD" "$viewer"
   tmux select-pane -L
-  exec claude "$@"
+  if [ "$#" -eq 0 ]; then exec claude; else exec claude "$@"; fi
 fi
 sess="cc-${proj//[^A-Za-z0-9]/-}-$(date +%H%M%S)"
-tmux new-session -d -s "$sess" -c "$PWD" -e "CLAUDE_RESULTS_FILE=$CLAUDE_RESULTS_FILE" "claude $(printf '%q ' "$@")"
+claude_cmd="claude"
+[ "$#" -gt 0 ] && claude_cmd="claude $(printf '%q ' "$@")"
+tmux new-session -d -s "$sess" -c "$PWD" -e "CLAUDE_RESULTS_FILE=$CLAUDE_RESULTS_FILE" "$claude_cmd"
 tmux set-option -t "$sess" mouse on >/dev/null
 tmux split-window -h -l 45% -t "$sess" -c "$PWD" "$viewer"
 tmux select-pane -t "$sess" -L

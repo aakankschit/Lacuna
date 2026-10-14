@@ -104,7 +104,7 @@ class Pane:
 
     def draw(self):
         cols, rows = shutil.get_terminal_size()
-        body = rows - 1
+        body = rows - 1          # one row is reserved for the header, which must never scroll
         self.offset = max(0, min(self.offset, max(0, len(self.lines) - body)))
         out = ["\033[H"]
         name = os.path.basename(self.path) if self.path else "no results yet"
@@ -120,8 +120,11 @@ class Pane:
             out.append(pad + DIM + msg.center(cols)[:cols] + RST)
             out.append("\033[J")
         else:
-            for ln in self.lines[self.offset:self.offset + body]:
-                out.append(ln + "\033[K\n")
+            # No trailing newline after the final row. Header + `body` rows is exactly the height
+            # of the pane, so one more newline scrolls the terminal by a line every redraw, which
+            # pushed the header off the top and left the last row blank.
+            shown = self.lines[self.offset:self.offset + body]
+            out.append("\n".join(ln + "\033[K" for ln in shown))
             out.append("\033[J")
         sys.stdout.write("".join(out).rstrip("\n"))
         sys.stdout.flush()
@@ -166,8 +169,14 @@ def main():
     if not os.path.exists(target):
         if target.endswith(".md"):
             os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+        elif not positional:
+            os.makedirs(target, exist_ok=True)      # the configured results dir: fine to create
         else:
-            os.makedirs(target, exist_ok=True)
+            # Creating a directory named after the user's typo is never what they meant.
+            print(f"ERROR: no such file or directory: {target}\n"
+                  f"Give an existing directory, or a path ending in .md to follow a file that does "
+                  f"not exist yet.", file=sys.stderr)
+            sys.exit(2)
     pane = Pane(target)
     if once or not sys.stdin.isatty() or not sys.stdout.isatty():
         pane.render()                      # no terminal of its own: print once and exit

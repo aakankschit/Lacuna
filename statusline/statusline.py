@@ -83,7 +83,10 @@ def last_turn(path):
 
 
 def main():
-    d = json.load(sys.stdin)
+    try:
+        d = json.load(sys.stdin)
+    except ValueError:
+        return          # a status line that prints a traceback is worse than one that prints nothing
     cols = int(os.environ.get("COLUMNS", 120))
     model = d.get("model") or {}
     name = model.get("display_name", "?")
@@ -111,8 +114,13 @@ def main():
             # "1h cache · 42m left", never "1h 42m left" — which reads as a single duration
             l1.append(f"cache {c(col, '●')} " + (f"{ttl} cache · " if ttl else "")
                       + c(col, dur(left) + " left"))
-        else:
+        elif pc:
+            # We know the cache state and it has expired.
             l1.append(c(203, f"cache ○ cold · next prompt re-caches ≈${ctx * w1 / 1e6:.2f}"))
+        # No prompt_cache at all: Claude Code has not reported one yet (it omits the field before
+        # a process's first request, e.g. straight after a resume). Say nothing rather than
+        # announce a cold cache that may well be warm — the docs promise an absent segment, and a
+        # red dollar figure on a warm cache is worse than no figure.
         if ctx >= 150_000:
             l1.append(c(221, "→ /compact or handoff at next break"))
     else:
@@ -143,4 +151,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # The status line runs on every refresh. Nothing it reports is worth breaking the prompt for.
+    try:
+        main()
+    except Exception:
+        pass

@@ -34,6 +34,10 @@ LEDGER = lacuna_config.path("ledger")
 # changed prompt must miss the cache rather than silently serve notes written under old assumptions.
 PROMPT_VERSION = "1"
 
+# Bump when prep_md's clean() or validate() changes: the parsed-markdown cache is keyed on this,
+# so without it a change to parsing never reaches a document that has already been parsed.
+PARSE_VERSION = "2"
+
 EX_OK, EX_INPUT, EX_PARSE, EX_MODEL = 0, 2, 3, 4   # exit codes, so callers can branch
 
 NOTE_TEMPLATE = """# <short title> (<first author> <year>)
@@ -199,7 +203,7 @@ def to_markdown(path, out_dir, equations=False, parser=None):
     h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
     os.makedirs(f"{CACHE}/md", exist_ok=True)
     tag = f"_{parser}" if parser else ("_marker" if equations else "")
-    md = f"{CACHE}/md/{os.path.basename(path)[:-4]}_{h}{tag}.md"
+    md = f"{CACHE}/md/{os.path.basename(path)[:-4]}_{h}_p{PARSE_VERSION}{tag}.md"
     if not os.path.exists(md):
         cmd = [VENV, "-I", f"{HERE}/prep_md.py", path, md]
         if equations:
@@ -207,6 +211,10 @@ def to_markdown(path, out_dir, equations=False, parser=None):
         if parser:
             cmd += ["--parser", parser]
         r = subprocess.run(cmd, capture_output=True, text=True)
+        # prep_md reports a fallback on stderr; pass it on so a slow parse is not a mystery.
+        for line in (r.stderr or "").splitlines():
+            if "falling back" in line or "trying" in line or "failed validation" in line:
+                print(f"  {line.strip()}", file=sys.stderr)
         if r.returncode != 0 or not os.path.exists(md):
             print(f"ERROR: could not parse {path}.\n{(r.stderr or r.stdout).strip()[-800:]}", file=sys.stderr)
             sys.exit(EX_PARSE)
@@ -240,7 +248,7 @@ def cmd_read(a):
             [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
         # md may be "<name>_<pdf-hash>[_<parser>].md" from the parse cache; the note is just <name>.
-        stem = re.sub(r"_[0-9a-f]{12}(_[a-z0-9]+)?$", "", os.path.basename(md)[:-3])
+        stem = re.sub(r"_[0-9a-f]{12}(_p\d+)?(_[a-z0-9]+)?$", "", os.path.basename(md)[:-3])
         jobs.append((md, f"{out_dir}/{stem}.md", f"{CACHE}/notes/{stem}_{key}.md"))
 
     def one(md, out, cached):
@@ -259,8 +267,11 @@ def cmd_read(a):
                      effort=lacuna_config.effort("reader"), cwd=out_dir)
         ok = usable_output(out, 400, "note")
         # source_tokens makes the calibration recipe in docs/extending.md actually runnable
-        ledger({"stage": "read", "model": reader_model, "paper": os.path.basename(md), "cost": usd(res),
-                "wall_s": res["wall_s"], "books": not a.no_books, "wrote_note": ok,
+        # effort and source_tokens are both required by the recalibration recipe in
+        # docs/extending.md, which is per model x effort.
+        ledger({"stage": "read", "model": reader_model, "effort": reader_effort,
+                "paper": os.path.basename(md), "cost": usd(res), "wall_s": res["wall_s"],
+                "books": not a.no_books, "wrote_note": ok,
                 "source_tokens": round(os.path.getsize(md) / 2.9), "is_error": res.get("is_error")})
         if ok:
             shutil.copy(out, cached)
@@ -394,7 +405,8 @@ def cmd_synth(a):
            ([os.path.dirname(os.path.abspath(a.digest))] if a.digest else [])
     res = claude("synth", model, prompt, dirs, effort=lacuna_config.effort(role), cwd=out_dir)
     ok = usable_output(a.out, 800, a.kind)
-    ledger({"stage": "synth", "kind": a.kind, "model": model, "notes": len(notes),
+    ledger({"stage": "synth", "kind": a.kind, "model": model, "effort": lacuna_config.effort(role),
+            "notes": len(notes),
             "from_digest": bool(a.digest), "cost": usd(res), "wall_s": res["wall_s"], "wrote": ok,
             "is_error": res.get("is_error")})
     print(f"{a.kind} ({model}): ${usd(res):.3f}, {res['wall_s']}s -> {a.out}")
@@ -424,7 +436,8 @@ def cmd_verify(a):
     dirs = [a.repo, os.path.dirname(os.path.abspath(a.target))] + ([a.notes] if a.notes else [])
     vmodel = a.model or lacuna_config.model("verifier")
     res = claude("verifier", vmodel, prompt, dirs, effort=lacuna_config.effort("verifier"))
-    ledger({"stage": "verify", "model": vmodel, "target": os.path.basename(a.target), "cost": usd(res),
+    ledger({"stage": "verify", "model": vmodel, "effort": lacuna_config.effort("verifier"),
+            "target": os.path.basename(a.target), "cost": usd(res),
             "wall_s": res["wall_s"], "is_error": res.get("is_error")})
     report = str(res.get("result") or "")
     if res.get("is_error") or not report.strip():

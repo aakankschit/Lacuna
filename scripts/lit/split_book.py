@@ -36,17 +36,51 @@ if not os.path.exists(pdf):
     die2(f"ERROR: no such file: {pdf}")
 os.makedirs(outdir, exist_ok=True)
 doc = pymupdf.open(pdf)
-toc = [(lvl, title, page) for lvl, title, page in doc.get_toc() if lvl == 1]
+full_toc = doc.get_toc()
+if not full_toc:
+    die2(f"ERROR: {os.path.basename(pdf)} has no table of contents, so it cannot be split by "
+         f"chapter. Parse it as one document instead: `lacuna lit read {pdf}`.")
+
+
+def entries_at(level):
+    return [(t, p) for lvl, t, p in full_toc if lvl == level and 0 < p <= doc.page_count]
+
+
+# Pick the shallowest level that actually divides the book: the first with at least 5 entries,
+# otherwise whichever level has the most. A book organised in Parts has two or three level-1
+# entries over hundreds of pages — splitting there gives 240-page "chapters" and a toc.md that
+# names none of the real ones.
+USEFUL = 5
+counts = {lvl: len(entries_at(lvl)) for lvl in (1, 2, 3) if entries_at(lvl)}
+level = next((lvl for lvl in sorted(counts) if counts[lvl] >= USEFUL),
+             max(counts, key=lambda lvl: (counts[lvl], -lvl)) if counts else 1)
+toc = entries_at(level)
 if not toc:
-    die2(f"ERROR: {os.path.basename(pdf)} has no top-level table of contents, so it cannot be "
-             f"split by chapter. Parse it as one document instead: `lacuna lit read {pdf}`.")
+    die2(f"ERROR: {os.path.basename(pdf)} has a table of contents, but none of its entries point "
+         f"at a valid page. Parse it as one document instead.")
+if level > 1:
+    print(f"  splitting at TOC level {level}: level 1 had {len(entries_at(1))} entries for "
+          f"{doc.page_count} pages, which is too coarse to be useful.", file=sys.stderr)
+
+# Bookmarks are not guaranteed to be sorted, and two chapters may claim the same start page.
+toc.sort(key=lambda tp: tp[1])
+deduped = []
+for title, start in toc:
+    if deduped and start == deduped[-1][1]:
+        print(f"  ! {title!r} starts on the same page as {deduped[-1][0]!r} (p. {start}); "
+              f"merging the titles rather than writing an empty chapter", file=sys.stderr)
+        deduped[-1] = (f"{deduped[-1][0]} / {title}", start)
+        continue
+    deduped.append((title, start))
+toc = deduped
 if len(toc) < 5 and doc.page_count > 150:
-    print(f"  ! only {len(toc)} top-level entries for {doc.page_count} pages — the chapters will be "
-          f"huge. This splits on the top TOC level only; check toc.md names what you expect.",
-          file=sys.stderr)
+    print(f"  ! only {len(toc)} entries for {doc.page_count} pages — the chapters will be large. "
+          f"Check toc.md names what you expect before relying on it.", file=sys.stderr)
 rows = []
-for i, (_, title, start) in enumerate(toc):
-    end = toc[i + 1][2] - 1 if i + 1 < len(toc) else doc.page_count
+for i, (title, start) in enumerate(toc):
+    end = toc[i + 1][1] - 1 if i + 1 < len(toc) else doc.page_count
+    if end < start:                     # cannot happen now that the list is sorted, but be sure
+        end = start
     text = "\n".join(doc[p].get_text() for p in range(start - 1, end))
     text = CTRL.sub("", text)
     text = "\n".join(l for ln in text.splitlines() for l in (textwrap.wrap(ln, 300) or [""]))

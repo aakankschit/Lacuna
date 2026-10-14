@@ -28,9 +28,7 @@ except Exception:                                      # the hook must never bre
     _DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")
     _CFG, _PRICES = {}, {}
 
-IDLE_MIN = float(os.environ.get("LACUNA_IDLE_MIN")
-                 or os.environ.get("LACUNA_IDLE_MIN")
-                 or _CFG.get("idle_minutes", 60))
+IDLE_MIN = float(os.environ.get("LACUNA_IDLE_MIN") or _CFG.get("idle_minutes", 60))
 MIN_CTX = int(os.environ.get("LACUNA_MIN_CTX", 40_000))
 GRACE_S = 15 * 60
 STATE = os.path.join(_DATA, "cache_guard")
@@ -38,9 +36,43 @@ FALLBACK_WRITE_1H = 8.0   # $/MTok if the model is not in the price table
 _m = _CFG.get("models", {})
 ROUTING = (f"Routing (measured — see the plugin's docs/benchmarks): "
            f"{_m.get('reader', 'haiku')} reads and fact-checks · {_m.get('coder', 'sonnet')} writes code · "
-           f"{_m.get('planner', 'claude-opus-5')} plans and writes tests. "
+           f"{_m.get('planner', 'claude-opus-5')} plans · {_m.get('tester', 'opus')} writes tests. "
            f"Effort is a cost multiplier, not a quality lever. "
            f"Stepping away for more than {IDLE_MIN:.0f} min? Write a handoff, then /clear.")
+
+
+def compacted_since(path, after_ts):
+    """True if the transcript shows a compaction after the given time.
+
+    /compact is the remedy this hook recommends, and it replaces the context with a summary. The
+    newest assistant call still in the transcript is the pre-compaction one, so without this the
+    hold quotes several times the real context immediately after the user did what it asked.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4_000_000))
+            lines = f.read().decode("utf-8", "ignore").splitlines()
+    except OSError:
+        return False
+    for ln in reversed(lines):
+        if '"compact' not in ln and '"summary' not in ln and "isCompactSummary" not in ln:
+            continue
+        try:
+            e = json.loads(ln)
+        except ValueError:
+            continue
+        if not (e.get("isCompactSummary") or e.get("type") in ("compact_boundary", "summary")
+                or (e.get("subtype") == "compact_boundary")):
+            continue
+        ts = e.get("timestamp") or ""
+        try:
+            when = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return True        # a compaction we cannot date: assume it is recent and stay quiet
+        if when >= after_ts:
+            return True
+    return False
 
 
 def last_call(path):
@@ -125,6 +157,8 @@ def main():
     st = state(sid)
 
     if idle >= IDLE_MIN and ctx >= MIN_CTX:
+        if compacted_since(d.get("transcript_path") or "", ts):
+            return          # the context was replaced after that call; our figure is meaningless
         if time.time() - st.get("held_at", 0) < GRACE_S:
             state(sid, {**st, "held_at": 0})
             return  # second send after a hold: user chose to go ahead

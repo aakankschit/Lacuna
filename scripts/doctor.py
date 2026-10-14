@@ -10,24 +10,27 @@ sys.path.insert(0, HERE)
 import lacuna_config
 
 OK, WARN, BAD = "ok  ", "note", "MISS"
+# Intentionally minimal: anything written here overrides the shipped default forever, including
+# defaults that later releases improve. `lacuna config` prints the full effective settings, and
+# docs/extending.md documents every key.
 CONFIG_TEMPLATE = {
-    "_comment": "lacuna configuration. Delete any key to fall back to the shipped default; "
-                "see docs/extending.md for the full schema. Environment variables LACUNA_* "
-                "override this file.",
-    "models": dict(lacuna_config.DEFAULTS["models"]),
-    "effort": dict(lacuna_config.DEFAULTS["effort"]),
-    "after": {"read": "", "synth": "", "verify": ""},
-    "budget_warn_usd": lacuna_config.DEFAULTS["budget_warn_usd"],
-    "idle_minutes": lacuna_config.DEFAULTS["idle_minutes"],
+    "_comment": "Lacuna settings. Add only what you want to change — anything set here overrides "
+                "the shipped default permanently. `lacuna config` shows what is in effect and "
+                "where each value came from. Full schema: docs/extending.md. Strict JSON: no "
+                "comments, or the whole file is ignored.",
+    "models": {},
 }
 # One venv per parser: their dependency trees genuinely collide. Keys match prep_md.py's VENVS.
 EXTRAS = {
-    "pdf":       dict(pkg="pymupdf4llm", mod="pymupdf4llm", venv="venv",
+    "pdf":       dict(pkg="pymupdf4llm", mod="pymupdf4llm", venv="venv", probe=None,
                       why="the default parser, ~4 s/document — needed only to read PDFs", blocking=False),
-    "fallback":  dict(pkg="docling", mod="docling", venv="venv-docling",
+    "fallback":  dict(pkg="docling", mod="docling", venv="venv-docling", probe=None,
                       why="structured fallback for documents the default parser mangles, ~73 s/document",
                       blocking=False),
     "equations": dict(pkg="marker-pdf", mod="marker", venv="venv-marker",
+                      # the symbols prep_md.py actually imports, not a bare `import marker`
+                      probe="from marker.converters.pdf import PdfConverter\n"
+                            "from marker.models import create_model_dict",
                       why="LaTeX-fidelity parser; ~2 GB of models on first use, and it also needs a "
                           "llama.cpp binary on PATH (`brew install llama.cpp`) or its import fails",
                       blocking=False),
@@ -40,10 +43,18 @@ def say(state, what, detail=""):
     print(f"  [{state}] {what}" + (f"\n         {detail}" if detail else ""))
 
 
-def venv_has(py, module):
+def venv_has(py, module, probe=None):
+    """True when the venv has a usable install.
+
+    `import marker` succeeds for ANY marker version, because it is a namespace package with no
+    __init__.py — so a probe of the symbol actually used is the only check with teeth. On macOS's
+    Python 3.9, `pip install marker-pdf` resolves to 0.2.17, which has no `marker.converters` at
+    all, and the plain import still passed.
+    """
     if not os.path.exists(py):
         return False
-    r = subprocess.run([py, "-I", "-c", f"import {module}"], capture_output=True)
+    code = probe or f"import {module}"
+    r = subprocess.run([py, "-I", "-c", code], capture_output=True)
     return r.returncode == 0
 
 
@@ -85,9 +96,13 @@ def main():
     if os.path.exists(cfg_path):
         say(OK, f"{cfg_path}", "yours; left untouched")
     else:
+        # Deliberately almost empty. Writing every default here would freeze them: a later release
+        # that improves a default would never reach anyone who had ever run `doctor`, and
+        # `lacuna config` would report every value as an override the user never made.
         with open(cfg_path, "w") as f:
             json.dump(CONFIG_TEMPLATE, f, indent=2)
-        say(OK, f"{cfg_path}   (written with the shipped defaults)")
+        say(OK, f"{cfg_path}   (created empty — defaults are not copied in, so later "
+                f"improvements still reach you)")
     cal_src = os.path.join(lacuna_config.ROOT, "scripts", "lit", "calibration.json")
     cal_dst = os.path.join(lacuna_config.DATA, "calibration.json")
     if not os.path.exists(cal_dst) and os.path.exists(cal_src):
@@ -105,13 +120,19 @@ def main():
             vdir = os.path.dirname(os.path.dirname(py))
             if not os.path.exists(py):
                 print(f"  creating {vdir} ...")
-                subprocess.run([sys.executable, "-m", "venv", vdir], check=True)
+                r = subprocess.run([sys.executable, "-m", "venv", vdir],
+                                   capture_output=True, text=True)
+                if r.returncode != 0 or not os.path.exists(py):
+                    say(BAD, f"could not create a virtualenv at {vdir}",
+                        (r.stderr or r.stdout).strip()[-300:]
+                        + "\n         on Debian/Ubuntu this usually means: apt install python3-venv")
+                    continue
             print(f"  installing {e['pkg']} into {vdir} (this can take a while) ...")
             if subprocess.run([py, "-m", "pip", "install", "-q", e["pkg"]]).returncode:
                 say(BAD, f"{e['pkg']} install failed",
                     f"run it by hand to see why: {py} -m pip install {e['pkg']}")
                 continue
-        if venv_has(py, e["mod"]):
+        if venv_has(py, e["mod"], e.get("probe")):
             say(OK, f"{e['pkg']}", e["why"])
         else:
             fix = os.path.join(lacuna_config.ROOT, "bin", "lacuna")

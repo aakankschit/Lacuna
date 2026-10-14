@@ -17,6 +17,9 @@ import lacuna_config
 
 DATA = lacuna_config.DATA
 REF = re.compile(r"\n#*\s*\**(References|Bibliography)\**\s*\n", re.I)
+# Any heading. Used to find where the citation block ends, so material a journal places AFTER the
+# references (acknowledgements, data availability, Extended Data legends) is not lost with them.
+HEADING = re.compile(r"\n#{1,4}\s+\S")
 CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 # each parser runs in its own venv so their dependencies never collide
 # Created by `lacuna doctor --install-*`; docling and marker are optional extras.
@@ -75,9 +78,23 @@ def validate(md, pages):
 
 
 def clean(md):
-    m = list(REF.finditer(md))
-    if m:
-        md = md[:m[-1].start()]
+    """Strip trailing reference lists, control characters, and rewrap.
+
+    Only a reference list in the last part of the document is cut, and only the citation block
+    itself. Journal formats put a second reference list before Methods, and put acknowledgements,
+    data-availability notes and Extended Data legends *after* the references — cutting from the
+    last heading to the end dropped 18% of one real paper, legends included.
+    """
+    # Only the LAST "References" heading is the real citation list; an earlier one is usually a
+    # contents-page entry. Cut from there to the NEXT heading rather than to the end of the file:
+    # journals put acknowledgements, data availability and Extended Data legends after the
+    # citations, and cutting to the end dropped 18% of one real paper, legends included.
+    found = list(REF.finditer(md))
+    if found:
+        last = found[-1]
+        tail = md[last.end():]
+        resume = HEADING.search(tail)
+        md = md[:last.start()] + (tail[resume.start():] if resume else "")
     md = CTRL.sub("", md)
     return "\n".join(l for ln in md.splitlines()
                      for l in (textwrap.wrap(ln, 300, break_long_words=False) or [""]))
@@ -108,8 +125,10 @@ def convert(pdf, out, forced=None, equations=False, quiet=False):
         if not quiet:
             print(f"{out}  {len(text):,} chars  ~{len(text) / 2.9:,.0f} tok  via {parser}")
         return True, []
-    hint = ("" if "docling" in problems or forced or equations else
-            "  (the docling fallback is not installed: `lacuna doctor --install-fallback`)")
+    missing_fallback = any("venv missing" in str(v) or "No module named" in str(v)
+                           for k, v in problems.items() if k == "docling")
+    hint = ("  (the docling fallback is not installed: `lacuna doctor --install-fallback`)"
+            if missing_fallback and not forced and not equations else "")
     print(f"ERROR {os.path.basename(pdf)}: no parser produced usable output.{hint} "
           + " | ".join(f"{k}: {v}" for k, v in problems.items()), file=sys.stderr)
     return False, list(problems)

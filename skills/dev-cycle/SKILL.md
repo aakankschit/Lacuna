@@ -58,16 +58,25 @@ attributed.
 Run them concurrently — they touch different files in different worktrees. (Unrelated but learned
 the hard way: never run two GPU-bound processes concurrently; it corrupted a parser output.)
 
-**Pass the configured models explicitly.** Agent frontmatter cannot read configuration, so the
-files carry a plain `sonnet` / `opus` default. Read the user's choice and pass it when spawning:
+**Models.** The agent files carry a plain `sonnet` / `opus` default, because agent frontmatter
+cannot read configuration.
+
+If you spawn them with the **Agent tool**, its `model:` accepts only `sonnet`, `opus`, `haiku` or
+`fable` — a pinned id such as `claude-opus-5` is **rejected**, and the spawn fails rather than
+falling back. So either omit `model:` and accept the frontmatter default, or pass one of those four
+aliases.
+
+If you need a pinned version — for a study that has to be reproducible — spawn headless instead,
+where any model string works:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/lacuna config --json | python3 -c \
-  "import json,sys; m=json.load(sys.stdin)['models']; print(m['coder'], m['tester'])"
+LAC=${CLAUDE_PLUGIN_ROOT}/bin/lacuna
+CODER=$($LAC config --json | python3 -c "import json,sys;print(json.load(sys.stdin)['models']['coder'])")
+claude -p --model "$CODER" --agents "$(cat agents.json)" --agent coder < prompt.txt
 ```
 
-Then spawn each agent with that `model:`. If the call fails, the frontmatter defaults apply and you
-should say so rather than assume the user's setting took effect.
+Say which route you took. An agent silently running on a different model than the user configured
+is the kind of thing that invalidates a comparison without anyone noticing.
 
 **Check the agents can actually run code.** Under a restrictive permission mode a headless agent may
 write files but have every `Bash` call refused, so it implements blind and cannot self-verify. Either

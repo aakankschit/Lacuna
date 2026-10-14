@@ -29,6 +29,7 @@ with open(CAL_PATH) as f:
     CAL = json.load(f)
 CAL_SOURCE = ("upstream — someone else's runs on their hardware, not yours"
               if CAL.get("_source") == "upstream" else "yours")
+POOL = 8                  # lit_pipeline runs at most this many readers concurrently
 STARTUP = 3_700           # measured: slim reader agent's first request
 HAIKU_TIER = 100_000      # the cheap tier's input price rises 5x above this prompt size
 IDEATION = {"notes_tok": 1_500, "context_tok": 6_000, "out_tok": 8_000}  # notes + project context, output
@@ -90,8 +91,10 @@ def main():
     total = sum(toks)
     groups = [toks[i:i + k] for i in range(0, len(toks), k)]
     biggest = max((sum(g) for g in groups), default=0) + STARTUP
-    print(f"{len(files)} documents, ~{total:,.0f} tokens; {len(groups)} reader(s) at {k} per reader "
-          f"(largest reader context ~{biggest:,.0f} tokens)")
+    waves = -(-len(groups) // POOL)
+    print(f"{len(files)} documents, ~{total:,.0f} tokens; {len(groups)} reader(s) at {k} per reader"
+          + (f", run {POOL} at a time in {waves} waves" if waves > 1 else "")
+          + f" (largest reader context ~{biggest:,.0f} tokens)")
     if biggest > HAIKU_TIER:
         print(f"  ! a reader exceeds {HAIKU_TIER:,} tokens: Haiku's long-context price (5x) applies; lower --per-agent")
     known = [m for m in CAL if isinstance(CAL[m], dict)]
@@ -109,7 +112,9 @@ def main():
             if not c:
                 cells.append(f"{'-':>14s}"); continue
             usd = total / 1000 * c["usd_per_ktok"] * (5 if m == "haiku" and biggest > HAIKU_TIER else 1)
-            mins = c["minutes_per_paper"] * max(len(g) for g in groups)  # readers run in parallel
+            # Readers run in a pool of POOL at a time, so N groups take ceil(N / POOL) waves.
+            waves = -(-len(groups) // POOL)
+            mins = c["minutes_per_paper"] * max(len(g) for g in groups) * waves
             cells.append(f"${usd:7.2f} {mins:4.0f}m")
         print(f"{m:15s} " + " ".join(cells))
     new_ctx = IDEATION["notes_tok"] * len(files) + IDEATION["context_tok"]
