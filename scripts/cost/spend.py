@@ -10,7 +10,7 @@ and whether they were billed is not in the transcript. Those are shown as the to
 import argparse, collections, glob, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ccost import ROOT, avoidable_colds, earlier_usd, load, project_dir, short, split, ts
+from ccost import ROOT, avoidable_colds, earlier_split, earlier_usd, load, project_dir, short, split, ts
 
 COLOR = True
 
@@ -35,9 +35,11 @@ def bar(parts, width=40):
 LOWER_BOUND = "a lower bound — see docs/LIMITS.md"
 
 
-def figure(low, gap):
-    """A dollar figure that never silently drops the earlier attempts: a range when there are any."""
-    return f"${low:.2f}–${low + gap:.2f}" if gap >= 0.005 else f"${low:.2f}"
+def figure(low, gap, nd=2):
+    """A dollar figure that never silently drops the earlier attempts: a range when there are any.
+    Every subtotal goes through here (a total that is a range beside a part that is not is a
+    contradiction), at the precision the figure is printed in."""
+    return f"${low:.{nd}f}–${low + gap:.{nd}f}" if gap >= 0.5 * 10 ** -nd else f"${low:.{nd}f}"
 
 
 def retried_line(n, gap):
@@ -51,11 +53,14 @@ def session_report(path):
     if not calls:
         print("no API calls in", path)
         return
-    tot = collections.Counter()
-    turns = []
+    tot, gtot = collections.Counter(), collections.Counter()   # dollars, and the earlier attempts' share
+    turns, tgap = [], {}
     for i, call in enumerate(calls):
         s, ctx = split(call)
         tot.update(s)
+        g = earlier_split(call)
+        gtot.update(g)
+        tgap[i] = sum(g.values())
         turns.append((sum(s.values()), i, call, ctx, s))
     usd = sum(tot.values())
     nocache = sum(
@@ -69,6 +74,7 @@ def session_report(path):
     retried = [x for x in calls if x["earlier"]]
     gap = sum(earlier_usd(x) for x in retried)
     writes = tot["write5m"] + tot["write1h"]
+    gwrites = gtot["write5m"] + gtot["write1h"]
 
     def share(x):        # a session that died on its first call has all-zero usage
         return f"{x / usd:.0%}" if usd else "0%"
@@ -79,11 +85,11 @@ def session_report(path):
     if gap >= 0.005:
         print(retried_line(len(retried), gap))
     print(f"  {bar([('read', tot['read'], 75), ('write', writes, 221), ('out', tot['output'], 177)])}")
-    print(f"  {c(75, '█')} cache reads ${tot['read']:.2f} ({share(tot['read'])})   "
-          f"{c(221, '█')} cache writes ${writes:.2f} ({share(writes)})   "
-          f"{c(177, '█')} output+thinking ${tot['output']:.2f} ({share(tot['output'])})")
+    print(f"  {c(75, '█')} cache reads {figure(tot['read'], gtot['read'])} ({share(tot['read'])})   "
+          f"{c(221, '█')} cache writes {figure(writes, gwrites)} ({share(writes)})   "
+          f"{c(177, '█')} output+thinking {figure(tot['output'], gtot['output'])} ({share(tot['output'])})")
     if cold:
-        print(f"  {c(203, f'{len(cold)} cold rewrites')} cost ${sum(t for t, _, _ in cold):.2f} "
+        print(f"  {c(203, f'{len(cold)} cold rewrites')} cost {figure(sum(t for t, _, _ in cold), sum(tgap[i] for _, i, _ in cold))} "
               + dim("(whole context re-cached after the cache expired or was invalidated)"))
     print(dim("  most expensive turns:"))
     prev = {i: ctx for _, i, _, ctx, _ in turns}
@@ -93,28 +99,30 @@ def session_report(path):
                f"+{delta / 1000:.0f}k new context" if delta > 15_000 else
                "long output/thinking" if s["output"] > 0.5 * t else "large context re-read")
         tools = ",".join(x.split("__")[-1] for x in call["tools"])[:30]
-        print(f"    #{i:<4} {call['ts'][5:16].replace('T', ' ')}  ${t:.3f}  ctx {ctx / 1000:5.0f}k  {why}"
+        print(f"    #{i:<4} {call['ts'][5:16].replace('T', ' ')}  {figure(t, tgap[i], 3)}  ctx {ctx / 1000:5.0f}k  {why}"
               + (dim(f"  → {tools}") if tools else ""))
 
     subs = glob.glob(os.path.join(path[:-6], "subagents", "*.jsonl"))
     if subs:
-        by = collections.Counter()
+        by, gby = collections.Counter(), collections.Counter()
         n = collections.Counter()
         for f in subs:
             sc = load(f)
             if sc:
                 m = short(sc[0]["model"])
                 by[m] += sum(sum(split(x)[0].values()) for x in sc)
+                gby[m] += sum(earlier_usd(x) for x in sc)
                 n[m] += 1
-        print(f"  subagents: {sum(n.values())} runs, ${sum(by.values()):.2f}  "
-              + dim("  ".join(f"{m} ×{n[m]} ${v:.2f}" for m, v in by.most_common())))
+        print(f"  subagents: {sum(n.values())} runs, {figure(sum(by.values()), sum(gby.values()))}  "
+              + dim("  ".join(f"{m} ×{n[m]} {figure(v, gby[m])}" for m, v in by.most_common())))
 
 
 def fleet_report(days):
     since = time.time() - days * 86400
     by_kind, by_model, by_proj = collections.Counter(), collections.Counter(), collections.Counter()
+    g_kind, g_model, g_proj = collections.Counter(), collections.Counter(), collections.Counter()
     hit = collections.Counter()
-    cold_n, cold_usd, sessions = 0, 0.0, set()
+    cold_n, cold_usd, cold_gap, sessions = 0, 0.0, 0.0, set()
     # A forked or resumed session copies its parent's calls into a new file, message ids and all.
     # Deduplicated within a file only, one fork counted $23.44 of real spend twice.
     seen, retried, gap = set(), 0, 0.0
@@ -134,31 +142,36 @@ def fleet_report(days):
             if call["id"] in seen:
                 continue
             seen.add(call["id"])
+            g = earlier_usd(call)
             if call["earlier"]:
                 retried += 1
-                gap += earlier_usd(call)
+                gap += g
             s, _ = split(call)
             usd = sum(s.values())
             by_kind[kind] += usd
             by_model[short(call["model"])] += usd
             by_proj[proj] += usd
+            g_kind[kind] += g
+            g_model[short(call["model"])] += g
+            g_proj[proj] += g
             u = call["u"]
             hit["read"] += u.get("cache_read_input_tokens", 0)
             hit["all"] += u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("input_tokens", 0)
             if kind == "main" and i in colds:
                 cold_n += 1
                 cold_usd += usd
+                cold_gap += g
             sessions.add(f)
     tot = sum(by_kind.values())
     print(c(75, f"■ Last {days} days") + dim(f"  {len(sessions)} transcripts"))
     print(f"  {c(255, figure(tot, gap))} list price, {LOWER_BOUND}")
-    print(f"  main ${by_kind['main']:.2f}  ·  subagents ${by_kind['subagent']:.2f}"
+    print(f"  main {figure(by_kind['main'], g_kind['main'])}  ·  subagents {figure(by_kind['subagent'], g_kind['subagent'])}"
           f"  ·  cache hit {hit['read'] / max(hit['all'], 1):.1%}")
     if gap >= 0.005:
         print(retried_line(retried, gap))
-    print(f"  {c(203, f'{cold_n} cold rewrites')} ${cold_usd:.2f}  " + dim("← avoidable with handoff + /clear before breaks"))
-    print("  by model:   " + "  ".join(f"{m} ${v:.2f}" for m, v in by_model.most_common(6) if v >= 0.005))
-    print("  by project: " + "  ".join(f"{p} ${v:.2f}" for p, v in by_proj.most_common(5)))
+    print(f"  {c(203, f'{cold_n} cold rewrites')} {figure(cold_usd, cold_gap)}  " + dim("← avoidable with handoff + /clear before breaks"))
+    print("  by model:   " + "  ".join(f"{m} {figure(v, g_model[m])}" for m, v in by_model.most_common(6) if v >= 0.005))
+    print("  by project: " + "  ".join(f"{p} {figure(v, g_proj[p])}" for p, v in by_proj.most_common(5)))
 
 
 def main():

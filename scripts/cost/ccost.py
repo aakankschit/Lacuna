@@ -38,7 +38,7 @@ def load(path):
         for line in f:
             try:
                 d = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):   # an absurdly nested line recurses, not ValueErrors
                 continue
             if not isinstance(d, dict) or d.get("type") != "assistant":
                 continue
@@ -71,7 +71,17 @@ def earlier_usd(c):
     The top-level usage is the last attempt only. Anthropic bills a refusal before any output only
     for some categories, and the transcript does not record which: so this is the gap between the
     figure reported and the most it could have been, never something to add in silently."""
-    return sum(sum(split_usage(u, model)[0].values()) for u, model in c.get("earlier", ()))
+    return sum(earlier_split(c).values())
+
+
+def earlier_split(c):
+    """earlier_usd by category (uncached, write5m, write1h, read, output), so a report that shows a
+    category subtotal can show the same range as the total."""
+    out = {}
+    for u, model in c.get("earlier", ()):
+        for k, v in split_usage(u, model)[0].items():
+            out[k] = out.get(k, 0) + v
+    return out
 
 
 def split_usage(u, model):

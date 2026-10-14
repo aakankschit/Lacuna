@@ -101,7 +101,7 @@ def _read_json(path, quiet=True):
     try:
         with open(path) as f:
             return json.load(f)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:   # absurdly nested input raises RecursionError, not ValueError
         CONFIG_ERRORS.append(f"{path}: not valid JSON ({e}). Using defaults for everything in it. "
                              f"JSON has no comments — a line starting with // will do this.")
     except OSError as e:

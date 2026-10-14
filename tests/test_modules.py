@@ -300,12 +300,24 @@ class TestEstimate(Sandbox):
         r = self.est("--help")
         self.assertIn(r.returncode, (0, 2))
         self.assertIn("--json", r.stdout + r.stderr)
+        # the help text is generated from READABLE, so it cannot drift from what the scan accepts
+        exts = self.run_py(["-c", f"import sys; sys.path.insert(0, {LIT!r}); import lit_cost; "
+                                  f"print(*lit_cost.READABLE)"]).stdout.split()
+        self.assertGreater(len(exts), 3)
+        for e in exts:
+            with self.subTest(ext=e):
+                self.assertIn(e, " ".join(r.stdout.split()))
 
     def test_unreadable_pdf_is_refused_rather_than_priced_at_zero(self):
         """Exit 2 when a PDF yields no text; exit 3 when there is no extractor at all. Never
         "$0.00, exit 0", which told a user the run was free."""
         pdf = write(self.p("broken.pdf"), "%PDF-1.4 not really a pdf")
         r = self.est(pdf, LACUNA_PYTHON=self.p("no-venv", "python"))
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        # the extension test is case-insensitive, as the directory scan is: an uppercase .PDF was
+        # priced as raw text (its bytes counted as words) instead of going through the extractor
+        upper = write(self.p("BROKEN2.PDF"), "%PDF-1.4 not really a pdf")
+        r = self.est(upper, LACUNA_PYTHON=self.p("no-venv", "python"))
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
         self.assertEqual(self.est(pdf, "--json", LACUNA_PYTHON=self.p("no-venv", "python")).stdout, "")
         silent = write(self.p("venv", "python"), "#!/bin/sh\nexit 0\n", 0o755)   # a parser that extracts nothing
@@ -359,6 +371,27 @@ class TestEstimate(Sandbox):
         """R16: the two documents that tell a model how to call this."""
         usage_lines = [l for l in read(os.path.join(ROOT, "bin", "lacuna")).splitlines() if "lacuna lit estimate" in l]
         self.assertTrue(any("--json" in l for l in usage_lines), usage_lines)
+        # every flag a subcommand accepts is in its entry of `lacuna --help` (--overwrite, the flag
+        # every refusal names, was missing)
+        usage = self.lacuna("--help").stdout.splitlines()
+        for entry, script, args in (
+                ("  lacuna doctor", os.path.join(ROOT, "scripts", "doctor.py"), []),
+                ("  lacuna spend", os.path.join(ROOT, "scripts", "cost", "spend.py"), []),
+                ("  lacuna lit read", os.path.join(LIT, "lit_pipeline.py"), ["read"]),
+                ("  lacuna lit synth", os.path.join(LIT, "lit_pipeline.py"), ["synth"]),
+                ("  lacuna lit verify", os.path.join(LIT, "lit_pipeline.py"), ["verify"]),
+                ("  lacuna lit estimate", LIT_COST, [])):
+            with self.subTest(entry=entry):
+                i = next(n for n, l in enumerate(usage) if l.startswith(entry))
+                text = usage[i]
+                for l in usage[i + 1:]:
+                    if not l.startswith(" " * 18):          # the command's own continuation lines
+                        break
+                    text += " " + l
+                helped = self.run_py([script, *args, "--help"]).stdout
+                flags = set(re.findall(r"(?m)^\s+(?:-\w, )?(--[a-z][\w-]*)", helped)) - {"--help"}
+                self.assertGreater(len(flags), 0)
+                self.assertEqual(flags - set(re.findall(r"--[a-z][\w-]*", text)), set(), text)
         skill = read(os.path.join(ROOT, "skills", "lit-review", "SKILL.md"))
         self.assertIn("lit estimate", skill)
         self.assertIn("any_over_budget", skill, "the skill must name the field it gates approval on")
@@ -453,6 +486,44 @@ class TestSpend(Sandbox):
         self.assertIn("$1.06 list price, a lower bound", s, "no retries: one figure, still called a lower bound")
         self.assertNotIn("retried", s)
 
+    def test_every_subtotal_shows_the_range_not_only_the_headline(self):
+        """The docs say every figure is a lower bound with earlier attempts as the top of a range.
+        The subagent line, the per-model and per-kind fleet figures and the category split priced
+        only the last attempt, beside a headline that was a range."""
+        now = datetime.now(timezone.utc) - timedelta(minutes=5)
+        sid = "dddd4444-0000-0000-0000-000000000000"
+        proj = os.path.join(self.home, ".claude", "projects", "-work-sub")
+        main = jsonl(os.path.join(proj, sid + ".jsonl"), [call("zm1", "claude-sonnet-5-5", now, usage(out=1_000))])
+        retried = call("zs1", "claude-opus-5-5", now, {**usage(out=1_000), "iterations": [
+            {**usage(out=500_000), "model": "claude-opus-5-5", "type": "message"},     # +$10.00 if billed
+            {**usage(out=1_000), "model": "claude-opus-5-5", "type": "message"}]})
+        jsonl(os.path.join(proj, sid, "subagents", "a.jsonl"), [retried])
+        s, fleet = self.spend("--session", main)
+        sub = next(l for l in s.splitlines() if "subagents:" in l)
+        self.assertIn("subagents: 1 runs, $0.02–$10.02", sub)
+        self.assertIn("opus-5-5 ×1 $0.02–$10.02", sub)
+        self.assertIn("subagents $0.27–$10.27", fleet)
+        self.assertIn("opus-5-5 $0.02–$10.02", fleet)
+        self.assertIn("work-sub $0.03–$10.03", fleet)
+        # the session's own category split and expensive-turn list, for a retried main-thread call
+        t = jsonl(os.path.join(proj, "eeee5555.jsonl"), [call("zr1", "claude-opus-5-5", now, {**usage(out=1_000), "iterations": [
+            {**usage(out=500_000), "model": "claude-opus-5-5", "type": "message"},
+            {**usage(out=1_000), "model": "claude-opus-5-5", "type": "message"}]})])
+        late = now - timedelta(hours=3)
+        cold = jsonl(os.path.join(proj, "ffff6666.jsonl"), [
+            call("zc1", "claude-opus-5-5", late, usage(0, 0, 100_000, 10)),
+            call("zc2", "claude-opus-5-5", now, {**usage(0, 100_000, 0, 10), "iterations": [
+                {**usage(out=500_000), "model": "claude-opus-5-5", "type": "message"},
+                {**usage(0, 100_000, 0, 10), "model": "claude-opus-5-5", "type": "message"}]})])
+        s, fleet = self.spend("--session", cold)
+        self.assertRegex(s, r"1 cold rewrites cost \$\d+\.\d\d–\$")
+        self.assertRegex(fleet, r"\d cold rewrites \$\d+\.\d\d–\$")
+        with open(t, "a") as f:
+            f.write("[" * 100_000 + "\n")           # nested past the recursion limit: a torn line, not a crash
+        s, _ = self.spend("--session", t)
+        self.assertIn("output+thinking $0.02–$10.02", s)
+        self.assertIn("$0.020–$10.020", s, "the most-expensive-turns list")
+
     def test_session_id_prefix_resolves_and_an_unknown_id_exits_2(self):
         jsonl(os.path.join(self.proj, "zzzz9999.jsonl"), [call("x", "claude-haiku-5-5", datetime.now(timezone.utc), usage(out=10))])
         s, _ = self.spend("--session", "aaaa1111", "--cwd", "/work/proj")
@@ -535,6 +606,26 @@ class TestStatusline(Sandbox):
         self.assertIn("last $", narrow)
         r = self.run_py([os.path.join(ROOT, "statusline", "statusline.py")], input="not json")
         self.assertEqual((r.returncode, r.stderr), (0, ""), "a status line that prints a traceback is worse than none")
+        # every field is typed: `true` as a path was open(True), file descriptor 1, and closing it
+        # killed the status line's own stdout (exit 120). A wrong-typed field blanks its segment.
+        for name, over in {"bool path": {"transcript_path": True}, "int path": {"transcript_path": 1},
+                           "list path": {"transcript_path": ["x"]}, "NUL path": {"transcript_path": "a\0b"},
+                           "model": {"model": 5}, "model name": {"model": {"display_name": 7, "id": []}},
+                           "effort": {"effort": "high"}, "window": {"context_window": [1]},
+                           "usage": {"context_window": {"current_usage": {"input_tokens": "9", "cache_read_input_tokens": [1]},
+                                                        "context_window_size": "big"}},
+                           "nan": {"context_window": {"current_usage": {"input_tokens": float("nan")}}},
+                           "cache": {"prompt_cache": {"expires_at": "soon", "hit_ratio": [1], "ttl": 5}},
+                           "rates": {"rate_limits": {"five_hour": {"used_percentage": float("inf"), "resets_at": "x"},
+                                                     "seven_day": 5}},
+                           "cost": {"cost": {"total_cost_usd": "free"}}, "cwd": {"cwd": 5, "workspace": {"project_dir": 3}},
+                           "top level": []}.items():
+            with self.subTest(name):
+                r = self.run_py([os.path.join(ROOT, "statusline", "statusline.py")],
+                                input=json.dumps(over if isinstance(over, dict) else over).replace("NaN", "NaN"))
+                self.assertEqual((r.returncode, r.stderr), (0, ""))
+                if isinstance(over, dict):
+                    self.assertIn("session", strip_ansi(r.stdout), "a valid segment is still printed")
 
     def test_reads_the_data_dir_prices_and_transcript_as_the_cli_does(self):
         """It is self-contained by design, and fell behind the CLI three ways at once: "~" in
@@ -651,7 +742,46 @@ class TestCacheGuard(Sandbox):
         tp = self.transcript(timedelta(hours=3), with_timestamp=False)
         r = self.prompt(tp)
         self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
-        for cfg in ({"idle_minutes": "sixty"}, {"idle_minutes": None}):
+        # hook JSON of the wrong type: `true` as a path is open(True), file descriptor 1
+        tp = self.transcript(timedelta(hours=3))
+        for name, over in {"bool path": {"transcript_path": True}, "list path": {"transcript_path": [tp]},
+                           "NUL path": {"transcript_path": "a\0b"}, "sid": {"session_id": ["x"], "transcript_path": tp},
+                           "path-like sid": {"session_id": "../../escape", "transcript_path": tp},
+                           "prompt": {"prompt": 5, "transcript_path": tp},
+                           "resume numbers": {"hook_event_name": "SessionStart", "source": "resume", "transcript_path": tp,
+                                              "seconds_since_last_response": "long", "context_tokens": [1],
+                                              "estimated_cache_write_usd": "x", "prompt_cache_likely_expired": "yes"}}.items():
+            with self.subTest(name):
+                r = self.guard({"hook_event_name": "UserPromptSubmit", "session_id": "s9", **over})
+                self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+                if r.stdout.strip():
+                    json.loads(r.stdout)                  # whatever it says is still valid hook JSON
+        for stray in ("escape.json", "escape.prompt.txt"):      # a session id names files: it cannot climb out
+            self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.data), stray)), stray)
+        # whatever else goes wrong (here: the state directory is a file) still exits 0
+        import shutil
+        shutil.rmtree(os.path.join(self.data, "cache_guard"), ignore_errors=True)
+        write(os.path.join(self.data, "cache_guard"), "in the way")
+        r = self.prompt(self.transcript(timedelta(hours=3)), sid="s4")
+        self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+        os.remove(os.path.join(self.data, "cache_guard"))
+        r = self.guard({"hook_event_name": "SessionStart", "session_id": "s6", "transcript_path": True})
+        self.assertIn("Routing", json.loads(r.stdout)["systemMessage"], "a bool path must not close the hook's stdout")
+        # a transcript line nested past the recursion limit is skipped like any torn line
+        r = self.prompt(self.transcript(timedelta(hours=3), extra=["[" * 100_000]), sid="s5")
+        self.assertEqual(json.loads(r.stdout)["decision"], "block")
+        # an unusable number in the environment is the default, not an OverflowError at import
+        for var in ("LACUNA_MIN_CTX", "LACUNA_IDLE_MIN"):
+            for bad in ("inf", "-inf", "nan", "-5", "1e999", "0", "abc"):
+                with self.subTest(var=var, value=bad):
+                    r = self.guard({"hook_event_name": "SessionStart", "source": "startup", "session_id": "t"}, **{var: bad})
+                    self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+                    self.assertIn("60 min", json.loads(r.stdout)["systemMessage"])
+        r = self.guard({"hook_event_name": "UserPromptSubmit", "session_id": "s7", "prompt": "x",
+                        "transcript_path": self.transcript(timedelta(hours=3), ctx=50_000)}, LACUNA_MIN_CTX="inf")
+        self.assertEqual(json.loads(r.stdout)["decision"], "block", "MIN_CTX=inf is the 40k default, not 'never hold'")
+        for cfg in ({"idle_minutes": "sixty"}, {"idle_minutes": None}, {"idle_minutes": float("inf")},
+                    {"idle_minutes": -1}, {"idle_minutes": 0}, {"idle_minutes": True}):
             with self.subTest(cfg):
                 self.config(cfg)
                 r = self.guard({"hook_event_name": "SessionStart", "source": "startup", "session_id": "t"})
@@ -735,6 +865,23 @@ class TestConfigReport(Sandbox):
         self.assertIn("not a number", r.stdout, "a string budget is reported, not a traceback")
         self.assertEqual(json.loads(self.lacuna("config", "--json").stdout)["models"]["planner"], "mine")
         self.assertEqual(self.calls(), [])
+
+    def test_absurdly_nested_json_files_are_reported_not_raised(self):
+        """json.load raises RecursionError on deep nesting, which is not a ValueError: every command
+        died on a hand-edited config.json, though this module must never raise on bad input."""
+        deep = "[" * 100_000 + "]" * 100_000
+        for name in ("config.json", "pricing.json", "calibration.json"):
+            with self.subTest(name):
+                write(os.path.join(self.data, name), deep)
+                r = self.lacuna("config")
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                self.assertNotIn("Traceback", r.stderr)
+                r = self.lacuna("lit", "estimate", write(self.p("a.md"), "x " * 500))
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                self.assertNotIn("Traceback", r.stderr)
+                os.remove(os.path.join(self.data, name))
+        write(os.path.join(self.data, "config.json"), deep)
+        self.assertIn("not valid JSON", self.lacuna("config").stdout)
 
 
 FAKE_PYMUPDF = '''

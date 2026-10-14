@@ -39,7 +39,7 @@ if os.path.exists(_user_cal):
         if not isinstance(_cal, dict):
             raise ValueError("the top level is not an object")
         CAL_PATH = _user_cal
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:   # a deeply nested file recurses, not ValueErrors
         CAL_WARNING = f"your calibration {_user_cal} is unusable ({e}); using the shipped one instead"
 with open(CAL_PATH) as f:
     CAL = json.load(f)
@@ -68,8 +68,13 @@ def pdf_text(path):
              "or `pdftotext` (poppler) on PATH. Estimating a parsed .md needs neither.")
 
 
+def is_pdf(path):
+    """Case-insensitive, as the directory scan is: an uppercase .PDF was priced as raw text."""
+    return path.lower().endswith(".pdf")
+
+
 def tokens(path):
-    if path.endswith(".pdf"):
+    if is_pdf(path):
         text = pdf_text(path)
     else:
         text = open(path, errors="ignore").read()
@@ -169,7 +174,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="lacuna lit estimate", description=__doc__.strip().splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("paths", nargs="+", help="documents (.md/.txt/.pdf) or directories of them")
+    ap.add_argument("paths", nargs="+", help="documents (" + "/".join(READABLE) + ") or directories of them")
     # 1 to match `lit read`, which runs one agent per document.
     ap.add_argument("--per-agent", type=int, default=1, help="documents per reader agent (default 1)")
     ap.add_argument("--model", help="show only this calibrated model")
@@ -184,10 +189,10 @@ def main():
     files = [os.path.join(d, f) for d in a.paths if os.path.isdir(d) for f in sorted(os.listdir(d))
              if f.lower().endswith(READABLE)] + [p for p in a.paths if not os.path.isdir(p)]
     if not files:
-        die2("ERROR: no .md, .txt or .pdf documents found in those paths.")
+        die2("ERROR: no " + ", ".join(READABLE) + " documents found in those paths.")
     # A PDF yielding no text is broken, encrypted or a scan. Pricing it at $0.00 and exiting 0
     # tells the user the run is free. A small .md or .txt is simply small, and is left alone.
-    unreadable = [f for f in files if f.endswith(".pdf") and tokens(f) < 20]
+    unreadable = [f for f in files if is_pdf(f) and tokens(f) < 20]
     if unreadable:
         die2("ERROR: no extractable text in: "
              + ", ".join(os.path.basename(f) for f in unreadable)
