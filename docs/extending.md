@@ -165,14 +165,24 @@ it). It travels with the folder, so moving the vault or deleting the cache chang
 
 When a run would replace a file that fails one of those tests, it exits 2 before any model call
 and names every such file: edited since Lacuna wrote it, not recorded as Lacuna's (your own file,
-or one written before 0.3.0 kept records), or the note for a different document with the same file
-name (`main.pdf` from two papers' folders). Move the file or choose another `--out` to keep it;
-re-run with `--overwrite` to replace it. What an `after.*` hook leaves (frontmatter it prepends, say)
-still counts as Lacuna's output; only edits made after the run make a file yours. If `synth --out`
-changes while the run is in progress, it is moved to `<out>.rejected` rather than deleted. Deleting
-`.lacuna.json` is safe: Lacuna then asks before
-replacing anything it finds, and adopts a note again when it is exactly that document's cached
-note.
+or one written before 0.3.0 kept records), the note for a different document with the same file
+name (`main.pdf` from two papers' folders), the note for a document that has changed since (a new
+download saved over the old one and a revised copy of the same paper look alike, so both ask), or a
+file another stage wrote (a paper named `plan.md` read into the folder that holds your plan). Move
+the file or choose another `--out` to keep it; re-run with `--overwrite` to replace it. What an
+`after.*` hook leaves in the directory (frontmatter it prepends to every note there, say) still
+counts as Lacuna's output; only edits made after the run make a file yours. A note you restore to
+exactly that document's cached note is Lacuna's again.
+
+A plan or report that changes while its run is in progress is never replaced or deleted. When the
+run succeeds, the file is left as it is, the result is written beside it as `<out>.new.md`, and the
+run exits 2 naming both; when a `synth` run fails, a changed `--out` is moved to `<out>.rejected`
+(the model may have written it). Neither name replaces an earlier one: the next is `-2`, then `-3`.
+
+Deleting `.lacuna.json` is safe: Lacuna then asks before replacing anything it finds, and adopts a
+note again when it is exactly that document's cached note. A damaged one is kept as
+`.lacuna.json.damaged-<time>` beside it, the run says so, and a new record is started; the same
+then holds, and a later refusal mentions the damaged copy.
 
 ### A note on frontmatter
 

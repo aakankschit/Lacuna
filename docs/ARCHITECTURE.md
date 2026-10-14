@@ -73,13 +73,16 @@ Other invariants:
   same words lower down are findings, and `synth`/`verify` agents are told to reply
   `INCOMPLETE: <reason>` rather than write a document about failing — their own word wins.
 - A failed stage must exit non-zero and cache nothing. A refusal must never become a note.
-- **Lacuna replaces a file in a user's directory only if it wrote it** — for the same document, in
-  the case of a note — and nobody has edited it since. The evidence is `.lacuna.json` beside the
-  files (`record`, `not_ours`), never the cache: the cache knows that Lacuna wrote some note, not
-  for which document, and is deleted or left behind on another machine. Anything else exits 2 before
-  any model call, naming each file and the way forward (`--overwrite`). The record is locked across
-  processes, re-written after an `after.*` hook, and compared by file identity (`samefile`), not by
-  path, because macOS folds case and Unicode form.
+- **Lacuna replaces a file in a user's directory only if it wrote it** — in the same stage, and for
+  the same document (the same bytes) in the case of a note — and nobody has edited it since. The
+  evidence is `.lacuna.json` beside the files (`record`, `not_ours`), never the cache: the cache
+  knows that Lacuna wrote some note, not for which document, and is deleted or left behind on
+  another machine. Anything else exits 2 before any model call, naming each file and the way
+  forward (`--overwrite`). The record is locked across processes, re-written for every file an
+  `after.*` hook changed, and compared by file identity (`samefile`), not by path, because macOS
+  folds case and Unicode form. A plan or report that changes while the model runs is never
+  replaced: the result goes beside it and the run exits 2. A file name too long for its directory
+  stops the run before the model call; cache names are cut to fit.
 
 ### `scripts/lit/prep_md.py`
 PDF → reference-stripped markdown. Parses, **validates**, falls back, and refuses. The validation

@@ -139,9 +139,14 @@ configured warning threshold (`budget_warn_usd`, default $2), and wait for appro
 `read`, `synth` and `verify` replace a file only when Lacuna wrote it (for the same document, in the
 case of a note) and nobody has edited it since; the record is `.lacuna.json` beside the files. When
 one of those is not true they exit 2 before any model call and name every such file and why: edited
-since, no record, or another document's note with the same file name. **Show the user that message
-and ask.** Do not add `--overwrite` on your own: it discards their edits, or another paper's note.
-For two papers with one file name (`main.pdf` in two folders), rename one or use another `--out`.
+since, no record, another document's note with the same file name, a document changed since its note
+was written, or a file another stage wrote. **Show the user that message and ask.** Do not add
+`--overwrite` on your own: it discards their edits, or another paper's note. For two papers with one
+file name (`main.pdf` in two folders), rename one or use another `--out`.
+
+One exit 2 comes after the model call: a plan or report that changed while `synth` or `verify` ran is
+left as it is, and the result is saved beside it as `<out>.new.md`. Tell the user both paths and let
+them choose; do not run the stage again, which pays again.
 
 ## If a model refuses
 
