@@ -276,7 +276,7 @@ class TestParse(unittest.TestCase):
         self.assertNotIn("File \"", err)
         self.assertNotIn("^^^", err, "indented source and caret lines are noise")
 
-    def convert(self, outputs, pages=4, unmeasured=None, quiet=True, **kw):
+    def convert(self, outputs, pages=4, unmeasured=None, quiet=True, pymupdf=True, **kw):
         """Run convert() with parsers stubbed: (ok, parsers called, text written or None); what it
         said on stderr is left in self.stderr."""
         called, out = [], os.path.join(self.tmp, "out.md")
@@ -291,6 +291,8 @@ class TestParse(unittest.TestCase):
         try:
             with mock.patch.object(prep_md, "parse", fake_parse), \
                     mock.patch.object(prep_md, "pdf_stats", lambda pdf: (pages, 0, unmeasured)), \
+                    mock.patch.dict(prep_md.VENVS, {"pymupdf4llm": sys.executable if pymupdf else
+                                                    os.path.join(self.tmp, "no-venv", "python")}), \
                     mock.patch("sys.stderr", err), mock.patch("sys.stdout"):
                 ok, _ = prep_md.convert("x.pdf", out, quiet=quiet, **kw)
         finally:
@@ -323,6 +325,12 @@ class TestParse(unittest.TestCase):
                 self.assertIsNone(text, f"{name}: the bad parse was written")
                 if "unmeasured" in kw:
                     self.assertIn("could not count the PDF's own pages", self.stderr, "and it says why")
+        # ...but with no pymupdf installed at all nothing can count it: `doctor --install-equations`
+        # makes only the marker venv, and --equations must still work there, saying the check is off.
+        ok, _, text = self.convert({"marker": self.GOOD}, pages=0, equations=True, pymupdf=False,
+                                   unmeasured="pymupdf is not installed")
+        self.assertTrue(ok, self.stderr)
+        self.assertIn("truncation check is off", self.stderr)
         # A write that dies part-way (here, on a character it cannot encode; in life, a kill or a full
         # disk) must leave no file: the pipeline serves whatever is at that path as a finished parse.
         with self.assertRaises(UnicodeEncodeError):

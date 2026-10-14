@@ -112,6 +112,8 @@ MUTANTS = [
     ("validate-garbled-only-latin-readable", PREP, "readable = sum(c.isalnum() for c in", "readable = sum(c.isascii() and c.isalnum() for c in"),
     ("validate-docling-glyphs-readable", PREP, r'|GLYPH<[^>\n]{0,80}>")', '")'),
     ("validate-unmeasured-pdf-accepted", PREP, "        if unmeasured:\n", "        if False:\n"),
+    ("equations-without-pymupdf-refused", PREP, '    if unmeasured and not os.path.exists(VENVS["pymupdf4llm"]):',
+     "    if False:"),
     # ---- split_book: the index a reader greps
     ("book-keeps-ctrl", SPLIT, '    text = CTRL.sub("", text)\n', "\n"),
     ("book-level-1-only", SPLIT, "    toc = []\n    for i, (lvl, title, start) in enumerate(valid):",

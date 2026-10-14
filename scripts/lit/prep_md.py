@@ -262,6 +262,14 @@ def finish(md, pages):
 
 def convert(pdf, out, forced=None, equations=False, quiet=False):
     pages, raw_chars, unmeasured = pdf_stats(pdf)
+    if unmeasured and not os.path.exists(VENVS["pymupdf4llm"]):
+        # No pymupdf at all: `doctor --install-equations` makes the marker venv and nothing else,
+        # and --equations runs prep_md without the default one. That is a choice, not evidence
+        # against this PDF, so the parse goes ahead, saying the check is off. A pymupdf that is
+        # there and cannot read the PDF is evidence, and is refused below.
+        print(f"  {os.path.basename(pdf)}: {unmeasured} — the truncation check is off for this parse",
+              file=sys.stderr)
+        unmeasured = None
     order = [forced] if forced else (["marker"] if equations else ["pymupdf4llm", "docling"])
     problems = {}
     for parser in order:
