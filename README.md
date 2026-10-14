@@ -83,9 +83,9 @@ anything beyond them:
 
 ```bash
 lacuna doctor --install-pdf          # pymupdf4llm, the default parser (~4 s/document)
-lacuna doctor --install-fallback     # docling, the structured fallback (~73 s/document)
-lacuna doctor --install-equations    # marker, for LaTeX fidelity — ~2 GB of models,
-                                     #   and needs llama.cpp on PATH (brew install llama.cpp)
+lacuna doctor --install-fallback     # docling, the fallback with OCR (~1 min/document)
+lacuna doctor --install-equations    # marker, for LaTeX fidelity — ~3 GB of venv and models;
+                                     #   scanned pages also need llama.cpp (brew install llama.cpp)
 ```
 
 Each goes in its own virtual environment under the data directory, because their dependency trees
@@ -225,86 +225,23 @@ batch discounts.
 
 ## Making it your own
 
-Lacuna allows users to personalize its setup. To tailor it for your use case, it is recommended
-that you add external data at these junctions in the codebase — four points that exist so your
-material and the pipeline can meet without either one having to change the other.
+Everything you supply stays *outside* this repository, at four junctions.
+[docs/extending.md](docs/extending.md) specifies each in full and says what is deliberately *not*
+stable, so you can tell what is safe to build on.
 
-Everything you supply stays *outside* this repository. That is the point of having junctions at
-all: the alternative is editing Lacuna's own files, and then every release either overwrites your
-changes or leaves you merging somebody else's project into yours indefinitely.
-
-`lacuna config` prints what is currently in effect and which layer each setting came from —
-built-in default, your config file, or an environment variable — so you can always see what the
-pipeline will actually do before it spends anything.
-
-### 1. The data directory — `~/.lacuna/`
-
-Where your external data lives: reference books split into chapters, your cost calibration, the
-note cache, the cost ledger. `lacuna doctor` creates it. A plugin update replaces the plugin folder
-and never touches this one, so nothing you put here is at risk from an upgrade.
-
-```bash
-lacuna lit split-book ~/books/bayesian-optimization.pdf ~/.lacuna/books/bayes-opt
-export LACUNA_DATA=~/Dropbox/lacuna        # or keep it in sync / under version control
-```
-
-Readers are offered any book with a `toc.md`, and grep the index rather than reading chapters
-whole. Measured effect: books do not produce more ideas, but they roughly halve factual errors.
-
-### 2. `config.json` — which model does what, and what it may spend
-
-Six roles, each taking any string `claude --model` accepts — an alias (`haiku`, `opus`, `fable`) or
-a pinned id (`claude-opus-5`) when a study needs reproducibility.
-
-```json
-{
-  "models": { "reader": "haiku", "digester": "sonnet", "planner": "claude-opus-5",
-              "verifier": "haiku", "coder": "sonnet", "tester": "claude-opus-5" },
-  "paths":  { "books": "~/.lacuna/books" },
-  "budget_warn_usd": 2.0
-}
-```
-
-`reader`, `digester`, `planner` and `verifier` are read by the pipeline. `coder` and `tester` are
-read by the `dev-cycle` skill, which passes them when it spawns those agents — the agent files
-themselves carry a plain `sonnet` / `opus` default. `budget_warn_usd` makes `lacuna lit estimate`
-flag any combination that would cost more.
-
-Change a role when your material demands it — some models refuse some subject matter in headless
-runs, and pinning the planner to one that does not is a one-line fix rather than a workaround.
-`LACUNA_PLANNER=fable lacuna lit synth ...` overrides any of it for a single run.
-
-### 3. `after.read` / `after.synth` / `after.verify` — where results end up
-
-A command of *yours*, run when a stage finishes, with the output as its argument. This is how
-results reach a lab notebook, a ticket, a commit, or a Slack channel; Lacuna never learns what any
-of those are.
-
-```json
-{ "after": { "synth": "~/bin/file-into-notebook --kind plan" } }
-```
-
-`after.read` is given the notes **directory**; `after.synth` and `after.verify` are given a
-**file**. A hook that fails is reported and the run continues — by the time it fires, the work is
-done and already paid for.
-
-If your notes app is a plain folder of markdown — Obsidian, Logseq, a wiki — you need no hook at
-all: point the reader straight at it with `--out ~/Vault/Literature/`.
-
-### 4. The `lacuna` command — the surface your own scripts call
-
-```bash
-lacuna lit read papers/*.pdf --out notes/ --brief "..."   # exit 4 = a model refused
-```
-
-Call the CLI; do not import Python from inside this repo. Exit codes are stable (0 ok, 2 bad input,
-3 parse failure, 4 the model refused or produced nothing) so a wrapper can branch on them — retry a
-refused document on a different model, say. The modules behind the CLI will be renamed.
-
----
-
-[docs/extending.md](docs/extending.md) specifies all four in full, and — the half that matters more
-— says what is deliberately *not* stable, so you can tell what is safe to build on.
+1. **The data directory, `~/.lacuna/`** (or `$LACUNA_DATA`): your books, calibration, note cache and
+   cost ledger. `lacuna doctor` creates it; a plugin update never touches it.
+2. **`config.json`**: which model does each of six jobs (`reader`, `digester`, `planner`, `verifier`,
+   `coder`, `tester`), as any string `claude --model` accepts; where things live; `budget_warn_usd`.
+   `lacuna config` prints what is in effect and which layer set it, and
+   `LACUNA_PLANNER=fable lacuna lit synth ...` overrides any of it for one run.
+3. **`after.read` / `after.synth` / `after.verify`**: a command of yours, run when a stage finishes,
+   with the output as its last argument: the notes directory for `read`, a file for the other two.
+   This is how results reach a notebook, a ticket or a channel without Lacuna knowing what those
+   are. A plain folder of markdown (Obsidian, Logseq) needs no hook: point `--out` at it.
+4. **The `lacuna` command**, with stable exit codes (0 ok, 2 bad input, 3 parse failure, 4 the model
+   refused or produced nothing), so a wrapper can branch on them. Call the CLI; the Python modules
+   will be renamed.
 
 A worked example: the author's own chemistry project is a separate private plugin that points
 `books` at its corpus, pins `planner` to a model that does not refuse its source material, and sets

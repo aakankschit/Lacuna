@@ -56,9 +56,10 @@ cleanliness — not on recall.**
 ## What the plugin therefore does
 
 1. Parse with **pymupdf4llm** (4 s, markdown headings and tables, no control characters).
-2. **Validate**: plausible character count for the page count, no control characters, at least some
-   headings on a document long enough to have them, and an expected section name present.
-3. If validation fails, re-parse with **docling** (73 s). Three parsers reached 100% recall;
+2. **Validate**: at least 60% of the characters pymupdf itself extracts from the PDF (a fixed per-page
+   floor let a parse truncated to 37% through), at most a handful of control characters, at least
+   some headings on a document long enough to have them, and an expected section name present.
+3. If validation fails, re-parse with **docling** (49–73 s, and it OCRs scanned pages). Three parsers reached 100% recall;
    docling is the only one of those that also preserves headings and tables.
 4. If both fail, **report the document and write nothing** rather than feed a bad parse downstream.
 5. `--equations` routes to **marker** when equations are the object of study: 34 LaTeX expressions
@@ -68,11 +69,15 @@ Steps 2 and 4 exist because of a mistake described below.
 
 ## Two rules learned the hard way
 
-**Never run two GPU-based parsers concurrently.** The first marker result was 2/12 with 10 `NOT
+**Never run two marker processes concurrently.** The first marker result was 2/12 with 10 `NOT
 FOUND`, and was nearly reported as "marker silently drops Methods and Results". It was a measurement
-error: two marker processes were sharing one GPU, and the output was truncated to 14,380 chars
-instead of 38,719. Run alone, marker is deterministic (38,626 and 38,719 chars on two repeats) and
-scores 12/12.
+error: two marker runs overlapped and one output was truncated to 14,380 chars instead of 38,719.
+Reproduced 3 of 3 times in October 2026: with two or three marker runs overlapping, one document lost
+22% of its body text and still passed validation. Marker 2.0 shares model servers through a hardcoded
+lock directory (`~/.cache/datalab/surya`), so a second run attaches to the first one's servers; the
+GPU is not the mechanism. Run alone, marker's body text is reproducible, but its vision model's figure
+descriptions are not (see the setup table), and "38,626 and 38,719 chars on two repeats" was one
+output's character and byte count, not two runs.
 
 **Always validate a parse.** The corrupted file looked like valid markdown — title, abstract,
 references, sensible headings. Nothing short of the fact quiz revealed it. A parser that fails

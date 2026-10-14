@@ -25,14 +25,15 @@ EXTRAS = {
     "pdf":       dict(pkg="pymupdf4llm", mod="pymupdf4llm", venv="venv", probe=None,
                       why="the default parser, ~4 s/document — needed only to read PDFs", blocking=False),
     "fallback":  dict(pkg="docling", mod="docling", venv="venv-docling", probe=None,
-                      why="structured fallback for documents the default parser mangles, ~73 s/document",
+                      why="structured fallback (with OCR) for documents the default parser cannot read, ~1 min/document",
                       blocking=False),
     "equations": dict(pkg="marker-pdf", mod="marker", venv="venv-marker",
                       # the symbols prep_md.py actually imports, not a bare `import marker`
                       probe="from marker.converters.pdf import PdfConverter\n"
                             "from marker.models import create_model_dict",
-                      why="LaTeX-fidelity parser; ~2 GB of models on first use, and it also needs a "
-                          "llama.cpp binary on PATH (`brew install llama.cpp`) or its import fails",
+                      why="LaTeX-fidelity parser; ~1.3 GB venv plus ~1.8 GB of models on first use. Pages "
+                          "that need OCR also need a llama.cpp binary on PATH (`brew install llama.cpp`); "
+                          "born-digital PDFs do not, and this check cannot tell whether it is there",
                       blocking=False),
 }
 rows = []
@@ -107,7 +108,7 @@ def main():
     cal_dst = os.path.join(lacuna_config.DATA, "calibration.json")
     if not os.path.exists(cal_dst) and os.path.exists(cal_src):
         shutil.copy(cal_src, cal_dst)
-        say(WARN, f"{cal_dst}   (copied from the shipped calibration)",
+        say(OK, f"{cal_dst}   (copied from the shipped calibration)",
             "estimates come from someone else's runs until you have your own; `lacuna lit estimate` says which it used")
     elif os.path.exists(cal_dst):
         say(OK, f"{cal_dst}")

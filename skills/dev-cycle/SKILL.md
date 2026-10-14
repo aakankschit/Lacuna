@@ -88,7 +88,19 @@ where any model string works:
 ```bash
 LAC=${CLAUDE_PLUGIN_ROOT}/bin/lacuna
 CODER=$($LAC config --json | python3 -c "import json,sys;print(json.load(sys.stdin)['models']['coder'])")
-claude -p --model "$CODER" --agents "$(cat agents.json)" --agent coder < prompt.txt
+# --agents takes JSON ({name: {description, prompt, tools}}), built here from the plugin's agent files
+AGENTS=$(python3 - "${CLAUDE_PLUGIN_ROOT}/agents" <<'EOF'
+import json, os, re, sys
+out = {}
+for fn in os.listdir(sys.argv[1]):
+    head, body = open(os.path.join(sys.argv[1], fn)).read().split("---\n")[1:3]
+    meta = dict(re.findall(r"^(\w+):\s*(.+)$", head, re.M))
+    out[meta["name"]] = {"description": meta["description"], "prompt": body.strip(),
+                         "tools": [t.strip() for t in meta.get("tools", "").split(",") if t.strip()]}
+print(json.dumps(out))
+EOF
+)
+claude -p --model "$CODER" --agents "$AGENTS" --agent coder < prompt.txt
 ```
 
 Say which route you took. An agent silently running on a different model than the user configured

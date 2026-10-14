@@ -1,0 +1,172 @@
+"""Shared fixtures: a fake `claude`, a fake parser interpreter, and a sandbox per test.
+
+No test may reach a real model. Every sandbox puts the fake `claude` first on a PATH that holds
+nothing else but /usr/bin and /bin, and asserts that it is what resolves before running anything.
+The fake logs each call, which is how a test proves that bad input exits *before* money is spent
+and that a cache hit really is free.
+"""
+import json, os, re, shutil, stat, subprocess, sys, tempfile, unittest
+from datetime import timezone
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LACUNA = os.path.join(ROOT, "bin", "lacuna")
+SCRIPTS = os.path.join(ROOT, "scripts")
+LIT = os.path.join(SCRIPTS, "lit")
+PY = sys.executable
+SAFE_PATH = "/usr/bin:/bin"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
+    sys.path.insert(0, p)
+
+# The fake model. Logs argv and prompt, then does what FAKE_MODE says: "ok" writes a plausible note
+# or plan so the pipeline's own bookkeeping is exercised; "refuse" and "garbage" are the two ways a
+# real run fails; "apology" is the dangerous one — a long, fluent failure that clears a size check.
+FAKE_CLAUDE = r'''#!{py}
+import json, os, re, sys
+prompt = sys.stdin.read()
+argv = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as f:
+    f.write(json.dumps({{"argv": argv, "prompt": prompt}}) + "\n")
+mode = os.environ.get("FAKE_MODE", "ok")
+if mode == "refuse":
+    print(json.dumps({{"is_error": True, "result": "I can't help with that.", "total_cost_usd": 0.002}}))
+    sys.exit(0)
+if mode == "garbage":
+    print("overloaded, not json")
+    sys.exit(1)
+note = re.search(r"(?m)^- (\S+) -> (\S+)$", prompt)
+plan = re.search(r"Write the result to (\S+)\.", prompt)
+target = (note and note.group(2)) or (plan and plan.group(1))
+if mode == "apology" and target:
+    with open(target, "w") as f:
+        f.write("# Plan\n\nBLOCKED - not completed. I could not read any of the supplied files.\n\n"
+                + ("Explanation of the blockage. " * 120))
+    print(json.dumps({{"is_error": False, "result": "done", "total_cost_usd": 0.01}}))
+    sys.exit(0)
+if mode == "prose" and target:      # fluent, long, and not a note
+    with open(target, "w") as f:
+        f.write("I can't summarise this paper because the text appears garbled throughout. " * 30)
+    print(json.dumps({{"is_error": False, "result": "done", "total_cost_usd": 0.01}}))
+    sys.exit(0)
+if prompt.startswith("Fact-check"):
+    print(json.dumps({{"is_error": False, "result": "No unverifiable claims found.", "total_cost_usd": 0.0012}}))
+    sys.exit(0)
+if note:
+    model = argv[argv.index("--model") + 1]
+    brief = next((l for l in prompt.splitlines() if l.startswith("BRIEF:")), "BRIEF:none")
+    books = "BOOKS-OFFERED" if "Textbooks you may consult" in prompt else "NO-BOOKS"
+    with open(target, "w") as f:
+        f.write("# A note ({{}})\n\n## Claim\n{{}}\n{{}}\nmodel={{}}\n\n## Key results\n".format(
+            os.path.basename(note.group(1)), brief, books, model) + ("Finding with a number, 42 units. " * 40))
+    print(json.dumps({{"is_error": False, "result": target, "total_cost_usd": 0.012}}))
+    sys.exit(0)
+if plan:
+    with open(target, "w") as f:
+        f.write("# Development plan\n\n## 1. A real proposal\n\n" + ("Substantive plan content naming src/widget/sampler.py. " * 60))
+    print(json.dumps({{"is_error": False, "result": target, "total_cost_usd": 0.3}}))
+    sys.exit(0)
+print(json.dumps({{"is_error": False, "result": "nothing to do", "total_cost_usd": 0.0}}))
+'''
+
+# Stands in for the parser venv's python: `<venv-python> -I prep_md.py <pdf> <md> [flags]`.
+FAKE_PARSER_PY = r'''#!/bin/sh
+echo "$@" >> "$FAKE_PARSE_LOG"
+if [ -n "$FAKE_PARSE_FAIL" ]; then echo "parse exploded" >&2; exit 1; fi
+printf '# Parsed\n\n## Abstract\n\nParsed body.\n' > "$4"
+'''
+
+
+def write(path, text, mode=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    if mode:
+        os.chmod(path, mode)
+    return path
+
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+
+def strip_ansi(s):
+    return ANSI.sub("", s)
+
+
+def usage(inp=0, write=0, read=0, out=0):
+    return {"input_tokens": inp, "cache_creation_input_tokens": write,
+            "cache_read_input_tokens": read, "output_tokens": out}
+
+
+def call(mid, model, when, u, sidechain=False, tools=()):
+    """One assistant line of a Claude Code transcript."""
+    row = {"type": "assistant", "timestamp": when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "message": {"id": mid, "model": model, "usage": u,
+                       "content": [{"type": "tool_use", "name": t} for t in tools]}}
+    if sidechain:
+        row["isSidechain"] = True
+    return row
+
+
+def jsonl(path, rows):
+    return write(path, "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows))
+
+
+class Sandbox(unittest.TestCase):
+    """One sandbox per test: its own HOME, data directory, PATH and fake model."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lacuna-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home, self.data, self.bin = (os.path.join(self.tmp, d) for d in ("home", "data", "bin"))
+        for d in (self.home, self.data, self.bin):
+            os.makedirs(d)
+        self.log = os.path.join(self.tmp, "calls.jsonl")
+        self.parse_log = os.path.join(self.tmp, "parse.log")
+        fake = write(os.path.join(self.bin, "claude"), FAKE_CLAUDE.format(py=PY))
+        os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        self.assertEqual(shutil.which("claude", path=f"{self.bin}:{SAFE_PATH}"), fake,
+                         "a test must never be able to reach the real `claude`")
+
+    def p(self, *parts):
+        return os.path.join(self.tmp, *parts)
+
+    def env(self, **extra):
+        env = {"PATH": f"{self.bin}:{SAFE_PATH}", "HOME": self.home, "LACUNA_DATA": self.data,
+               "FAKE_LOG": self.log, "FAKE_PARSE_LOG": self.parse_log, "LANG": "en_US.UTF-8",
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        env.update({k: v for k, v in extra.items() if v is not None})
+        return env
+
+    def run_py(self, argv, cwd=None, input=None, **extra):
+        """Run a script under the sandbox environment."""
+        return subprocess.run([PY, *argv], capture_output=True, text=True, encoding="utf-8",
+                              env=self.env(**extra), cwd=cwd or self.tmp, input=input,
+                              stdin=None if input is not None else subprocess.DEVNULL)
+
+    def lacuna(self, *args, mode="ok", prelude=None, cwd=None, **extra):
+        """`lacuna <args>` through bin/lacuna. With `prelude`, run lit_pipeline in-process after
+        executing it, so a test can bump a version constant the way a release would."""
+        extra.setdefault("FAKE_MODE", mode)
+        if prelude is None:
+            return subprocess.run([LACUNA, *args], capture_output=True, text=True, encoding="utf-8",
+                                  env=self.env(**extra), cwd=cwd or self.tmp)
+        code = (f"import sys\nsys.path.insert(0, {LIT!r})\nimport lit_pipeline as L\n{prelude}\n"
+                f"sys.argv = ['lit_pipeline.py'] + {list(args[1:])!r}\nL.main()\n")
+        return self.run_py(["-c", code], cwd=cwd, **extra)
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def config(self, cfg):
+        write(os.path.join(self.data, "config.json"), json.dumps(cfg))
+
+    def hook(self, name):
+        """A hook script that records its arguments, one per line, in <name>.args."""
+        marker = self.p(f"{name}.args")
+        script = write(self.p(f"{name}.sh"), f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{marker}"\n', 0o755)
+        return script, marker

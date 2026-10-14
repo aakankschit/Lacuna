@@ -28,15 +28,25 @@ except Exception:                                      # the hook must never bre
     _DATA = os.environ.get("LACUNA_DATA") or os.path.expanduser("~/.lacuna")
     _CFG, _PRICES = {}, {}
 
-IDLE_MIN = float(os.environ.get("LACUNA_IDLE_MIN") or _CFG.get("idle_minutes", 60))
-MIN_CTX = int(os.environ.get("LACUNA_MIN_CTX", 40_000))
+
+def _num(value, default):
+    """A setting that must be a number. config.json is hand-edited and may hold anything, and a
+    hook that raises at import breaks every prompt in the session."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+IDLE_MIN = _num(os.environ.get("LACUNA_IDLE_MIN") or _CFG.get("idle_minutes"), 60)
+MIN_CTX = int(_num(os.environ.get("LACUNA_MIN_CTX"), 40_000))
 GRACE_S = 15 * 60
 STATE = os.path.join(_DATA, "cache_guard")
 FALLBACK_WRITE_1H = 8.0   # $/MTok if the model is not in the price table
 _m = _CFG.get("models", {})
 ROUTING = (f"Routing (measured — see the plugin's docs/benchmarks): "
            f"{_m.get('reader', 'haiku')} reads and fact-checks · {_m.get('coder', 'sonnet')} writes code · "
-           f"{_m.get('planner', 'claude-opus-5')} plans · {_m.get('tester', 'opus')} writes tests. "
+           f"{_m.get('planner', 'claude-opus-5')} plans · {_m.get('tester', 'sonnet')} writes tests. "
            f"Effort is a cost multiplier, not a quality lever. "
            f"Stepping away for more than {IDLE_MIN:.0f} min? Write a handoff, then /clear.")
 
@@ -56,20 +66,20 @@ def compacted_since(path, after_ts):
     except OSError:
         return False
     for ln in reversed(lines):
-        if '"compact' not in ln and '"summary' not in ln and "isCompactSummary" not in ln:
+        if '"compact' not in ln and "isCompactSummary" not in ln:
             continue
         try:
             e = json.loads(ln)
         except ValueError:
             continue
-        if not (e.get("isCompactSummary") or e.get("type") in ("compact_boundary", "summary")
-                or (e.get("subtype") == "compact_boundary")):
+        if not (e.get("isCompactSummary") or e.get("subtype") == "compact_boundary"):
             continue
-        ts = e.get("timestamp") or ""
+        # Both shapes Claude Code writes carry a timestamp. An undated line is no evidence: it
+        # must not switch the guard off for the whole session.
         try:
-            when = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            when = datetime.fromisoformat((e.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
         except ValueError:
-            return True        # a compaction we cannot date: assume it is recent and stay quiet
+            continue
         if when >= after_ts:
             return True
     return False

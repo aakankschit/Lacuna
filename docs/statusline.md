@@ -1,7 +1,7 @@
 # Status line (manual install)
 
 ```
-◆ Opus 5 xhigh │ my-project │ ctx ▰▰▰▰▱▱▱▱▱▱ 163k │ cache ● 1h 42m left │ → /compact or handoff at next break
+◆ Opus 5 xhigh │ my-project │ ctx ▰▰▰▰▱▱▱▱▱▱ 163k │ cache ● 1h cache · 42m left │ → /compact or handoff at next break
 $4.12 session │ last $0.120 (read 0.037 · write 0.015 · out 0.069) │ hit 97% │ 5h ▰▰▱▱▱▱ 38% ↻2h09m │ 7d ▰▰▰▰▱▱ 71% ↻83h19m
 ```
 
@@ -59,7 +59,7 @@ without re-running the script constantly.
 | `◆ Opus 5 xhigh` | current model and reasoning effort, coloured by model family |
 | `my-project` | the workspace directory, so two sessions are distinguishable |
 | `ctx ▰▰▰▰▱▱ 163k` | context tokens in use against the window |
-| `cache ● 1h 42m left` | time until the prompt cache expires; `○ cold` plus a dollar figure once it has |
+| `cache ● 1h cache · 42m left` | the cache TTL and the time left on it; `○ cold` plus a dollar figure once it has expired; absent when Claude Code reports no expiry time |
 | `→ /compact or handoff…` | appears only when the context is large enough for it to matter |
 | `$4.12 session` | this session's cost at list price |
 | `last $0.120 (read · write · out)` | the previous turn, split so you can see *why* it cost that |
@@ -68,8 +68,7 @@ without re-running the script constantly.
 
 ## Caveats
 
-- Dollar figures are **list price**, not your bill. On a subscription the usage bars are the figures
-  that matter; see [LIMITS.md](LIMITS.md).
-- The rate-limit and cache-TTL segments read fields that are not a documented interface. If they
-  change, those segments go blank rather than show a wrong number.
-- Cost is computed from Claude Code's transcript files, whose format is internal.
+Every figure is a list-price estimate from undocumented fields and transcript files; when a field is
+absent the segment goes blank. [LIMITS.md](LIMITS.md) has the full statement. The `$ session` figure
+is Claude Code's own; `last $` is computed from the transcript, and the two can differ by the 4–14%
+that Claude Code counts but does not log.

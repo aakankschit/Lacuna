@@ -13,7 +13,7 @@ mkdir -p "$results_dir"
 proj=$(basename "$PWD")
 export CLAUDE_RESULTS_FILE="$results_dir/${proj}-$(date +%Y%m%d-%H%M%S).md"
 
-viewer="$HERE/ccresults $(printf '%q' "$CLAUDE_RESULTS_FILE")"
+viewer="$PY $HERE/results_pane.py $(printf '%q' "$CLAUDE_RESULTS_FILE")"
 if [ -n "${TMUX:-}" ]; then
   tmux split-window -h -l 45% -c "$PWD" "$viewer"
   tmux select-pane -L
