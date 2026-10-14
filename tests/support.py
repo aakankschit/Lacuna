@@ -26,6 +26,7 @@ for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
 # never returns, so a test can interrupt a run part-way. "incomplete" writes a plausible plan and
 # then says, in its reply, that it could not read its sources — the honest failure a real model
 # gives. "clobber" writes its plan over --out itself instead of the .partial it was given.
+# "body" writes exactly FAKE_BODY to the note or plan path and replies FAKE_REPLY (default: the path).
 FAKE_CLAUDE = r'''#!{py}
 import json, os, re, sys, time
 prompt = sys.stdin.read()
@@ -57,6 +58,10 @@ plan = re.search(r"Write the result to (\S+)\.", prompt)
 target = (note and note.group(2)) or (plan and plan.group(1))
 if mode == "clobber" and plan:
     target = target[:-len(".partial")]
+if mode == "body" and target:      # exactly FAKE_BODY, so a test controls a document's opening
+    with open(target, "w") as f:
+        f.write(os.environ["FAKE_BODY"])
+    done({{"is_error": False, "result": os.environ.get("FAKE_REPLY", target), "total_cost_usd": 0.01}})
 if mode == "apology" and target:
     with open(target, "w") as f:
         f.write("# Plan\n\nBLOCKED - not completed. I could not read any of the supplied files.\n\n"
