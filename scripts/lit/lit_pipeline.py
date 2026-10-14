@@ -224,7 +224,8 @@ def to_markdown(path, out_dir, equations=False, parser=None):
     h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
     os.makedirs(f"{CACHE}/md", exist_ok=True)
     tag = f"_{parser}" if parser else ("_marker" if equations else "")
-    md = f"{CACHE}/md/{os.path.basename(path)[:-4]}_{h}_p{PARSE_VERSION}{tag}.md"
+    md = os.path.join(CACHE, "md", fitted(os.path.basename(path)[:-4], f"_{h}_p{PARSE_VERSION}{tag}.md",
+                                          os.path.join(CACHE, "md"), spare=len(".partial")))   # prep_md's temp
     if not os.path.exists(md) or os.path.getsize(md) == 0:   # 0 bytes: an interrupted parse
         cmd = [VENV, "-I", f"{HERE}/prep_md.py", path, md]
         if equations:
@@ -252,6 +253,8 @@ def cmd_read(a):
     os.makedirs(out_dir, exist_ok=True)
     need_writable(out_dir, "--out")
     os.makedirs(f"{CACHE}/notes", exist_ok=True)
+    need_short_names([f"{out_dir}/{os.path.splitext(os.path.basename(p))[0]}.md" for p in a.papers],
+                     "Rename the document, or copy it under a shorter name.")
     # Each document's note is <out>/<its name>.md. Settle every name before anything is parsed or
     # paid for: two documents with one name once shared a note path, and the parallel readers then
     # cached one paper's note under the other's key, permanently.
@@ -309,7 +312,7 @@ def cmd_read(a):
         key = hashlib.sha256("\0".join(
             [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
-        cached = f"{CACHE}/notes/{stem}_{key}.md"
+        cached = os.path.join(CACHE, "notes", fitted(stem, f"_{key}.md", os.path.join(CACHE, "notes")))
         # A note from before ownership was recorded (0.2.0), or from a run killed between writing
         # it and recording it, is still provably this document's when it is exactly this document's
         # cached note.
@@ -518,7 +521,9 @@ def _atomic_copy(src, dst):
     a truncated note that the next run served as a free hit — the same defect already fixed for the
     parse cache, in its sibling path.
     """
-    tmp = f"{dst}.{os.getpid()}.part"
+    # A short temporary name: "<dst>.<pid>.part" was 11 bytes longer than a name that fits, so a
+    # document with a 230-239 byte name failed here, after its reader had been paid (B13).
+    tmp = os.path.join(os.path.dirname(dst), f".{os.getpid()}.{threading.get_ident()}.part")
     try:
         shutil.copyfile(src, tmp)
         os.replace(tmp, dst)
@@ -535,6 +540,38 @@ def name_key(path):
     """One key per file that the filesystem treats as one. macOS folds case (Paper.md is paper.md)
     and Unicode normalisation (café typed and café pasted from a PDF are one name)."""
     return unicodedata.normalize("NFC", os.path.basename(path)).casefold()
+
+
+def name_max(d):
+    """The longest file name directory `d` (or its nearest existing parent) holds, in bytes."""
+    while not os.path.isdir(d) and os.path.dirname(d) != d:
+        d = os.path.dirname(d)
+    try:
+        n = os.pathconf(d, "PC_NAME_MAX")
+    except (OSError, ValueError, AttributeError):
+        n = None
+    return n if n and n > 0 else 255
+
+
+def fitted(stem, suffix, d, spare=0):
+    """stem + suffix, the stem cut short enough for directory `d` (with `spare` bytes over, for a
+    temporary name built on it). Only for names that carry a hash (the caches): cutting the stem
+    cannot make two of them one. A name that already fits is kept, so no cache entry moves."""
+    room = name_max(d) - len(os.fsencode(suffix)) - spare
+    if len(os.fsencode(stem)) > room:
+        stem = os.fsencode(stem)[:max(room, 0)].decode("utf-8", "ignore")
+    return stem + suffix
+
+
+def need_short_names(paths, how):
+    """Exit 2 unless every file name Lacuna will create fits its directory. Checked before any model
+    call: a name the filesystem refused after the call cost the call and wrote nothing (B13, B14)."""
+    long = [p for p in paths if len(os.fsencode(os.path.basename(p))) > name_max(os.path.dirname(p))]
+    if long:
+        print("ERROR: these file names would be longer than their directory allows "
+              f"({name_max(os.path.dirname(long[0]))} bytes):\n" + "\n".join(f"  - {p}" for p in long)
+              + f"\n{how} Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
 
 
 def _sha(path):
@@ -775,6 +812,8 @@ def cmd_synth(a):
         sys.exit(EX_INPUT)
     a.repo = os.path.abspath(a.repo)
     a.out = os.path.abspath(a.out)
+    need_short_names([a.out, f"{a.out}.filelist.txt", f"{a.out}.partial", f"{a.out}.rejected"],
+                     "Choose a shorter --out.")
     # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
     # plan was once replaced without a word: the ownership rule covered read's notes only.
     why = not_ours(a.out)
@@ -923,6 +962,7 @@ def cmd_verify(a):
     if a.notes:
         a.notes = os.path.abspath(a.notes)
     out = f"{a.target}.unverified.md"
+    need_short_names([out], "Rename --target, or copy it under a shorter name.")
     why = not_ours(out, namespaced=True)       # a report annotated by hand is the user's
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "

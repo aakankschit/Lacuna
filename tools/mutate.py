@@ -217,6 +217,16 @@ MUTANTS = [
     ("clobbered-out-kept", PIPE, "        if os.path.isfile(a.out) and _sha(a.out) != before:", "        if False:"),
     ("hook-edit-not-rerecorded", PIPE, "    for out, src in written:\n        rerecord(out, src)\n", "\n"),
     ("clobbered-out-deleted", PIPE, '            os.replace(a.out, f"{a.out}.rejected")', "            os.remove(a.out)"),
+    # B13/B14: a name the filesystem refuses after the model call costs the call
+    ("atomic-copy-temp-longer-than-name", PIPE,
+     '    tmp = os.path.join(os.path.dirname(dst), f".{os.getpid()}.{threading.get_ident()}.part")',
+     '    tmp = f"{dst}.{os.getpid()}.part"'),
+    ("note-cache-name-unbounded", PIPE, 'fitted(stem, f"_{key}.md", os.path.join(CACHE, "notes"))', 'f"{stem}_{key}.md"'),
+    ("parse-cache-name-unbounded", PIPE, 'fitted(os.path.basename(path)[:-4], f"_{h}_p{PARSE_VERSION}{tag}.md",\n'
+     '                                          os.path.join(CACHE, "md"), spare=len(".partial")))',
+     'os.path.basename(path)[:-4] + f"_{h}_p{PARSE_VERSION}{tag}.md")'),
+    ("parse-cache-name-ignores-its-temp", PIPE, 'spare=len(".partial")))', "spare=0))"),
+    ("names-not-checked-before-paying", PIPE, "    if long:\n        print(\"ERROR: these file names", "    if False:\n        print(\"ERROR: these file names"),
     ("record-unlocked-between-processes", PIPE, "                fcntl.flock(self.fd, fcntl.LOCK_EX)", "                pass"),
     ("damaged-record-raises", PIPE, "    except Exception as e:       # OSError, ValueError, a list at the top, RecursionError on deep nesting",
      "    except (OSError, ValueError) as e:"),

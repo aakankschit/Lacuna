@@ -159,11 +159,17 @@ class TestNoteCache(Pipeline):
         one paper's note under the other's key. A document passed twice was paid for twice."""
         hexy = write(os.path.join(self.docs, "notes_3f2a9c1b7d4e.md"), read(self.alpha))
         plain = write(os.path.join(self.docs, "notes.md"), read(self.alpha) + "\nAnother paper.\n")
+        # A long name that fits is a name: its cache entry once failed on a temporary name 11 bytes
+        # longer than itself, or on its own 16-byte hash suffix, after the reader had been paid.
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        fits = write(os.path.join(self.docs, "f" * (nm - 16) + ".md"), read(self.alpha) + "\nA third.\n")
+        cut = write(os.path.join(self.docs, "c" * (nm - 8) + ".md"), read(self.alpha) + "\nA fourth.\n")
         for attempt in ("first read", "cache hit"):
-            r = self.lacuna("lit", "read", hexy, plain, self.alpha, self.alpha, "--out", self.notes)
+            r = self.lacuna("lit", "read", hexy, plain, self.alpha, self.alpha, fits, cut, "--out", self.notes)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(len(self.calls()), 3, f"{attempt}: one call per distinct document, none on a hit")
-            self.assertEqual(ls(self.notes), ["alpha.md", "notes.md", "notes_3f2a9c1b7d4e.md"])
+            self.assertEqual(len(self.calls()), 5, f"{attempt}: one call per distinct document, none on a hit")
+            self.assertEqual(ls(self.notes), sorted(["alpha.md", "notes.md", "notes_3f2a9c1b7d4e.md",
+                                                     os.path.basename(fits), os.path.basename(cut)]))
             for name in ls(self.notes):
                 self.assertIn(f"# A note ({name})", self.note(name), f"{attempt}: {name} holds another paper's note")
 
@@ -347,6 +353,11 @@ class TestMoneyGuarantees(Pipeline):
         os.chmod(self.p("readonly"), 0o555)
         partial = write(self.p("partial-digest.md"), "# PARTIAL: literature notes unreadable\n\n## Status of this "
                         "digest\n\nThis digest contains no literature claims.\n" + "Padding. " * 120)
+        # A name the filesystem refuses after the model call costs the call and writes nothing.
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        venv_py = write(self.p("venv", "python"), FAKE_PARSER_PY, 0o755)
+        long_pdf = write(self.p("long", "x" * nm), "%PDF")       # no extension: parsed, noted as <name>.md
+        long_target = write(self.p("long", "t" * (nm - 8) + ".md"), "# Plan\n" + "x" * 500)
         cases = [
             ("two documents, one name", ("lit", "read", *twins, "--out", self.notes)),
             ("a .txt and a .pdf, one name", ("lit", "read", txt, pdf, "--out", self.notes)),
@@ -375,12 +386,16 @@ class TestMoneyGuarantees(Pipeline):
             ("verify missing target", ("lit", "verify", "--target", f"{self.tmp}/nope.md", "--repo", self.repo)),
             ("verify missing repo", ("lit", "verify", "--target", self.alpha, "--repo", gone)),
             ("verify missing notes", ("lit", "verify", "--target", self.alpha, "--repo", self.repo, "--notes", gone)),
+            ("a note name longer than --out allows", ("lit", "read", long_pdf, "--out", self.notes)),
+            ("synth --out too long for its .filelist.txt", ("lit", "synth", "--notes", self.notes, "--repo", self.repo,
+                                                            "--out", self.p("long", "p" * (nm - 5) + ".md"))),
+            ("a verify report name longer than allowed", ("lit", "verify", "--target", long_target, "--repo", self.repo)),
         ]
         for label, argv in cases:
             if ("cannot read" in label or "cannot write" in label) and os.geteuid() == 0:
                 continue                      # root ignores file modes
             with self.subTest(label):
-                r = self.lacuna(*argv)
+                r = self.lacuna(*argv, LACUNA_PYTHON=venv_py)
                 self.assertEqual(r.returncode, 2, f"{label}: {r.stdout}{r.stderr}")
                 self.assertEqual(self.calls(), [], f"{label} reached a model, which costs real money")
         self.assertEqual(read(vault_note), "# My own alpha notes\n", "a user's file in --out was overwritten")
@@ -579,6 +594,12 @@ class TestPdfPlumbing(Pipeline):
         self.assertEqual(len(self.parse_lines()), 4, "an empty parse must be redone, not handed to a reader")
         self.read_pdf(prelude="L.PARSE_VERSION = '999'")
         self.assertEqual(len(self.parse_lines()), 5, "a change to clean()/validate() must reach parsed documents")
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        long_pdf = write(self.p("x" * (nm - 4) + ".pdf"), "%PDF-1.4 not really a pdf")
+        for _ in range(2):
+            r = self.lacuna("lit", "read", long_pdf, "--out", self.notes, LACUNA_PYTHON=self.venv_py)
+            self.assertEqual(r.returncode, 0, f"a PDF whose name fits must parse: {r.stderr[-300:]}")
+        self.assertEqual(len(self.parse_lines()), 6, "a long name is parsed once, then served from the cache")
 
     def test_parse_failures_exit_3_before_any_model_call(self):
         r = self.read_pdf(LACUNA_PYTHON=self.p("no-such-venv", "python"))

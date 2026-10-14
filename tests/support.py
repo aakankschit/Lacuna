@@ -100,7 +100,7 @@ print(json.dumps({{"is_error": False, "result": "nothing to do", "total_cost_usd
 FAKE_PARSER_PY = r'''#!/bin/sh
 echo "$@" >> "$FAKE_PARSE_LOG"
 if [ -n "$FAKE_PARSE_FAIL" ]; then echo "parse exploded" >&2; exit 1; fi
-printf '# Parsed\n\n## Abstract\n\nParsed body.\n' > "$4"
+printf '# Parsed\n\n## Abstract\n\nParsed body.\n' > "$4.partial" && mv "$4.partial" "$4"   # as prep_md does
 '''
 
 
