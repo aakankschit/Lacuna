@@ -451,7 +451,7 @@ class TestMoneyGuarantees(Pipeline):
         self.config({"after": {"verify": hook}})
         plan, report = self.p("plan.md"), self.p("plan.md.unverified.md")
         write(plan, "# Plan\n" + "content " * 200)
-        for mode, reply in [("refuse", None), ("garbage", None),
+        for mode, reply in [("refuse", None), ("garbage", None), ("incomplete", None),
                             ("reply", "I cannot help with that request."),
                             ("reply", "I could not check any claims because the document is not in the codebase.\n"
                                       "- `runs/real/plan.md` -> not found.")]:

@@ -381,65 +381,126 @@ def cmd_read(a):
         rerecord(out, src)
 
 
-# Phrases a model writes when it could not do the job. A file of apologies passes any size check,
-# which is how a blocked run came to report success and fire the user's after.* hook.
-REFUSAL_MARKERS = (
-    "not completed", "cannot complete", "could not complete", "unable to complete",
-    "i can't help", "i cannot help", "i'm unable to", "i am unable to", "no files were found",
-    "unable to read", "could not read any", "i don't have access",
-    "could not check any", "cannot check any", "unable to check any", "could not verify any",
-)
-
-
-# A model writes "I could not read any…", not "could not read any…", and a curly apostrophe is
-# what most of them actually emit. Normalise both away before matching, or the phrase list only
-# catches the one phrasing someone happened to paste into it.
-_LEAD = re.compile(r"^(?:unfortunately|sorry|apologies|note)\b[,:\s]*|^(?:i|we)\s+(?:am\s+|'m\s+)?")
+# ---- did the model say it could not do the job?
+#
+# A model that cannot do the job writes a fluent explanation that passes any size check; an honest one
+# writes "PARTIAL: literature notes unreadable" or replies "INCOMPLETE: …". Either way it says so
+# FIRST. So the rule is positional: only the OPENING is judged — the first statement below any YAML
+# frontmatter, headings and furniture (a callout tag, a quote mark, a list number, a code fence,
+# "Status:"), and the headings above it. The same words anywhere else are findings: "37 had not
+# completed follow-up", "- INCOMPLETE: data for site B", "the authors were unable to read 5 records".
+# This check has swung between false positives and false negatives three times, each time by adding or
+# removing phrases; it is a grammar now, and these are its three shapes:
+#
+#   1. A status word standing alone: BLOCKED, PARTIAL:, INCOMPLETE:, "Not completed." Followed by
+#      another word it is part of a name: PARTIAL LEAST SQUARES, "Not completed follow-up in 37 of 412".
+#   2. The agent saying it cannot do the job: an optional lead-in ("Unfortunately,", "I'm sorry, but"),
+#      "I" or no subject, an inability ("cannot", "could not", "was unable to", "was not able to", "do
+#      not have access") and a verb for the job or for getting at its inputs ("help", "complete",
+#      "summarise", "open", "read", "access", "process"…). Not "we": in a note "we" are the paper's
+#      authors ("We could not complete follow-up for 37 patients"). Not a numbered part of the input
+#      ("I could not read Table 3"): that is a caveat about the part. And the verifier's own verbs
+#      ("check", "verify") only with "any": "I could not verify the following claims:" opens a report.
+#   3. "No files were found", what an agent given paths it cannot resolve replies.
+#
+# A line in the verify report's `claim -> what you found` form is a finding whatever its first words:
+# "No files were found matching `src/ghost.py` -> …" is a report, "- PARTIAL: … -> …" a graded claim.
+_LEAD_IN = re.compile(r"^(?:(?:unfortunately|regrettably|sadly|however|sorry|apologies|my apologies|note"
+                      r"|i am (?:very |so |really )?sorry|i am afraid|i apologi[sz]e)\b[^\w]*(?:but\b[^\w]*)?)+")
+_UNABLE = (r"(?:(?:am|was|were|have been|had been)\s+)?(?:unable|not able)\s+to"
+           r"|cannot|can not|could not|did not manage to")
+_JOB = (r"help|assist|complete|finish|fulfil|fulfill|comply|proceed|continue|summari[sz]e|write|produce|generate"
+        r"|provide|perform|do|open|read|access|load|parse|process|view|retrieve|extract|decode")
+_PART = r"\s+(?:the\s+)?(?!any\b|all\b|the\b|of\b)[a-z]+\.?\s*\(?\d"      # "Table 3", "pages 3-12"
+_DECLINE = re.compile(
+    rf"(?:i\s+)?(?:(?:{_UNABLE})\s+(?:(?:{_JOB})\b(?!{_PART})|(?:check|verify|confirm|fact-check)\s+(?:any|a single)\b)"
+    r"|(?:do|did) not have access\b|(?:have|had) no access\b)"
+    r"|no (?:files?|notes?|documents?) (?:were|was|could be) found\b"
+    r"|not completed(?=\s*(?:[^\w\s]|$))")
 
 
 def _norm(text):
-    return text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    """Lower case, straight apostrophes and contractions spelled out, so the grammar has one form of each
+    phrase: a curly apostrophe is what most models emit, and "couldn't" is as common as "could not"."""
+    t = text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    t = re.sub(r"\bcan't\b", "cannot", t)
+    t = re.sub(r"\bwon't\b", "will not", t)
+    t = re.sub(r"n't\b", " not", t)
+    return re.sub(r"\bi'm\b", "i am", t)
 
 
-def _opens_with_apology(low):
-    for _ in range(3):                       # "Unfortunately, I could not…"
-        stripped = _LEAD.sub("", low, count=1)
-        hit = next((m for m in REFUSAL_MARKERS if low.startswith(m) or stripped.startswith(m)), None)
-        if hit:
-            return hit
-        if stripped == low:
-            return None
-        low = stripped
+def _declines(text):
+    """The declining phrase `text` (an opening, furniture stripped) starts with, or None. It may follow
+    a lead-in ("Unfortunately,") or one short sentence ("Both notes are binary garbage.")."""
+    low = _norm(text).strip()
+    first = re.split(r"(?<=[.!?])\s", low, 1)[0]
+    for s in (low, low[len(first):].lstrip() if len(first) < 90 else ""):
+        m = _DECLINE.match(_LEAD_IN.sub("", s, count=1))
+        if m:
+            return m.group(0)
     return None
 
 
+_FENCE = re.compile(r"\s*(?:```|~~~)")
+_ITEM = re.compile(r"\s*(?:[-*+]|\d+[.)])\s")
+_YAML_KEY = re.compile(r"[a-z_][\w-]*:(?:\s|$)")
+
+
+def _furniture_only(line):
+    return _FENCE.match(line) or not re.search(r"\w", _FURNITURE.sub("", line, count=1))
+
+
+def _lines(text):
+    """`text` by line as a reader meets it: past any YAML frontmatter, and with each line that is only
+    furniture blanked — a callout's `> [!WARNING]` on a line of its own, a code fence, a rule — so that
+    what follows it is the opening, as it is on the page. Without this, the callout tag alone and the
+    frontmatter's first key were each taken for the opening, and a `PARTIAL:` under them was filed."""
+    lines = text.splitlines()[:80]
+    top = next((i for i, l in enumerate(lines) if l.strip()), 0)
+    if lines and lines[top].strip() == "---" and top + 1 < len(lines) and _YAML_KEY.match(lines[top + 1]):
+        end = next((j for j in range(top + 2, len(lines)) if lines[j].strip() in ("---", "...")), None)
+        if end is not None:
+            lines = lines[end + 1:]
+    return ["" if _furniture_only(l) else l for l in lines]
+
+
 def refusal(head):
-    """The apology in the opening of a document, or None.
+    """The declaration of failure that opens a document or a reply, or None (the rule is above).
 
-    Position, not presence. A model that could not do the job *opens a block* with the apology:
-    "Not completed. I could not read any of the notes." A correct document contains the same words
-    inside a sentence: "37 had not completed follow-up", "cannot complete in polynomial time".
-
-    So each block in the opening is tested at its START, after stripping markdown furniture. That
-    catches an apology under a heading or as a list item — the earlier version only looked before
-    the first heading, which let `## Status` + an apology be filed as a plan — without discarding a
-    finding that merely mentions the words.
-    """
-    for block in re.split(r"\n\s*\n", head[:1500])[:6]:
-        stripped = re.sub(r"^(?:[#>\s]*|\s*(?:[-*+]|\d+[.)])\s*)+", "", block).strip()
-        if not stripped:
-            continue
-        low = _norm(stripped)
-        hit = _opens_with_apology(low)
+    The opening statement runs to a blank line, a heading or the next list item: an apology wrapped
+    over two lines is read whole, and a report's first finding is not part of the line above it."""
+    units, statement = [], []
+    for line in _lines(head):
+        if not line.strip():
+            if statement:
+                break
+        elif line.lstrip().startswith("#"):
+            if statement:
+                break
+            units.append(line)
+        elif statement and _ITEM.match(line):
+            break
+        else:
+            statement.append(_FURNITURE.sub("", line, count=1))
+    units.append(" ".join(statement))
+    for unit in units:
+        hit = None if "->" in unit else _declines(_FURNITURE.sub("", unit, count=1))
         if hit:
             return hit
-        # The apology may follow one short lead-in sentence in the same block.
-        first_sentence = re.split(r"(?<=[.!?])\s", low, 1)[0]
-        if len(first_sentence) < 90:
-            hit = _opens_with_apology(low[len(first_sentence):].lstrip())
-            if hit:
-                return hit
     return declared_failure(head)
+
+
+def reply_failure(reply):
+    """What a model's reply says went wrong, or None.
+
+    A reply is judged like a document, by its opening. And every agent is told to reply `INCOMPLETE:
+    <reason>` when it could not read its sources (INCOMPLETE_RULE), so a line of a reply that opens with
+    that word is the agent's own verdict wherever it stands: a real planner put it on line 3, under two
+    lines of prose, when only the first line was read. The other markers count only at the opening."""
+    hit = refusal(reply)
+    if hit:
+        return hit
+    return next(("INCOMPLETE" for line in reply.splitlines() if declared_failure(line) == "INCOMPLETE"), None)
 
 
 # A status marker opening a document or a reply: BLOCKED, as a blocked agent writes it, or PARTIAL: /
@@ -475,8 +536,9 @@ INCOMPLETE_RULE = ("If you could not read {what}, do not write a document explai
 
 
 def declared_failure(text):
-    """The status marker a document or reply opens with (BLOCKED, PARTIAL, INCOMPLETE), or None."""
-    for line in text.splitlines()[:40]:
+    """The status marker a document or reply opens with (BLOCKED, PARTIAL, INCOMPLETE), or None.
+    Frontmatter and lines that are only furniture are passed over (_lines)."""
+    for line in _lines(text)[:40]:
         if not line.strip():
             continue
         heading = line.lstrip().startswith("#")
@@ -878,7 +940,7 @@ def cmd_synth(a):
     ok = usable_output(part, 800, a.kind)
     # A model that could not read its sources may say so in its reply and still leave a document
     # behind; a real digester filed "PARTIAL: literature notes unreadable", exit 0. Its own word wins.
-    said = declared_failure(str(res.get("result") or ""))
+    said = reply_failure(str(res.get("result") or ""))
     if ok and said:
         print(f"  ! the model reported {said!r} — treating it as a failed run, not output", file=sys.stderr)
         ok = False
@@ -963,7 +1025,7 @@ def cmd_verify(a):
 
     if res.get("is_error") or not report.strip():
         failed("returned no usable report")
-    hit = refusal(report)     # a reply that checked nothing arrives with is_error: false
+    hit = reply_failure(report)     # a reply that checked nothing arrives with is_error: false
     if hit:
         failed(f"replied with {hit!r} rather than a report")
     try:

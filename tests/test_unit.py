@@ -484,6 +484,21 @@ class TestRefusalPosition(unittest.TestCase):
             ("> [!warning] PARTIAL: two of three notes unreadable", "in a callout"),
             ("Status: INCOMPLETE — no literature was readable", "behind a Status: label"),
             ("# Development plan — next iteration (PARTIAL / BLOCKED)\n\n## Read this first", "a real planner's title"),
+            # VERDICT3 N6: each of these was filed, exit 0, with the hook fired.
+            ("# Development plan\n\n> [!WARNING]\n> PARTIAL: literature notes unreadable", "a callout tag on its own line"),
+            ("---\ntitle: Plan\ntags: [lit]\n---\n\nPARTIAL: literature notes unreadable", "after YAML frontmatter"),
+            ("```\nINCOMPLETE: the notes could not be read\n```", "in a code fence"),
+            ("# Development plan\n\nI couldn't open any of the literature notes, so no proposals follow.", "couldn't open"),
+            ("# Development plan\n\nI was unable to access the notes, so what follows is generic.", "was unable to access"),
+            ("# A note (x)\n\n## Claim\nI\u2019m sorry, but I can\u2019t help with summarising this paper.",
+             "I'm sorry, but, curly apostrophes, under a heading with no blank line"),
+            ("Unfortunately, I was not able to read the paper: every page is symbol noise.", "was not able to"),
+            ("> [!NOTE]\n> I don't have access to the notes directory.", "no access, in a callout"),
+            ("Both notes are binary garbage. I could not read either of them.", "after one short sentence"),
+            ("Unfortunately,\nI could not read any of the notes.", "wrapped over two lines"),
+            ("No files were found at the given path.", "a verifier that resolved nothing"),
+            ("I could not check any claims because the document is not in the codebase.\n- `runs/real/plan.md` -> not found.",
+             "a real verifier's reply, its finding below the apology"),
         ]:
             with self.subTest(label):
                 self.assertTrue(self.refusal(text), f"{label} must be recognised as an apology")
@@ -503,6 +518,17 @@ class TestRefusalPosition(unittest.TestCase):
             ("# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim", "a hyphenated title"),
             ("# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA", "a bracketed title"),
             ("# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim", "a title in capitals"),
+            # VERDICT3 N10a: findings that open with the words, each discarded after it was paid for.
+            ("# A note (Lee 2025)\n\n## Claim\n\nNot completed follow-up in 37 of 412 patients biased the estimate.",
+             "a Claim opening 'Not completed follow-up'"),
+            ("# A note (Lee 2025)\n\n## Claim\nNot completed follow-up in 37 of 412 patients biased the estimate.",
+             "the same, with no blank line under the heading"),
+            ("No files were found matching `src/ghost.py` -> the repo has src/a.py only", "a verify finding"),
+            ("I could not verify the following claims:\n\n- `0.83` -> not in any note", "a verify report's first line"),
+            ("# A note (x)\n\n## Claim\nI could not read Table 3 (the scan is blurred); the rest shows X improves Y "
+             "by 12% (Section 4).", "a caveat about a numbered part"),
+            ("# A note (Lee 2025)\n\n## Claim\n\nWe could not complete follow-up for 37 of 412 patients, which biases "
+             "the estimate (Table 2).", "the paper's authors, as 'we'"),
         ]:
             with self.subTest(label):
                 self.assertIsNone(self.refusal(text), f"{label} must not be discarded")
@@ -689,6 +715,23 @@ class TestStatusMarkerEdges(unittest.TestCase):
                      "Status: INCOMPLETE — no literature was readable"):
             with self.subTest(text[:40]):
                 self.assertTrue(self.declared(text), text)
+
+    def test_a_reply_is_searched_for_the_word_it_was_told_to_use(self):
+        """Every agent is told to reply INCOMPLETE when it could not read its sources. A real planner
+        put it on line 3, under two lines of prose, and only the first line was read (VERDICT3 N6)."""
+        reply_failure = L.reply_failure
+        for text in ("Both literature notes are binary garbage -\nno text survives.\nINCOMPLETE: notes unreadable",
+                     "/x/plan.md.partial\n\n`INCOMPLETE: two notes are empty`",
+                     "Done. I could not open any of the notes, so the plan rests on the repo alone."):
+            with self.subTest(text[:40]):
+                self.assertTrue(reply_failure(text), text)
+        for text in ("/x/notes/a.md",
+                     "Wrote /x/notes/a.md.\n\nPages 3-12 were garbled; the note says which numbers are missing.",
+                     "Wrote the plan.\nBLOCKED: proposal 3 waits for the CUDA build.",
+                     "Wrote it.\nINCOMPLETE-data methods are covered in proposal 2.",
+                     "- `src/a.py` -> exists\n- INCOMPLETE: data for site B -> the note has it (Table 3)"):
+            with self.subTest(text[:40]):
+                self.assertIsNone(reply_failure(text), text)
 
     def test_a_marker_inside_a_technique_name_is_not_a_failure(self):
         """These are real papers. Discarding them is the false positive this keeps swinging into."""
