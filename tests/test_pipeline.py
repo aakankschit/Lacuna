@@ -12,6 +12,7 @@ import json, os, shutil, signal, subprocess, sys, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from support import FAKE_PARSER_PY, LACUNA, ROOT, Sandbox, ls, read, write
+import lit_pipeline as L
 
 
 class Pipeline(Sandbox):
@@ -174,6 +175,12 @@ class TestNoteCache(Pipeline):
                                                      os.path.basename(fits), os.path.basename(cut)]))
             for name in ls(self.notes):
                 self.assertIn(f"# A note ({name})", self.note(name), f"{attempt}: {name} holds another paper's note")
+        # What a failed run sets aside is named after the note, and cut to fit when it must be.
+        long_note = os.path.join(self.notes, os.path.basename(cut))
+        r = self.lacuna("lit", "read", cut, "--out", self.notes, "--brief", "BRIEF:again", mode="refuse",
+                        FAKE_EDIT=long_note)
+        self.assertEqual(r.returncode, 4, r.stderr[-300:])
+        self.assertEqual(len([f for f in ls(self.notes) if ".rejected" in f]), 1)
 
     def test_books_are_offered_and_keyed_by_what_exists(self):
         """Found end to end: after deleting a book, the old note came back as "cached (free)"
@@ -287,6 +294,27 @@ class TestOwnership(Pipeline):
         r = read_(jones)
         self.assertEqual(r.returncode, 2, r.stderr[-300:])
         self.assertIn(".lacuna.json could not be read", r.stderr)
+
+    def test_what_is_cached_is_what_this_runs_agent_wrote(self):
+        """The reader wrote the note path, and whatever was there when it returned was judged and
+        cached: an earlier note after a refusal, another run's note, an edit made meanwhile. It
+        writes a draft of its own now; the note is replaced only by that draft, and only if nobody
+        changed it during the run."""
+        note = os.path.join(self.notes, "alpha.md")
+        self.assertEqual(self.read("--brief", "BRIEF:one").returncode, 0)
+        first = self.note()
+        r = self.read("--brief", "BRIEF:two", FAKE_EDIT=note)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"KEPT — {note} changed while this run was in progress", r.stdout)
+        self.assertEqual(self.note(), first + "EDITED WHILE THE MODEL RAN\n", "an edit made during the run was lost")
+        r = self.read("--brief", "BRIEF:two", "--overwrite")
+        self.assertIn("cached (free)", r.stdout, "the note this run paid for was not kept")
+        self.assertIn("BRIEF:two", self.note())
+        self.assertNotIn("EDITED", self.note(), "the cache took what was at the note path, not what the agent wrote")
+        r = self.read("--brief", "BRIEF:three", mode="refuse", FAKE_EDIT=note)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("EDITED", read(note + ".rejected"), "a note that changed during a failed run is moved aside")
+        self.assertFalse(os.path.exists(note), "and not left for the next synth to read")
 
     def test_a_document_inside_out_under_another_spelling_survives_overwrite(self):
         """macOS folds case and Unicode form: Paper.MD inside --out is the note path Paper.md. The
@@ -675,6 +703,7 @@ class TestMoneyGuarantees(Pipeline):
         self.assertEqual(self.verify(plan, mode="refuse").returncode, 4)
         self.assertFalse(os.path.exists(report), "a report must not sit beside a version it never checked")
 
+
     def test_a_missing_tool_or_an_odd_reply_stays_inside_the_exit_codes(self):
         """0, 2, 3, 4 is the contract a caller branches on. A traceback (exit 1) after a paid call
         is the worst outcome: the money is spent and the caller cannot tell what happened."""
@@ -797,21 +826,77 @@ class TestPdfPlumbing(Pipeline):
         self.assertEqual(self.calls(), [])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class TestConcurrentRuns(Pipeline):
+    """One run writes a given note, plan or report at a time, from its ownership check to its final
+    write, and nothing a run leaves behind blocks the next.
 
+    0.3.1 reserved a note path in the record and released it only on success, so a refused reader,
+    Ctrl-C or a kill refused every later read of a same-named document for good, --overwrite
+    included. A re-read dropped its own reservation before its model call, and the same document
+    under another --brief was let through: two agents wrote one path, and a cache key could hold
+    another document's note. Two synths into one --out deleted each other's work."""
 
-class TestConcurrentReads(Pipeline):
-    """Two Lacuna processes reading same-named documents into one --out.
+    def test_a_path_another_run_holds_is_refused_before_paying(self):
+        os.makedirs(self.notes)
+        write(os.path.join(self.notes, "n.md"), "# n\n" + "content " * 200)
+        plan, target = self.p("lit", "plan.md"), write(self.p("lit", "t.md"), "# T\n" + "content " * 200)
+        self.addCleanup(L.release_all)
+        for path in (os.path.join(self.notes, "alpha.md"), plan, target + ".unverified.md"):
+            self.assertIsNone(L.hold(path, "testing"))     # this test process is the other run
+        read_ = ("lit", "read", self.alpha, "--out", self.notes)
+        synth = ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out", plan)
+        verify = ("lit", "verify", "--target", target, "--repo", self.repo)
+        for label, argv in [("read", read_), ("read --overwrite", read_ + ("--overwrite",)),
+                            ("the same document under another --brief", read_ + ("--brief", "BRIEF:other")),
+                            ("synth", synth), ("synth --overwrite", synth + ("--overwrite",)),
+                            ("verify", verify), ("verify --overwrite", verify + ("--overwrite",))]:
+            with self.subTest(label):
+                r = self.lacuna(*argv)
+                self.assertEqual((r.returncode, len(self.calls())), (2, 0), r.stdout + r.stderr)
+                self.assertIn(f"another Lacuna run (pid {os.getpid()} ", r.stderr)
+        L.release_all()
+        for argv in (read_, synth, verify):
+            self.assertEqual(self.lacuna(*argv).returncode, 0)
+        self.assertEqual([f for d in (self.notes, self.p("lit")) for f in os.listdir(d) if f.endswith(".lock")], [],
+                         "a run that has ended holds nothing")
 
-    The collision guard and the ownership check both ran before any lock, so each process cached
-    whatever was at the note path when its own agent returned: one note silently replaced the
-    other, and one paper's cache key could end up holding the other paper's note, served free
-    from then on.
-    """
+    def test_nothing_a_run_leaves_behind_blocks_the_next(self):
+        other = write(self.p("elsewhere", "alpha.md"), "# Another alpha\n\n## Abstract\n\n" + "Other. " * 300)
 
-    def test_one_run_wins_and_the_other_is_refused_before_paying(self):
-        import subprocess
+        def later(out):
+            r = self.lacuna("lit", "read", other, "--out", out)
+            self.assertEqual(r.returncode, 0, f"{out}: {r.stderr}")
+
+        out = self.p("refused")
+        self.assertEqual(self.lacuna("lit", "read", self.alpha, "--out", out, mode="refuse").returncode, 4)
+        later(out)
+        out = self.p("collision")
+        self.assertEqual(self.lacuna("lit", "read", self.alpha, other, "--out", out).returncode, 2)
+        later(out)
+        out, calls = self.p("killed"), len(self.calls())
+        killed = subprocess.Popen([LACUNA, "lit", "read", self.alpha, "--out", out], env=self.env(FAKE_MODE="hang"),
+                                  cwd=self.tmp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        deadline = time.time() + 20
+        while len(self.calls()) == calls and time.time() < deadline:     # its reader is running
+            time.sleep(0.05)
+        os.killpg(killed.pid, signal.SIGKILL)
+        killed.wait()
+        later(out)
+        # 0.3.1 left reservations in the record, and the half-written note of a run killed meanwhile
+        old = self.p("old")
+        write(os.path.join(old, ".lacuna.json"), json.dumps(
+            {"files": {"alpha.md": {"name": "alpha.md", "pending": True, "source": self.alpha}}}))
+        later(old)
+        write(os.path.join(old, ".lacuna.json"), json.dumps(
+            {"files": {"alpha.md": {"name": "alpha.md", "pending": True, "source": self.alpha}}}))
+        write(os.path.join(old, "alpha.md"), "# half a note\n")
+        r = self.lacuna("lit", "read", self.alpha, "--out", old)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("has no record", r.stderr, "the note a killed run left was called edited")
+
+    def test_two_runs_at_once_one_wins_and_the_other_is_refused_before_paying(self):
+        """End to end, with real timing: the deterministic tests above are the guard."""
         a = write(self.p("a", "main.md"), "Title A\n\n" + "body " * 300)
         b = write(self.p("b", "main.md"), "Title B\n\n" + "body " * 300)
         out = self.p("notes")
@@ -830,3 +915,8 @@ class TestConcurrentReads(Pipeline):
         for k in keys:
             cached = read(os.path.join(self.data, "cache", "notes", k))
             self.assertEqual(cached, note, "a cache key must hold its own document's note")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+

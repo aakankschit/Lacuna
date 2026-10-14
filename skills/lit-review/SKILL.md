@@ -144,9 +144,11 @@ was written, or a file another stage wrote. **Show the user that message and ask
 `--overwrite` on your own: it discards their edits, or another paper's note. For two papers with one
 file name (`main.pdf` in two folders), rename one or use another `--out`.
 
-One exit 2 comes after the model call: a plan or report that changed while `synth` or `verify` ran is
-left as it is, and the result is saved beside it as `<out>.new.md`. Tell the user both paths and let
-them choose; do not run the stage again, which pays again.
+One exit 2 comes after the model call: a note, plan or report that changed while the stage ran is
+left as it is. A plan or report's result is saved beside it as `<out>.new.md`; a note's is cached, and
+the same command with `--overwrite` places it for free. Tell the user and let them choose; never run
+`synth` or `verify` again for it, which pays again. If the message says another Lacuna run is writing
+the file, that run is still going: wait for it rather than retrying.
 
 ## If a model refuses
 

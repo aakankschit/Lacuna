@@ -18,7 +18,8 @@ usage:
   lit_pipeline.py synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT] [--overwrite]
   lit_pipeline.py verify --target FILE --repo DIR [--notes DIR]
 """
-import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, shutil, subprocess, sys, threading, time
+import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile
+import threading, time
 import unicodedata
 try:
     import fcntl                       # POSIX; elsewhere the record is guarded within one process only
@@ -266,7 +267,7 @@ def cmd_read(a):
     # Each document's note is <out>/<its name>.md. Settle every name before anything is parsed or
     # paid for: two documents with one name once shared a note path, and the parallel readers then
     # cached one paper's note under the other's key, permanently.
-    papers, by_note, blocked = [], {}, {}
+    papers, by_note, blocked, before = [], {}, {}, {}
     for src in map(os.path.abspath, a.papers):
         stem = os.path.splitext(os.path.basename(src))[0]
         note = f"{out_dir}/{stem}.md"
@@ -285,20 +286,15 @@ def cmd_read(a):
             print(f"ERROR: {note} is a directory, so {src} has nowhere to put its note. Nothing was sent "
                   f"to a model.", file=sys.stderr)
             sys.exit(EX_INPUT)
+        # Held before it is checked and until this run ends, so that no other run writes it between.
+        need_hold(note, f"reading {src} into")
         # A note may only replace a note this tool wrote for this document and nobody has edited
         # since. Anything else at that path is someone's: a hand-edited note, a file in a vault, or
         # the note for another paper that happens to share this one's file name.
         why = not_ours(note, src)
         if why:
             blocked[note] = why
-        # Reserve only a note we may actually write. Reserving one we are about to refuse
-        # overwrote the rightful owner's record with this run's claim; the document still goes
-        # through, because an unrecorded note may yet be adopted as this document's cached note.
-        taken = reserve(note, src) if a.overwrite or not why else None
-        if taken:
-            print(f"ERROR: another Lacuna run is reading {taken} into {note} right now. Wait for it, "
-                  f"or use a different --out. Nothing was sent to a model.", file=sys.stderr)
-            sys.exit(EX_INPUT)
+        before[note] = file_state(note)
         by_note[name_key(note)] = src
         papers.append((src, stem, note))
     reader_model = a.model or lacuna_config.model("reader")
@@ -311,6 +307,8 @@ def cmd_read(a):
     indexes = "".join(open(t, "rb").read().decode(errors="ignore") for t in idx)
     books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]
     reader_effort = lacuna_config.effort("reader")
+    os.makedirs(os.path.join(CACHE, "drafts"), exist_ok=True)
+    drafts = tempfile.mkdtemp(prefix="read-", dir=os.path.join(CACHE, "drafts"))
     jobs = []
     for src, stem, note in papers:
         md = to_markdown(src, out_dir, equations=a.equations, parser=a.parser)
@@ -326,7 +324,7 @@ def cmd_read(a):
         # provably this document's when it is exactly this document's cached note.
         if blocked.get(note, ("",))[0] in (UNRECORDED, "edited") and same_bytes(note, cached):
             del blocked[note]
-        jobs.append((src, md, note, cached))
+        jobs.append((src, md, note, cached, os.path.join(drafts, f"{len(jobs)}.md")))
     if blocked and not a.overwrite:
         print(f"ERROR: {len(blocked)} file(s) in {out_dir} would be replaced, and Lacuna cannot show they "
               f"are notes it wrote for these documents:", file=sys.stderr)
@@ -337,26 +335,31 @@ def cmd_read(a):
               "these files anyway, run the same command with --overwrite.", file=sys.stderr)
         sys.exit(EX_INPUT)
 
-    def one(src, md, out, cached):
-        if os.path.islink(out):
-            os.remove(out)                # only with --overwrite; never write through a link
+    def place(src, out, text):
+        """Put `text` at the note path, unless the note changed while this run was in progress
+        (someone edited it, or something else wrote it): then it is left as it is (B11)."""
+        if changed_since(out, before[out]):
+            return False
+        _atomic_copy(text, out)           # renamed into place: never half-written, never through a link
+        record(out, src)
+        return True
+
+    def one(src, md, out, cached, draft):
+        left = (f"KEPT — {out} changed while this run was in progress, so it was left as it is. This run's "
+                f"note is cached: run the same command with --overwrite to put it there, free")
         if os.path.exists(cached) and os.path.getsize(cached) > 400:
-            shutil.copy(cached, out)      # always refresh: --out may hold another run's note
-            record(out, src)
-            return os.path.basename(out), "cached (free)", 0.0
-        # Remove any earlier note first, so "the file exists" can only mean this call wrote it.
-        # Otherwise a refusal on a re-run reports success and caches the stale note under a new key.
-        # (Only ever a note this tool wrote: anything else at this path stopped the run above.)
-        if os.path.exists(out):
-            os.remove(out)
-            forget(out)
+            # always refresh: --out may hold another run's note
+            return os.path.basename(out), "cached (free)" if place(src, out, cached) else left, 0.0
+        # The agent writes a draft in a directory of this run's own, never the note path. Judged and
+        # cached at the note path, whatever was there when the agent returned was taken for its note:
+        # an earlier note after a refusal, or another run's note, cached under this document's key.
         prompt = "\n\n".join(x for x in [
             a.brief, books,
             "Read the paper below in full and write its note to the given path, using exactly this template:",
-            NOTE_TEMPLATE, f"Paper:\n- {md} -> {out}", "Keep the note under 1,100 words."] if x)
-        res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, BOOKS_DIR],
+            NOTE_TEMPLATE, f"Paper:\n- {md} -> {draft}", "Keep the note under 1,100 words."] if x)
+        res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, drafts, BOOKS_DIR],
                      effort=lacuna_config.effort("reader"), cwd=out_dir)
-        ok = usable_output(out, 400, "note", must_contain=("## Claim",))
+        ok = usable_output(draft, 400, "note", must_contain=("## Claim",))
         # source_tokens makes the calibration recipe in docs/extending.md actually runnable
         # effort and source_tokens are both required by the recalibration recipe in
         # docs/extending.md, which is per model x effort.
@@ -365,26 +368,49 @@ def cmd_read(a):
                 "books": bool(idx), "wrote_note": ok,
                 "source_tokens": round(os.path.getsize(md) / 2.9), "is_error": res.get("is_error")})
         if ok:
-            _atomic_copy(out, cached)
-            record(out, src)
-            return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
+            try:
+                _atomic_copy(draft, cached)
+            except OSError as e:      # the note is paid for and good: caching it is only a saving
+                print(f"  ! could not cache the note for {src} ({e}); it will be read again next time",
+                      file=sys.stderr)
+                if changed_since(out, before[out]):
+                    beside = free_name(out, ".new")      # not .md: synth reads every note in --out
+                    _atomic_copy(draft, beside)
+                    left = (f"KEPT — {out} changed while this run was in progress, so it was left as it is. "
+                            f"This run's note is in {beside}")
+            msg = f"${usd(res):.4f} {res['wall_s']}s" if place(src, out, draft) else left
+            return os.path.basename(out), msg, usd(res)
         why = (str(res.get("result"))[:120] if res.get("is_error") else
-               "the file it wrote is not a note (see above)" if os.path.exists(out) else "agent produced no note file")
-        if os.path.exists(out):
-            os.remove(out)      # an apology left in --out would be read as a note by the next synth
+               "the file it wrote is not a note (see above)" if os.path.exists(draft) else "agent produced no note file")
+        if changed_since(out, before[out]):
+            # The note changed during a failed run: the agent wrote it instead of its draft, or it was
+            # edited meanwhile. Moved aside, never deleted, and not left for the next synth to read.
+            rejected = free_name(out, ".rejected")
+            os.replace(out, rejected)
+            forget(out)
+            why += f"; {out} changed during the run, and was moved to {rejected}"
         return os.path.basename(out), f"FAILED ${usd(res):.4f} — {why}", usd(res)
 
-    t0, total, failed = time.time(), 0.0, 0
-    with cf.ThreadPoolExecutor(min(8, len(jobs))) as ex:
-        for name, msg, cost in ex.map(lambda j: one(*j), jobs):
-            print(f"  {name:48s} {msg}")
-            total += cost
-            failed += msg.startswith("FAILED")
-    print(f"{len(jobs) - failed}/{len(jobs)} notes written, ${total:.3f}, {round(time.time() - t0)}s wall -> {out_dir}")
+    t0, total, failed, kept = time.time(), 0.0, 0, 0
+    try:
+        with cf.ThreadPoolExecutor(min(8, len(jobs))) as ex:
+            for name, msg, cost in ex.map(lambda j: one(*j), jobs):
+                print(f"  {name:48s} {msg}")
+                total += cost
+                failed += msg.startswith("FAILED")
+                kept += msg.startswith("KEPT")
+    finally:
+        shutil.rmtree(drafts, ignore_errors=True)
+    print(f"{len(jobs) - failed - kept}/{len(jobs)} notes written, ${total:.3f}, {round(time.time() - t0)}s wall "
+          f"-> {out_dir}")
     if failed:
         print(f"ERROR: {failed} document(s) produced no note. Nothing downstream should run on this "
               f"directory, and no partial note was cached.", file=sys.stderr)
         sys.exit(EX_MODEL)
+    if kept:
+        print(f"ERROR: {kept} note(s) changed while this run was in progress and were left as they are; "
+              f"see above.", file=sys.stderr)
+        sys.exit(EX_INPUT)
     after("read", out_dir)
 
 
@@ -578,9 +604,13 @@ def need_short_names(paths, how):
         sys.exit(EX_INPUT)
 
 
-def free_name(base, ext=""):
-    """base+ext, or base-2+ext, base-3+ext …, whichever does not exist yet. What an earlier run set
-    aside for the user to look at is never replaced by a later one."""
+def free_name(path, tag, ext=""):
+    """path+tag+ext, or path+tag-2+ext, -3 …, whichever does not exist yet. What an earlier run set
+    aside for the user to look at is never replaced by a later one. The name of `path` is cut to
+    fit the directory if it must be, never the tag: these names are made after the model call, and
+    one too long to create cost the call."""
+    d, name = os.path.split(path)
+    base = os.path.join(d, fitted(name, "", d, spare=len(os.fsencode(tag + ext)) + 4) + tag)
     n = 1
     while os.path.lexists(f"{base}-{n}{ext}" if n > 1 else f"{base}{ext}"):
         n += 1
@@ -635,11 +665,14 @@ def _owners(d):
         return {}, f"{OWNERS} could not be read ({type(e).__name__})"
     good = {}
     for k, v in files.items():
-        # A completed entry carries the note's checksum. A reservation, written before the model
-        # runs, cannot: the note does not exist yet. Dropping those silently let two concurrent
-        # runs each believe the path was free.
-        if isinstance(v, dict) and (isinstance(v.get("sha256"), str) or v.get("pending") is True):
-            good[k] = {**v, "source": v["source"] if isinstance(v.get("source"), str) else None}
+        # Only an entry with a checksum describes a file Lacuna wrote. 0.3.1 also kept "pending"
+        # reservations here, released only on success: one left by a refused, failed or killed run
+        # refused every later read of a same-named document, --overwrite included (A4), and made the
+        # note such a run left read as "edited since" (A7). Runs hold paths now (hold()); old
+        # reservations are ignored.
+        if isinstance(v, dict) and isinstance(v.get("sha256"), str):
+            good[k] = {**{x: y for x, y in v.items() if x != "pending"},
+                       "source": v["source"] if isinstance(v.get("source"), str) else None}
     return good, None
 
 
@@ -664,7 +697,7 @@ def _owners_to_update(d):
     run's entries alone left every later refusal unable to say why (B28)."""
     files, damaged = _owners(d)
     if damaged:
-        kept = free_name(os.path.join(d, f"{OWNERS}.damaged-{time.strftime('%Y%m%d-%H%M%S')}"))
+        kept = free_name(os.path.join(d, OWNERS), f".damaged-{time.strftime('%Y%m%d-%H%M%S')}")
         os.replace(os.path.join(d, OWNERS), kept)
         print(f"  ! {damaged}; it was kept as {kept} and a new record started. Files it listed are no "
               f"longer known to be Lacuna's, so a later run asks (--overwrite) before replacing them.",
@@ -710,33 +743,85 @@ def _save_owners(d, files):
     os.replace(tmp, os.path.join(d, OWNERS))
 
 
-def reserve(path, source):
-    """Claim `path` for `source` before any model call, atomically across processes.
+_held = {}             # lock file -> fd, for every path this process holds
 
-    Returns the source that already holds it, or None on success. The collision guard and the
-    ownership check both ran before any lock, so two concurrent `read`s of same-named documents
-    into one --out each cached whatever was at the note path when its own agent returned: one
-    note silently replaced the other, and one paper's cache key could end up holding the other
-    paper's note, served free from then on.
-    """
-    d = os.path.dirname(path)
-    try:
-        with _locked(d):
-            files = _owners_to_update(d)
-            held = files.get(name_key(path))
-            if held and held.get("source") and os.path.realpath(held["source"]) != os.path.realpath(source):
-                if held.get("pending"):
-                    return held["source"]          # another process is reading it right now
-            entry = dict(held) if held and held.get("source") and \
-                os.path.realpath(held["source"]) == os.path.realpath(source) else \
-                {"name": os.path.basename(path), "source": source, "stage": "read",
-                 "written": time.strftime("%Y-%m-%d %H:%M")}
-            entry["pending"] = True          # keep sha256 etc. so a re-read of the same document
-            files[name_key(path)] = entry    # is not locked out of its own note
-            _save_owners(d, files)
-    except OSError:
-        return None          # cannot reserve: fall through to the existing per-run guard
+
+def hold(path, doing):
+    """Hold `path` until this process exits. Returns None, or what the run that holds it is doing.
+
+    One process writes a given note, plan or report at a time, from its ownership check to its final
+    write. 0.3.1 reserved a path with a "pending" entry in the record, released only on success: a
+    refused reader, Ctrl-C, a missing parser or a kill left it there, and every later read of a
+    same-named document was refused for good, --overwrite included (A4). A re-read dropped its own
+    reservation before its model call (A5), and the same document under two cache keys was let
+    through (A6): two agents wrote one path, and one paper's note was cached under another's key.
+    Two synths into one --out deleted each other's .partial (A11).
+
+    A hold is an flock on a lock file beside the record. The kernel ends it when the process ends,
+    however it ends (SIGKILL, a reused pid), so a hold can never go stale. The file says who holds
+    it, for the message. Without fcntl, or where no lock file can be made, a path is not held."""
+    if fcntl is None:
+        return None
+    lock = os.path.join(os.path.dirname(path),
+                        f".lacuna-{hashlib.sha256(name_key(path).encode()).hexdigest()[:16]}.lock")
+    if lock in _held:
+        return None
+    for _ in range(5):
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                info = json.loads(os.read(fd, 4096) or b"{}")
+            except (OSError, ValueError):
+                info = {}
+            os.close(fd)
+            return {**(info if isinstance(info, dict) else {}), "lock": lock}
+        except OSError:
+            os.close(fd)
+            return None
+        try:      # released and unlinked between our open and our lock: hold the file now at the path
+            ours = os.path.samestat(os.fstat(fd), os.stat(lock))
+        except OSError:
+            ours = False
+        if ours:
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps({"pid": os.getpid(), "host": socket.gethostname(),
+                                     "since": time.strftime("%Y-%m-%d %H:%M"), "doing": doing}).encode())
+            _held[lock] = fd
+            return None
+        os.close(fd)
     return None
+
+
+def need_hold(path, doing):
+    """Hold `path`, or exit 2 before any model call naming the run that holds it."""
+    info = hold(path, doing)
+    if info is None:
+        return
+    who = " ".join(str(x) for x in (f"pid {info.get('pid')}" if info.get("pid") else "",
+                                    f"on {info.get('host')}" if info.get("host") else "",
+                                    f"since {info.get('since')}" if info.get("since") else "") if x)
+    print(f"ERROR: another Lacuna run{f' ({who})' if who else ''} is {info.get('doing') or 'writing'} {path} "
+          f"right now. Wait for it to finish, or write somewhere else. Nothing was sent to a model. A run "
+          f"holds a path only while it runs, however it ends; if that run is gone and this persists, "
+          f"delete {info['lock']}.", file=sys.stderr)
+    sys.exit(EX_INPUT)
+
+
+def release_all():
+    """End every hold this process has. Unlinked before it is unlocked; hold() checks it still has
+    the file at the path, so a run that opened it meanwhile does not hold a file nobody can see."""
+    for lock, fd in list(_held.items()):
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+        os.close(fd)
+        del _held[lock]
 
 
 def record(path, source=None, stage="read"):
@@ -920,8 +1005,11 @@ def cmd_synth(a):
         sys.exit(EX_INPUT)
     a.repo = os.path.abspath(a.repo)
     a.out = os.path.abspath(a.out)
-    need_short_names([a.out, f"{a.out}.filelist.txt", f"{a.out}.partial", f"{a.out}.rejected-99",
-                      f"{a.out}.new-99.md"], "Choose a shorter --out.")
+    need_short_names([a.out, f"{a.out}.filelist.txt", f"{a.out}.partial"], "Choose a shorter --out.")
+    out_dir = os.path.dirname(a.out)
+    os.makedirs(out_dir, exist_ok=True)
+    need_writable(out_dir, "the directory of --out")
+    need_hold(a.out, "writing a plan or digest to")     # its .partial and .filelist.txt with it
     # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
     # plan was once replaced without a word: the ownership rule covered read's notes only.
     why = not_ours(a.out, stage="synth")
@@ -966,9 +1054,6 @@ def cmd_synth(a):
                 "sent to a model.",
               file=sys.stderr)
         sys.exit(EX_INPUT)
-    out_dir = os.path.dirname(os.path.abspath(a.out)) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    need_writable(out_dir, "the directory of --out")
     try:
         tree = subprocess.run(["git", "-C", a.repo, "ls-files"], capture_output=True, text=True).stdout
     except OSError:                            # no git on this machine
@@ -1043,7 +1128,7 @@ def cmd_synth(a):
             # given, or someone edited it meanwhile. Either way it is not an earlier run's plan,
             # and the next command must not read it as one; moved aside, never deleted, and never
             # over what an earlier run moved aside.
-            rejected = free_name(f"{a.out}.rejected")
+            rejected = free_name(a.out, ".rejected")
             os.replace(a.out, rejected)
             forget(a.out)
             kept = (f"{a.out} changed during this run (the model wrote it directly, or it was edited), so it "
@@ -1056,7 +1141,7 @@ def cmd_synth(a):
     if changed_since(a.out, before):
         # Edited while the model ran (or written by something else): checked before the call, it
         # was replaced on success all the same, and the edit was lost (B11). Keep both.
-        new = free_name(f"{a.out}.new", ".md")
+        new = free_name(a.out, ".new", ".md")
         os.replace(part, new)
         record(new, stage="synth")
         print(f"ERROR: {a.out} changed while this run was in progress, so it was left as it is. This run's "
@@ -1080,7 +1165,8 @@ def cmd_verify(a):
     if a.notes:
         a.notes = os.path.abspath(a.notes)
     out = f"{a.target}.unverified.md"
-    need_short_names([out, f"{out}.new-99.md"], "Rename --target, or copy it under a shorter name.")
+    need_short_names([out], "Rename --target, or copy it under a shorter name.")
+    need_hold(out, "writing a verify report to")
     why = not_ours(out, stage="verify")       # a report annotated by hand is the user's
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "
@@ -1131,7 +1217,7 @@ def cmd_verify(a):
         failed(f"replied with {hit!r} rather than a report")
     # A report edited while the verifier ran is never replaced; this run's goes beside it (B11).
     clash = changed_since(out, before)
-    dst = free_name(f"{out}.new", ".md") if clash else out
+    dst = free_name(out, ".new", ".md") if clash else out
     try:
         if os.path.islink(dst):
             os.remove(dst)     # only with --overwrite; never write through a link
@@ -1188,7 +1274,10 @@ def main():
     v.add_argument("--overwrite", action="store_true",
                    help="replace the report even if Lacuna cannot show it wrote it (edited, or not recorded)")
     a = ap.parse_args()
-    {"read": cmd_read, "synth": cmd_synth, "verify": cmd_verify}[a.cmd](a)
+    try:
+        {"read": cmd_read, "synth": cmd_synth, "verify": cmd_verify}[a.cmd](a)
+    finally:
+        release_all()
 
 
 if __name__ == "__main__":

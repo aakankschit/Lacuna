@@ -80,8 +80,11 @@ Other invariants:
   another machine. Anything else exits 2 before any model call, naming each file and the way
   forward (`--overwrite`). The record is locked across processes, re-written for every file an
   `after.*` hook changed, and compared by file identity (`samefile`), not by path, because macOS
-  folds case and Unicode form. A plan or report that changes while the model runs is never
-  replaced: the result goes beside it and the run exits 2. A file name too long for its directory
+  folds case and Unicode form. A run holds each path it will write from that check to its last
+  write (`hold`: an flock the kernel ends with the process, so a hold never goes stale), and a
+  reader writes a draft of its own, which is what gets cached; the note path is never judged. A
+  note, plan or report that changes while the model runs is never replaced: the run exits 2 with
+  the result beside it (or, for a note, in the cache). A file name too long for its directory
   stops the run before the model call; cache names are cut to fit.
 
 ### `scripts/lit/prep_md.py`
