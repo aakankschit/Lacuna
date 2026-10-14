@@ -348,22 +348,59 @@ REFUSAL_MARKERS = (
 )
 
 
-def refusal(head):
-    """The apology a model's output opens with, or None.
+# A model writes "I could not read any…", not "could not read any…", and a curly apostrophe is
+# what most of them actually emit. Normalise both away before matching, or the phrase list only
+# catches the one phrasing someone happened to paste into it.
+_LEAD = re.compile(r"^(?:unfortunately|sorry|apologies|note)\b[,:\s]*|^(?:i|we)\s+(?:am\s+|'m\s+)?")
 
-    Only the opening counts: the text before the first section heading or list item, which is where
-    a model that could not do the job says so. Inside a section the same words are findings: a
-    correct note was discarded, and paid for again on every retry, for "37 had not completed
-    follow-up". Bare words are not safe either: "blocked" once discarded a note about blocked sampling.
+
+def _norm(text):
+    return text.lower().replace("\u2019", "'").replace("\u2018", "'")
+
+
+def _opens_with_apology(low):
+    for _ in range(3):                       # "Unfortunately, I could not…"
+        stripped = _LEAD.sub("", low, count=1)
+        hit = next((m for m in REFUSAL_MARKERS if low.startswith(m) or stripped.startswith(m)), None)
+        if hit:
+            return hit
+        if stripped == low:
+            return None
+        low = stripped
+    return None
+
+
+def refusal(head):
+    """The apology in the opening of a document, or None.
+
+    Position, not presence. A model that could not do the job *opens a block* with the apology:
+    "Not completed. I could not read any of the notes." A correct document contains the same words
+    inside a sentence: "37 had not completed follow-up", "cannot complete in polynomial time".
+
+    So each block in the opening is tested at its START, after stripping markdown furniture. That
+    catches an apology under a heading or as a list item — the earlier version only looked before
+    the first heading, which let `## Status` + an apology be filed as a plan — without discarding a
+    finding that merely mentions the words.
     """
-    opening = head[:1200]
-    first = re.search(r"(?m)^(?:#{2,6}\s|\s*(?:[-*+]|\d+[.)])\s)", opening)
-    if first:
-        opening = opening[:first.start()]
-    hit = next((m for m in REFUSAL_MARKERS if m in opening.lower()), None)
-    if "BLOCKED" in head[:400]:      # a status marker in capitals, as a blocked agent writes it
-        hit = "BLOCKED"
-    return hit
+    for block in re.split(r"\n\s*\n", head[:1500])[:6]:
+        stripped = re.sub(r"^(?:[#>\s]*|\s*(?:[-*+]|\d+[.)])\s*)+", "", block).strip()
+        if not stripped:
+            continue
+        low = _norm(stripped)
+        hit = _opens_with_apology(low)
+        if hit:
+            return hit
+        # The apology may follow one short lead-in sentence in the same block.
+        first_sentence = re.split(r"(?<=[.!?])\s", low, 1)[0]
+        if len(first_sentence) < 90:
+            hit = _opens_with_apology(low[len(first_sentence):].lstrip())
+            if hit:
+                return hit
+    # A status marker in capitals, as a blocked agent writes it — but only standing alone, not
+    # inside prose such as "- JobState.BLOCKED -> not found".
+    if re.search(r"(?m)^[#>\s*-]*\**BLOCKED\b", head[:600]):
+        return "BLOCKED"
+    return None
 
 
 def lacuna_wrote(path, stem):

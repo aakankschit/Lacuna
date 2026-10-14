@@ -387,3 +387,87 @@ class TestShippedState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRefusalPosition(unittest.TestCase):
+    """An apology is recognised by POSITION, not presence.
+
+    Two defects, one in each direction, were shipped here. First a phrase list discarded correct
+    notes ("37 had not completed follow-up"). The fix — look only before the first heading — then
+    let an apology under `## Status` be filed as a plan, with the hook fired and exit 0.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
+        import lit_pipeline
+        self.refusal = lit_pipeline.refusal
+
+    def test_an_apology_is_caught_wherever_a_block_opens_with_it(self):
+        for text, label in [
+            ("# Development plan\n\n## Status\n\nNot completed. I could not read any of the notes.",
+             "under a heading"),
+            ("# Plan\n\n- Not completed: I could not read any of the notes.", "as a list item"),
+            ("# Plan\n\n1. I cannot help with that request.", "as a numbered item"),
+            ("I could not read any of the supplied files.\n\npadding", "bare opening"),
+            ("BLOCKED - not completed.\n\nmore text", "a bare status marker"),
+            ("# Digest\n\n> I am unable to summarise documents I could not open.", "in a blockquote"),
+        ]:
+            with self.subTest(label):
+                self.assertTrue(self.refusal(text), f"{label} must be recognised as an apology")
+
+    def test_the_same_words_inside_a_sentence_are_findings(self):
+        for text, label in [
+            ("# Note\n\n## Claim\n\nOf 412 patients, 37 had not completed follow-up (Table 2).",
+             "clinical finding"),
+            ("# Note\n\n## Claim\n\nThe solver cannot complete in polynomial time.", "complexity"),
+            ("# Verify\n\n- JobState.BLOCKED -> not found in the repo", "BLOCKED in a finding"),
+            ("# Plan\n\n## 1. A real proposal\n\nSubstantive content naming src/widget.py.", "a plan"),
+        ]:
+            with self.subTest(label):
+                self.assertIsNone(self.refusal(text), f"{label} must not be discarded")
+
+
+class TestFixesThatSurvivedTheirOwnRevert(unittest.TestCase):
+    """Four fixes were shipped with no test: reverting any of them left the suite green.
+
+    Their tests existed, in docs/reviews/, outside tests/ — so nothing ever ran them. A test that
+    is not discovered is not a test.
+    """
+
+    def test_lacuna_data_is_expanded(self):
+        """A "~" in LACUNA_DATA made a literal ./~/ beside the cwd while config was read elsewhere."""
+        import subprocess
+        out = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "lacuna_config.py"), "--json"],
+                             capture_output=True, text=True,
+                             env={**os.environ, "LACUNA_DATA": "~/lacuna-expand-check"}).stdout
+        data = json.loads(out)["data_dir"]
+        self.assertNotIn("~", data, "LACUNA_DATA must be expanded, not taken literally")
+        self.assertTrue(data.startswith(os.path.expanduser("~")), data)
+
+    def test_cache_guard_skips_synthetic_api_error_lines(self):
+        """Claude Code records an API failure as a zero-usage <synthetic> line. Read as the newest
+        call it reports 0 tokens of context, so the guard stayed silent exactly when the next
+        prompt would re-cache everything."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            t = os.path.join(d, "t.jsonl")
+            real = {"type": "assistant", "timestamp": "2026-10-13T00:00:00Z",
+                    "message": {"id": "m1", "model": "claude-opus-5",
+                                "usage": {"input_tokens": 10, "output_tokens": 50,
+                                          "cache_read_input_tokens": 500_000,
+                                          "cache_creation_input_tokens": 0}}}
+            synth = {"type": "assistant", "timestamp": "2026-10-13T00:05:00Z",
+                     "message": {"id": "<synthetic>", "model": "<synthetic>",
+                                 "usage": {"input_tokens": 0, "output_tokens": 0,
+                                           "cache_read_input_tokens": 0,
+                                           "cache_creation_input_tokens": 0}}}
+            with open(t, "w") as f:
+                f.write(json.dumps(real) + "\n" + json.dumps(synth) + "\n")
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "hooks", "cache_guard.py")],
+                               input=json.dumps({"hook_event_name": "SessionStart", "source": "resume",
+                                                 "session_id": "s", "transcript_path": t}),
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("500k", r.stdout.replace("\\u00a0", " "),
+                          "the guard must see the real call's context, not the synthetic zero")

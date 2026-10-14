@@ -3,6 +3,23 @@
 Dates are the measurement or release date. Price-table changes get their own entry, because a stale
 price table makes every cost figure wrong without looking wrong.
 
+## 0.2.0 — 2026-10-14
+
+Seven independent reviews. The sixth returned NOT READY with nine defect classes; the seventh
+returned READY WITH CAVEATS after checking that each was fixed, and found that nine of twelve were
+fixed only where they were reported rather than as a class.
+
+- `refusal()` now recognises an apology by **position** — a block that opens with one — rather than
+  by the presence of a phrase. The previous version looked only before the first heading, which let
+  an apology under `## Status` be filed as a plan with exit 0 and the `after.*` hook fired. It also
+  now handles a leading pronoun and a curly apostrophe, which most models actually emit.
+- Tests for four fixes that had none: reverting the `<synthetic>` skip, the `LACUNA_DATA`
+  expansion, `casefold` in the collision guard or `islink` in `lacuna_wrote` all left the suite
+  green. Their tests existed but sat in `docs/reviews/`, outside `tests/`, where nothing ran them.
+- `docs/LIMITS.md` now states that `/spend` is a **lower bound**, with the `usage.iterations`
+  evidence and an explicit statement that the true figure is not determinable from transcripts.
+- Version bumped, so `claude plugin update` actually delivers fixes. It had stayed at 0.1.0.
+
 ## Unreleased
 
 **Review of the seven unreviewed commits** (2026-10-13), against the real papers and with two

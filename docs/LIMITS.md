@@ -41,7 +41,19 @@ discounts or enterprise agreements, and the transcript format is internal rather
 contract. The price table is dated (`scripts/pricing.json`) and will rot; override it in your data
 directory when it does.
 
-`/spend` estimates. It does not reconcile with an invoice.
+`/spend` estimates. It does not reconcile with an invoice, and it is a **lower bound**:
+
+- It reads the top-level `usage` of each API call. Where a call records several `usage.iterations`
+  — a retry, a model fallback, a refused attempt — only the last is counted. On this machine that
+  affects 116 of 5,959 calls, all in interactive sessions; on four of them the gap between the
+  top-level figure and the sum over iterations is large (one session: $62.65 against $285.28).
+- Whether the earlier iterations were billed is **not determinable from the transcripts**.
+  Anthropic bills a refusal before any output only for certain categories (`bio`,
+  `frontier_llm`, `reasoning_extraction`); a mid-stream refusal bills what was streamed. The
+  category of an earlier iteration is not recorded, so the true figure lies between the two
+  numbers above and nobody can compute which.
+- If your work triggers refusals — chemistry and biology source material does — assume the real
+  cost is higher than reported, possibly much higher.
 
 ## The cache guard is a heuristic
 
