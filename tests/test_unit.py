@@ -878,7 +878,7 @@ class TestOwnershipRecord(unittest.TestCase):
                 os.chmod(d, 0o755)
                 self.assertIn("could not record", err.getvalue())
             L.record(note)
-            before = L.as_recorded(d)
+            before = {L.name_key(note): L._sha(note)}
             os.remove(note)
             err = io.StringIO()
             with contextlib.redirect_stderr(err):

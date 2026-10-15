@@ -125,8 +125,9 @@ def usd(res):
     return res.get("total_cost_usd") or 0
 
 
-def after(stage, out_path):
+def after(stage, out_path, written):
     """Run the user's post-stage command, if configured, with the output path as its final argument.
+    `written` is what this run wrote: the files whose changes by the hook are still Lacuna's.
 
     This is the extension seam: a project-specific layer can file the output wherever it keeps
     records without this plugin knowing anything about it.
@@ -137,9 +138,12 @@ def after(stage, out_path):
     cmd = (lacuna_config.CONFIG.get("after") or {}).get(stage)
     if not cmd:
         return
-    # What the hook leaves in the output's directory is still Lacuna's: see rerecord().
+    # What the hook does to this run's outputs is still Lacuna's: see rerecord().
     d = out_path if os.path.isdir(out_path) else os.path.dirname(out_path) or "."
-    before = as_recorded(d)
+    try:
+        before = {name_key(p): _sha(p) for p in written if os.path.isfile(p) and not os.path.islink(p)}
+    except OSError:
+        before = {}
     _run_hook(stage, cmd, out_path)
     rerecord(d, before)
 
@@ -411,6 +415,8 @@ def cmd_read(a):
               "these files anyway, run the same command with --overwrite.", file=sys.stderr)
         sys.exit(EX_INPUT)
 
+    written = []
+
     def place(src, out, text):
         """Put `text` at the note path, unless the note changed while this run was in progress
         (someone edited it, or something else wrote it): then it is left as it is (B11)."""
@@ -418,6 +424,7 @@ def cmd_read(a):
             return False
         _atomic_copy(text, out)           # renamed into place: never half-written, never through a link
         record(out, src)
+        written.append(out)
         return True
 
     def one(src, md, out, cached, draft):
@@ -503,7 +510,7 @@ def cmd_read(a):
         print(f"ERROR: {kept} note(s) changed while this run was in progress and were left as they are; "
               f"see above.", file=sys.stderr)
         sys.exit(EX_INPUT)
-    after("read", out_dir)
+    after("read", out_dir, written)
 
 
 # ---- did the model say it could not do the job?
@@ -1033,28 +1040,14 @@ def forget(path):
         pass
 
 
-def as_recorded(d):
-    """{key: sha256} for each file recorded in `d` that is still exactly as Lacuna recorded it."""
-    out = {}
-    try:
-        for k, e in _owners(d)[0].items():
-            p = os.path.join(d, str(e.get("name")))
-            if e.get("sha256") and os.path.basename(p) == e.get("name") and not os.path.islink(p) \
-                    and os.path.isfile(p) and _sha(p) == e["sha256"]:
-                out[k] = e["sha256"]
-    except OSError:
-        pass
-    return out
-
-
 def rerecord(d, before):
-    """After an after.* hook: the hook is part of the user's pipeline, so what it leaves is still
-    Lacuna's output. A hook that prepended frontmatter, as docs/extending.md suggests, otherwise made
-    every later run refuse the note as edited. Every file the hook changed is re-recorded, not only
-    this run's: such a hook edits each note in the directory, and an earlier run's notes were then
-    refused as edited (B10). Only files that were still as recorded before it ran: an edit of the
-    user's does not become Lacuna's because a hook touched the file too. A hook that moved a file
-    away takes it out of the record."""
+    """After an after.* hook: the hook is part of the user's pipeline, so what it does to this run's
+    outputs (`before`, {key: sha256} as they were when it started) is still Lacuna's. A hook that
+    prepended frontmatter, as docs/extending.md suggests, otherwise made every later run refuse the
+    note as edited. Only this run's outputs, and only those still as recorded: any other file that
+    changed while the hook ran — an earlier run's note, edited by the user meanwhile — became
+    Lacuna's, and the next read replaced the user's edit (F1). A hook that changes other files makes
+    them the user's, so the next run asks. A hook that moved a file away takes it out of the record."""
     if not before:
         return
     try:
@@ -1063,7 +1056,7 @@ def rerecord(d, before):
             for k, sha in before.items():
                 e = files.get(k)
                 if not e or e.get("sha256") != sha:
-                    continue                  # re-recorded by another run meanwhile: theirs to keep
+                    continue                  # edited since it was written, or re-recorded by another run
                 p = os.path.join(d, e["name"])
                 if os.path.islink(p) or not os.path.isfile(p):
                     del files[k]
@@ -1344,7 +1337,7 @@ def cmd_synth(a):
         os.remove(a.out)     # only with --overwrite; replacing the link, not writing through it
     os.replace(part, a.out)
     record(a.out, stage="synth")
-    after("synth", a.out)
+    after("synth", a.out, [a.out])
 
 
 def cmd_verify(a):
@@ -1442,7 +1435,7 @@ def cmd_verify(a):
                  else "report is printed above."), file=sys.stderr)
         sys.exit(EX_INPUT)
     if where != "(not saved; printed below)":
-        after("verify", out)
+        after("verify", out, [out])
 
 
 def main():

@@ -459,11 +459,12 @@ class TestOwnership(Pipeline):
                          "verify": lambda: self.verify(*args)}[stage]()
                     self.assertEqual(r.returncode, 0, f"its own {stage} output is Lacuna's to replace: {r.stderr}")
 
-    def test_what_an_after_hook_leaves_is_still_lacunas(self):
-        """A hook that prepends frontmatter to every note in the directory, as extending.md
-        suggests, edits earlier runs' notes as well as this run's; only this run's were re-recorded,
-        so the next read of an earlier document was refused as edited. after.synth and after.verify
-        are given one file, and may change its neighbours just the same."""
+    def test_what_an_after_hook_does_to_this_runs_output_is_still_lacunas(self):
+        """A hook that prepends frontmatter, as extending.md suggests, made every later run refuse the
+        note as edited, so what it does to this run's output is re-recorded (B10). Only to this run's
+        output: every file that changed while the hook ran was once re-recorded, and a user's edit to
+        another note during a slow hook became Lacuna's, to be replaced by the next read (F1). A hook
+        that changes other files makes them the user's; the next run asks."""
         hook = write(self.p("every.py"), "import os, sys\n"
                      "d = sys.argv[-1] if os.path.isdir(sys.argv[-1]) else os.path.dirname(sys.argv[-1])\n"
                      "for f in sorted(os.listdir(d)):\n"
@@ -474,18 +475,16 @@ class TestOwnership(Pipeline):
         self.config({"after": {stage: [sys.executable, hook] for stage in ("read", "synth", "verify")}})
         beta = os.path.join(self.docs, "beta.md")
         self.assertEqual(self.read().returncode, 0)
+        self.assertEqual(self.read().returncode, 0, "a note its own run's hook changed was refused as edited")
         self.assertEqual(self.lacuna("lit", "read", beta, "--out", self.notes).returncode, 0)
+        calls = len(self.calls())
         r = self.read()
-        self.assertEqual(r.returncode, 0, f"an earlier note the hook edited again was refused:\n{r.stderr}")
-        self.assertEqual(self.note("beta.md").count("tags: [lit]"), 2, "each run's hook edited every note")
-
-        # Only what was still Lacuna's before the hook ran: the hook touching a file the user edited
-        # does not make the user's edit Lacuna's.
-        write(os.path.join(self.notes, "beta.md"), self.note("beta.md") + "\nMy own annotation.\n")
-        self.assertEqual(self.read().returncode, 0)
-        r = self.lacuna("lit", "read", beta, "--out", self.notes)
-        self.assertEqual(r.returncode, 2, "a user's edit became Lacuna's because a hook touched the file")
+        self.assertEqual((r.returncode, len(self.calls())), (2, calls), "beta's hook changed alpha, and it was adopted")
         self.assertIn("has been edited since", r.stderr)
+        self.assertEqual(self.read("--overwrite").returncode, 0)
+        self.assertEqual(self.note("beta.md").count("tags: [lit]"), 2, "each run's hook edited every note")
+        r = self.lacuna("lit", "read", beta, "--out", self.notes)
+        self.assertEqual(r.returncode, 2, "a change alpha's hook made to beta became Lacuna's")
 
         # A note restored from a backup is exactly that document's cached note: adopted, not refused.
         cache = os.path.join(self.data, "cache", "notes")
@@ -498,11 +497,11 @@ class TestOwnership(Pipeline):
         lit = self.p("lit")
         plan = os.path.join(lit, "plan.md")
         self.assertEqual(self.synth(plan).returncode, 0)
+        self.assertEqual(self.synth(plan, "--objective", "again").returncode, 0, "after.synth's change was refused")
         self.assertEqual(self.verify(plan).returncode, 0)
-        self.assertEqual(self.synth(plan, "--objective", "again").returncode, 0)     # its hook edits the report
-        r = self.verify(plan)
-        self.assertEqual(r.returncode, 0, f"a report after.synth edited was refused as edited:\n{r.stderr}")
-        self.assertEqual(self.synth(plan, "--objective", "and again").returncode, 0)
+        self.assertEqual(self.verify(plan).returncode, 0, "after.verify's change to its report was refused")
+        r = self.synth(plan, "--objective", "and again")
+        self.assertEqual(r.returncode, 2, "after.verify's change to the plan, not its output, was adopted")
 
     def test_a_plan_or_report_changed_during_the_run_is_never_replaced(self):
         """--out was checked before the model call and replaced after it, so an edit made while the
@@ -929,7 +928,7 @@ class TestAfterHooks(Pipeline):
 
     def after(self, cmd, **env):
         self.config({"after": {"synth": cmd}})
-        return self.lacuna("lit", prelude=f"L.after('synth', {self.p('plan.md')!r}); sys.exit(0)", **env)
+        return self.lacuna("lit", prelude=f"L.after('synth', {self.p('plan.md')!r}, [{self.p('plan.md')!r}]); sys.exit(0)", **env)
 
     def test_shell_semantics(self):
         out = self.p("plan.md")

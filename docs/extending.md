@@ -170,9 +170,10 @@ name (`main.pdf` from two papers' folders), the note for a document that has cha
 download saved over the old one and a revised copy of the same paper look alike, so both ask), or a
 file another stage wrote (a paper named `plan.md` read into the folder that holds your plan). Move
 the file or choose another `--out` to keep it; re-run with `--overwrite` to replace it. What an
-`after.*` hook leaves in the directory (frontmatter it prepends to every note there, say) still
-counts as Lacuna's output; only edits made after the run make a file yours. A note you restore to
-exactly that document's cached note is Lacuna's again.
+`after.*` hook does to the files its run wrote (frontmatter it prepends, say) still counts as
+Lacuna's output. A change it makes to any other file (an earlier run's note) makes that file yours,
+so the next run that would replace it asks: write such a hook to skip a file it has already
+changed. A note you restore to exactly that document's cached note is Lacuna's again.
 
 A note, plan or report that changes while its run is in progress is never replaced or deleted.
 When the run succeeds, the file is left as it is and the run exits 2 naming it: a plan or report is

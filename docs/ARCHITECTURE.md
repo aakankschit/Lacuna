@@ -91,8 +91,8 @@ Other invariants:
   evidence is `.lacuna.json` beside the files (`record`, `not_ours`), never the cache: the cache
   knows that Lacuna wrote some note, not for which document, and is deleted or left behind on
   another machine. Anything else exits 2 before any model call, naming each file and the way
-  forward (`--overwrite`). The record is locked across processes, re-written for every file an
-  `after.*` hook changed, and compared by file identity (`samefile`), not by path, because macOS
+  forward (`--overwrite`). The record is locked across processes, re-written for each file of the
+  run's own that an `after.*` hook changed (no other), and compared by file identity (`samefile`), not by path, because macOS
   folds case and Unicode form. A run holds each path it will write from that check to its last
   write (`hold`: an flock the kernel ends with the process, so a hold never goes stale), and a
   reader writes a draft of its own, which is what gets cached; the note path is never judged. A

@@ -314,12 +314,12 @@ MUTANTS = [
      '    why = not_ours(out, stage="verify") if os.path.exists(os.path.join(os.path.dirname(out), OWNERS)) else None'),
     ("clobbered-out-kept", PIPE, "        if changed_since(a.out, before):\n            # --out changed during the run: the model",
      "        if False:\n            # --out changed during the run: the model"),
-    ("hook-edit-not-rerecorded", PIPE, "    before = as_recorded(d)\n", "    before = {}\n"),
-    # B10: a hook that edits every file in the directory changes earlier runs' files too
-    ("hook-rerecords-only-its-output", PIPE, "    before = as_recorded(d)\n",
-     "    before = {k: v for k, v in as_recorded(d).items() if os.path.isdir(out_path) or k == name_key(out_path)}\n"),
-    ("hook-adopts-user-edits", PIPE, '                    and os.path.isfile(p) and _sha(p) == e["sha256"]:',
-     "                    and os.path.isfile(p):"),
+    # B10: a hook that prepends frontmatter made the next run refuse its own run's output as edited
+    ("hook-edit-not-rerecorded", PIPE, "        before = {name_key(p): _sha(p) for p in written if",
+     "        before = {name_key(p): _sha(p) for p in [] if"),
+    # F1: every file that changed while the hook ran was re-recorded, a user's edit to another note too
+    ("hook-adopts-other-files", PIPE, "for p in written if os.path.isfile(p)",
+     "for p in [os.path.join(d, f) for f in os.listdir(d)] if os.path.isfile(p)"),
     ("clobbered-out-deleted", PIPE, "            os.replace(a.out, rejected)", "            os.remove(a.out)"),
     # B11: --out or the report changed while the model ran; the edit was replaced on success
     ("changed-out-replaced-on-success", PIPE, "    if changed_since(a.out, before):\n        # Edited while the model ran",
