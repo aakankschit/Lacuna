@@ -91,17 +91,25 @@ def main():
     errors = list(dict.fromkeys(lacuna_config.CONFIG_ERRORS))
     # A file lacuna could not use is a problem, not an [ok]: doctor once printed [ok] beside a
     # config.json, pricing.json and calibration.json that were all being ignored.
-    user_cal = os.path.join(lacuna_config.DATA, "calibration.json")
+    user_cal, stale_cal = os.path.join(lacuna_config.DATA, "calibration.json"), False
     if os.path.isfile(user_cal):
         try:
             with open(user_cal) as f:
-                if not isinstance(json.load(f), dict):
-                    raise ValueError("the top level is not an object")
+                cal = json.load(f)
+            if not isinstance(cal, dict):
+                raise ValueError("the top level is not an object")
+            stale_cal = cal.get("_source") == "upstream"     # lit_cost ignores such a copy
         except (OSError, ValueError) as e:
             errors.append(f"{user_cal}: unusable ({e}). `lit estimate` falls back to the shipped calibration.")
     broken = lambda name: any(name in e for e in errors)
+    # A whole file lacuna ignores is a problem; one setting that fell back to its default is a note
+    # ("lacuna config" shows the value in effect). A mistyped model name once blocked everything.
+    whole_file = ("not valid JSON", "cannot read", "Ignoring the file", "Using the shipped prices", "unusable")
     for e in errors:
-        say(BAD, "unusable settings file", e)
+        if any(w in e for w in whole_file):
+            say(BAD, "unusable settings file", e)
+        else:
+            say(WARN, "a setting was not used as written", e)
     if not broken("pricing.json"):
         say(OK, f"price table retrieved {meta['retrieved']}" + (" (overridden locally)" if meta["overridden"] else ""),
             "list prices, not your bill — see docs/LIMITS.md")
@@ -132,7 +140,10 @@ def main():
     # The shipped calibration is read from the plugin directory and is NOT copied here: a copy in
     # the data directory beats every later shipped calibration forever, and `lit estimate` would
     # keep quoting the old runs. Only a calibration you made yourself belongs in this directory.
-    if os.path.isfile(user_cal) and not broken(user_cal):
+    if stale_cal:
+        say(WARN, f"{user_cal}", "a stale copy of the shipped calibration (an older doctor wrote it); "
+                                 "`lit estimate` ignores it and uses the plugin's. You can delete it.")
+    elif os.path.isfile(user_cal) and not broken(user_cal):
         say(OK, f"{user_cal}", "yours; left untouched")
 
     print("\nPDF parsers (only needed to read PDFs; markdown and text input work without them)")
