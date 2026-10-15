@@ -191,12 +191,6 @@ class TestNoteCache(Pipeline):
                                                      os.path.basename(fits), os.path.basename(cut)]))
             for name in ls(self.notes):
                 self.assertIn(f"# A note ({name})", self.note(name), f"{attempt}: {name} holds another paper's note")
-        # What a failed run sets aside is named after the note, and cut to fit when it must be.
-        long_note = os.path.join(self.notes, os.path.basename(cut))
-        r = self.lacuna("lit", "read", cut, "--out", self.notes, "--brief", "BRIEF:again", mode="refuse",
-                        FAKE_EDIT=long_note)
-        self.assertEqual(r.returncode, 4, r.stderr[-300:])
-        self.assertEqual(len([f for f in ls(self.notes) if ".rejected" in f]), 1)
 
     def test_books_are_offered_and_keyed_by_what_exists(self):
         """Found end to end: after deleting a book, the old note came back as "cached (free)"
@@ -327,10 +321,12 @@ class TestOwnership(Pipeline):
         self.assertIn("cached (free)", r.stdout, "the note this run paid for was not kept")
         self.assertIn("BRIEF:two", self.note())
         self.assertNotIn("EDITED", self.note(), "the cache took what was at the note path, not what the agent wrote")
+        edited = self.note() + "EDITED WHILE THE MODEL RAN\n"
         r = self.read("--brief", "BRIEF:three", mode="refuse", FAKE_EDIT=note)
         self.assertEqual(r.returncode, 4)
-        self.assertIn("EDITED", read(note + ".rejected"), "a note that changed during a failed run is moved aside")
-        self.assertFalse(os.path.exists(note), "and not left for the next synth to read")
+        self.assertEqual(self.note(), edited, "a failed run moved or deleted a note it did not write (E11)")
+        self.assertEqual(ls(self.notes), ["alpha.md"])
+        self.assertIn("changed during the run and was left as it is", r.stdout)
 
     def test_each_note_is_recorded_when_it_is_written(self):
         """A run where one document is refused exits 4 and never reaches the after.read hook. The
@@ -388,11 +384,11 @@ class TestOwnership(Pipeline):
         self.assertEqual(read(mine), "mine\n", "the file list was written through a symlink")
         r = self.synth(self.p("vault", "other.md"), mode="clobber")
         self.assertEqual(r.returncode, 4)
-        self.assertFalse(os.path.exists(self.p("vault", "other.md")), "the model's failed output was left for the next command")
-        self.assertTrue(os.path.exists(self.p("vault", "other.md.rejected")),
-                        "moved aside, never deleted: --out may have changed because the user edited it")
-        self.assertIn("wrote", r.stderr)
+        self.assertIn("changed during this run", r.stderr, "say that --out is not a checked plan")
         self.assertNotIn("earlier run's output", r.stderr, "the file held this run's output, not an earlier one")
+        self.assertTrue(os.path.exists(self.p("vault", "other.md")),
+                        "never moved or deleted: --out may have changed because the user edited it")
+        self.assertEqual(self.synth(self.p("vault", "other.md")).returncode, 2, "and the next run asks before using it")
 
     def test_a_file_is_replaced_only_by_the_stage_and_document_that_wrote_it(self):
         """Same path is not same document: a new download saved as fulltext.md over the last one is
@@ -528,11 +524,10 @@ class TestOwnership(Pipeline):
         fresh = self.p("vault", "fresh.md")
         self.assertEqual(self.synth(fresh, FAKE_EDIT=fresh).returncode, 2, "--out created during the run")
         self.assertEqual(read(fresh), "EDITED WHILE THE MODEL RAN\n")
-        write(plan + ".rejected", "set aside by an earlier run\n")
+        edited = read(plan) + "EDITED WHILE THE MODEL RAN\n"
         r = self.synth(plan, "--overwrite", mode="refuse", FAKE_EDIT=plan)
         self.assertEqual(r.returncode, 4)
-        self.assertIn("EDITED WHILE", read(plan + ".rejected-2"), "a failed run must move a changed --out aside")
-        self.assertEqual(read(plan + ".rejected"), "set aside by an earlier run\n", "and never over an earlier one")
+        self.assertEqual(read(plan), edited, "a failed run moved or deleted a plan it did not write")
 
         target = write(self.p("vault", "t.md"), "# T\n" + "content " * 200)
         report = target + ".unverified.md"
@@ -548,6 +543,13 @@ class TestOwnership(Pipeline):
         r = self.verify(target, "--overwrite", mode="refuse", FAKE_EDIT=report)
         self.assertEqual(r.returncode, 4)
         self.assertTrue(os.path.exists(report), "a report edited during a failed run was deleted")
+        # What a run sets aside is named after the file, and cut to fit when it must be.
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        long_t = write(self.p("vault", "t" * (nm - len(".md.unverified.md")) + ".md"), read(target))
+        self.assertEqual(self.verify(long_t).returncode, 0)
+        r = self.verify(long_t, FAKE_EDIT=long_t + ".unverified.md")
+        self.assertEqual(r.returncode, 2, r.stderr[-300:])
+        self.assertEqual(len([f for f in ls(self.p("vault")) if f.startswith("ttt") and ".new" in f]), 1)
 
     def test_deleting_or_damaging_the_record_makes_every_stage_ask(self):
         """extending.md says deleting .lacuna.json is safe: Lacuna then asks before replacing
@@ -844,12 +846,13 @@ class TestMoneyGuarantees(Pipeline):
                                  "--kind", "plan", "--objective", "interrupted"], env=self.env(FAKE_MODE="hang"),
                                 cwd=self.tmp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         deadline = time.time() + 20
-        while len(ls(out)) < 3 and time.time() < deadline:     # plan, file list, and the run's output
+        partial = lambda: [f for f in os.listdir(out) if f.endswith(".partial")]
+        while not partial() and time.time() < deadline:     # the run's own output file
             time.sleep(0.05)
         os.killpg(hung.pid, signal.SIGKILL)
         hung.wait()
-        self.assertEqual(len(ls(out)), 3, "the interrupted run never wrote its output")
-        r = self.synth(plan, mode="refuse")
+        self.assertEqual(len(partial()), 1, "the interrupted run never wrote its output")
+        r = self.synth(plan, mode="garbage")
         self.assertEqual(r.returncode, 4, "an interrupted run's output passed for this run's")
         self.assertEqual(read(plan), first)
         self.assertEqual(ls(out), ["plan.md"])
@@ -881,11 +884,14 @@ class TestMoneyGuarantees(Pipeline):
         r = self.verify(plan)
         self.assertEqual((r.returncode, len(self.calls())), (2, calls), "a hand-annotated report was replaced")
         self.assertIn("checked by hand", read(report))
-        self.assertEqual(self.verify(plan, "--overwrite").returncode, 0)
         write(plan, read(plan) + "\nA new proposal.\n")
-        self.assertEqual(self.verify(plan, mode="refuse").returncode, 4)
-        self.assertFalse(os.path.exists(report), "a report must not sit beside a version it never checked")
+        annotated = read(report)
+        r = self.verify(plan, "--overwrite", mode="refuse")
+        self.assertEqual(r.returncode, 4)
+        self.assertEqual(read(report), annotated, "a failed --overwrite deleted the user's annotated report (F4)")
+        self.assertIn("describes another version of it", r.stderr)
         victim = write(self.p("victim.md"), "keep me\n")
+        os.remove(report)
         os.symlink(victim, report)
         self.assertEqual(self.verify(plan, "--overwrite").returncode, 0)
         self.assertEqual(read(victim), "keep me\n", "--overwrite wrote the report through a symlink")

@@ -482,12 +482,9 @@ def cmd_read(a):
                f"it replied {said[1][:160]!r}" if said and said[0] == "fail" else
                "the file it wrote is not a note (see above)" if os.path.exists(draft) else "agent produced no note file")
         if changed_since(out, before[out]):
-            # The note changed during a failed run: the agent wrote it instead of its draft, or it was
-            # edited meanwhile. Moved aside, never deleted, and not left for the next synth to read.
-            rejected = free_name(out, ".rejected")
-            os.replace(out, rejected)
-            forget(out)
-            why += f"; {out} changed during the run, and was moved to {rejected}"
+            # The agent wrote the note path instead of its draft, or someone edited it meanwhile. This run
+            # did not write it, so it stays where it is: a user's edit was moved aside once (E11).
+            why += f"; {out} changed during the run and was left as it is: check it before using it"
         return os.path.basename(out), f"FAILED ${usd(res):.4f} — {why}", usd(res)
 
     t0, total, failed, kept = time.time(), 0.0, 0, 0
@@ -1029,17 +1026,6 @@ def record(path, source=None, stage="read"):
               file=sys.stderr)
 
 
-def forget(path):
-    d = os.path.dirname(path)
-    try:
-        with _locked(d):
-            files = _owners_to_update(d)
-            if files.pop(name_key(path), None) is not None:
-                _save_owners(d, files)
-    except OSError:
-        pass
-
-
 def rerecord(d, before):
     """After an after.* hook: the hook is part of the user's pipeline, so what it does to this run's
     outputs (`before`, {key: sha256} as they were when it started) is still Lacuna's. A hook that
@@ -1184,11 +1170,11 @@ def cmd_synth(a):
         sys.exit(EX_INPUT)
     a.repo = os.path.abspath(a.repo)
     a.out = os.path.abspath(a.out)
-    need_short_names([a.out, f"{a.out}.filelist.txt", f"{a.out}.partial"], "Choose a shorter --out.")
+    need_short_names([a.out, f"{a.out}.filelist.txt"], "Choose a shorter --out.")
     out_dir = os.path.dirname(a.out)
     os.makedirs(out_dir, exist_ok=True)
     need_writable(out_dir, "the directory of --out")
-    need_hold(a.out, "writing a plan or digest to")     # its .partial and .filelist.txt with it
+    need_hold(a.out, "writing a plan or digest to")     # its .filelist.txt with it
     # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
     # plan was once replaced without a word: the ownership rule covered read's notes only.
     why = not_ours(a.out, stage="synth")
@@ -1257,10 +1243,10 @@ def cmd_synth(a):
     open(tree_path, "w").write(tree)
     # The agent writes beside --out, never over it. Judged at --out, an earlier run's plan passed for
     # this run's when the model refused; and an apology written there was taken as input by the next
-    # command. --out is replaced only by output that passed the content check.
-    part = f"{a.out}.partial"
-    if os.path.exists(part):
-        os.remove(part)      # left by an interrupted run; never this run's output
+    # command. --out is replaced only by output that passed the content check. The name is this run's
+    # own: a shared <out>.partial was deleted by a concurrent run (J4), and written by a killed run's
+    # model after a retry had started (F2), so another run's output passed for this one's.
+    part = os.path.join(out_dir, f".lacuna-{os.getpid()}-{os.urandom(4).hex()}.partial")
     role = "digester" if a.kind == "digest" else "planner"
     model = a.model or lacuna_config.model(role)
 
@@ -1310,15 +1296,11 @@ def cmd_synth(a):
             if os.path.exists(f):
                 os.remove(f)
         if changed_since(a.out, before):
-            # --out changed during the run: the model wrote it rather than the .partial it was
-            # given, or someone edited it meanwhile. Either way it is not an earlier run's plan,
-            # and the next command must not read it as one; moved aside, never deleted, and never
-            # over what an earlier run moved aside.
-            rejected = free_name(a.out, ".rejected")
-            os.replace(a.out, rejected)
-            forget(a.out)
-            kept = (f"{a.out} changed during this run (the model wrote it directly, or it was edited), so it "
-                    f"is not a checked plan. It was moved to {rejected} for you to inspect.")
+            # --out changed during the run: the model wrote it rather than the file it was given, or
+            # someone edited it meanwhile. This run did not write it, so it stays where it is: a
+            # concurrent run's plan was moved aside by this path once (J4).
+            kept = (f"{a.out} changed during this run (the model may have written it, or it was edited), so it "
+                    f"is not a checked plan; it was left as it is.")
         else:
             kept = (f"{a.out} was left as it was, and holds an earlier run's output, not this one's."
                     if os.path.exists(a.out) else "Nothing was written.")
@@ -1394,17 +1376,12 @@ def cmd_verify(a):
     report = str(res.get("result") or "")
 
     def failed(why):
-        # An earlier report may stay only while the document is still the version it checked. One
-        # edited while the verifier ran is the user's now, and is never removed (B11).
+        # An earlier report is never removed, even one that describes another version of the document:
+        # this run did not write it, and it may be the user's annotated copy (F4).
         stale = os.path.exists(out) and checked not in open(out, errors="ignore").read(400)
-        removed = stale and not changed_since(out, before)
-        if removed:
-            os.remove(out)
         print(f"ERROR: the verifier ({vmodel}) {why}. Nothing was written, and "
               f"{os.path.basename(a.target)} has NOT been fact-checked."
-              + (" The earlier report described another version of it and was removed." if removed else
-                 f" {out} describes another version of it, and was left as it is because it changed during "
-                 f"this run." if stale else "")
+              + (f" {out} describes another version of it." if stale else "")
               + f"\n{report[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
 

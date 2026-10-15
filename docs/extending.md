@@ -178,9 +178,11 @@ changed. A note you restore to exactly that document's cached note is Lacuna's a
 A note, plan or report that changes while its run is in progress is never replaced or deleted.
 When the run succeeds, the file is left as it is and the run exits 2 naming it: a plan or report is
 written beside it as `<out>.new.md`; a note is in the cache, so the same command with `--overwrite`
-puts it there for free. When `read` or `synth` fails, the changed file is moved to `<out>.rejected`
-(the model may have written it); a failed `verify` leaves a changed report where it is. Neither name
-replaces an earlier one: the next is `-2`, then `-3`.
+puts it there for free. When the run fails, the changed file is left where it is (the model may
+have written it, so check it); it is no longer as Lacuna recorded it, so the next run asks before
+replacing it. A run never moves, renames or deletes a file it did not write itself: not an edited
+note, not a report that describes an older version of the document. A `.new.md` never replaces an
+earlier one: the next is `-2`, then `-3`.
 
 Two runs never write one file at once. A run holds each note, plan or report it will write from
 the check above to its last write; another run that needs the same file exits 2 before any model

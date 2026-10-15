@@ -320,13 +320,18 @@ MUTANTS = [
     # F1: every file that changed while the hook ran was re-recorded, a user's edit to another note too
     ("hook-adopts-other-files", PIPE, "for p in written if os.path.isfile(p)",
      "for p in [os.path.join(d, f) for f in os.listdir(d)] if os.path.isfile(p)"),
-    ("clobbered-out-deleted", PIPE, "            os.replace(a.out, rejected)", "            os.remove(a.out)"),
+    # F4, E11, J4: a failed run moved or deleted a file it did not write (a user's edit, a concurrent run's plan)
+    ("failed-synth-moves-out", PIPE, '            kept = (f"{a.out} changed during this run',
+     '            os.replace(a.out, a.out + ".rejected"); kept = (f"{a.out} changed during this run'),
+    ("synth-output-name-shared", PIPE,
+     '    part = os.path.join(out_dir, f".lacuna-{os.getpid()}-{os.urandom(4).hex()}.partial")', '    part = f"{a.out}.partial"'),
     # B11: --out or the report changed while the model ran; the edit was replaced on success
     ("changed-out-replaced-on-success", PIPE, "    if changed_since(a.out, before):\n        # Edited while the model ran",
      "    if False:\n        # Edited while the model ran"),
     ("changed-report-replaced-on-success", PIPE, "    clash = changed_since(out, before)", "    clash = False"),
-    ("changed-report-removed-on-failure", PIPE, "        removed = stale and not changed_since(out, before)",
-     "        removed = stale"),
+    ("failed-verify-removes-report", PIPE, '        stale = os.path.exists(out) and checked not in open(out, errors="ignore").read(400)\n',
+     '        stale = os.path.exists(out) and checked not in open(out, errors="ignore").read(400)\n'
+     '        if stale:\n            os.remove(out)\n'),
     ("set-aside-replaces-earlier", PIPE, "    while os.path.lexists(", "    while False and os.path.lexists("),
     ("set-aside-name-too-long", PIPE, 'fitted(name, "", d, spare=len(os.fsencode(tag + ext)) + 4) + tag', "name + tag"),
     # B28: a damaged record was silently rewritten with only this run's entries
@@ -364,8 +369,8 @@ MUTANTS = [
     ("cache-takes-the-note-path", PIPE, "                _atomic_copy(draft, cached)", "                _atomic_copy(out, cached)"),
     ("changed-note-replaced", PIPE, "        if changed_since(out, before[out]):\n            return False",
      "        if False:\n            return False"),
-    ("changed-note-kept-on-failure", PIPE, "        if changed_since(out, before[out]):\n            # The note changed during a failed run",
-     "        if False:\n            # The note changed during a failed run"),
+    ("failed-read-moves-note", PIPE, '            why += f"; {out} changed during the run and was left as it is',
+     '            os.replace(out, out + ".rejected"); why += f"; {out} changed during the run and was left as it is'),
     ("note-placed-not-recorded", PIPE, "never through a link\n        record(out, src)\n", "never through a link\n"),
     # ---- guards that survived their own revert at 0.3.1 (round-1 "unguarded" R/Y/V/O)
     ("cache-written-in-place", PIPE, "                _atomic_copy(draft, cached)", "                shutil.copy(draft, cached)"),

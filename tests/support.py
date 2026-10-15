@@ -27,7 +27,7 @@ for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
 # unreadable: it writes a plausible note or plan anyway and, only if the prompt told it the INCOMPLETE
 # rule, says in its reply that it could not read them — under a line of prose, as a real planner did.
 # Not told, it replies as usual, as a real reader did. "clobber" writes its plan over --out itself
-# instead of the .partial it was given.
+# instead of the file it was given.
 # "body" writes exactly FAKE_BODY to the note or plan path and replies FAKE_REPLY (default: the path).
 # In any mode, FAKE_EDIT names a file the fake appends a line to while it runs: a user editing it then.
 # FAKE_REFUSE_IF refuses any prompt that contains it, so one document of a run can fail.
@@ -67,8 +67,8 @@ def done(reply):
 note = re.search(r"(?m)^- (\S+) -> (\S+)$", prompt)
 plan = re.search(r"Write the result to (\S+)\.", prompt)
 target = (note and note.group(2)) or (plan and plan.group(1))
-if mode == "clobber" and plan:
-    target = target[:-len(".partial")]
+if mode == "clobber" and plan:       # --out itself: the file list is named after it
+    target = re.search(r"file list is (\S+)\.filelist\.txt", prompt).group(1)
 if mode == "body" and target:      # exactly FAKE_BODY, so a test controls a document's opening
     with open(target, "w") as f:
         f.write(os.environ["FAKE_BODY"])

@@ -97,8 +97,10 @@ Other invariants:
   write (`hold`: an flock the kernel ends with the process, so a hold never goes stale), and a
   reader writes a draft of its own, which is what gets cached; the note path is never judged. A
   note, plan or report that changes while the model runs is never replaced: the run exits 2 with
-  the result beside it (or, for a note, in the cache). A file name too long for its directory
-  stops the run before the model call; cache names are cut to fit.
+  the result beside it (or, for a note, in the cache). **A run never deletes, moves or renames a
+  file it did not write in that run**, failed or not: a changed file stays where it is, and synth's
+  model writes a file named for its run alone. A file name too long for its directory stops the
+  run before the model call; cache names are cut to fit.
 
 ### `scripts/lit/prep_md.py`
 PDF → reference-stripped markdown. Parses, **validates**, falls back, and refuses. The validation
