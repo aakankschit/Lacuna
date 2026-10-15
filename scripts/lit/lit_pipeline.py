@@ -38,7 +38,7 @@ LEDGER = lacuna_config.path("ledger")
 
 # Bump when the reader prompt or the note template changes: it is part of the cache key, so a
 # changed prompt must miss the cache rather than silently serve notes written under old assumptions.
-PROMPT_VERSION = "2"
+PROMPT_VERSION = "3"
 
 # Bump when prep_md's clean() or validate() changes: the parsed-markdown cache is keyed on this,
 # so without it a change to parsing never reaches a document that has already been parsed.
@@ -57,10 +57,6 @@ What was done, with key parameters, datasets, metrics, baselines.
 ## Key results
 Bullets. Every number with its unit AND a location (section, table, figure).
 
-## Concepts looked up
-Per concept: the concept, the source (book + chapter), the one-line definition taken away.
-"Not found in the supplied sources" is a valid and useful entry. Write "none" if you looked none up.
-
 ## Relevance to the project
 How it bears on the project's problem. Mark anything that is your inference, not the paper's claim.
 
@@ -68,13 +64,27 @@ How it bears on the project's problem. Mark anything that is your inference, not
 Numbered. Each: the gap, the evidence in the paper, what would resolve it. Include gaps the authors do not state.
 """
 
+# Only when textbooks are offered. Books are optional; without them this section filled every note with
+# "Not found in the supplied sources" lines, which a reader took for claims about the paper.
+CONCEPTS_SECTION = """## Concepts looked up
+Per concept: the concept, the source (book + chapter), the one-line definition taken away.
+"Not found in the supplied sources" is a valid and useful entry. Write "none" if you looked none up.
+
+"""
+
+
+def note_template(books_offered):
+    if not books_offered:
+        return NOTE_TEMPLATE
+    return NOTE_TEMPLATE.replace("## Relevance to the project", CONCEPTS_SECTION + "## Relevance to the project", 1)
+
 AGENTS = {
     "reader": {"description": "Reads one paper and writes a structured note",
                "tools": ["Read", "Grep", "Glob", "Write"],
                "prompt": ("You read one research paper (plain text from PDF; equations may be garbled) and write a "
                           "faithful structured note for a colleague who will not see the paper. Every number carries "
-                          "a location. When the paper assumes a concept you cannot state precisely, look it up in the "
-                          "supplied textbooks with Grep and read only the surrounding lines. Never invent a number, a "
+                          "a location. If textbooks are supplied and the paper assumes a concept you cannot state "
+                          "precisely, look it up in them with Grep and read only the surrounding lines. Never invent a number, a "
                           "citation or a section number. Your final reply is only the path you wrote.")},
     "synth": {"description": "Turns notes plus a codebase into a digest or a development plan",
               "tools": ["Read", "Grep", "Glob", "Write"],
@@ -448,7 +458,7 @@ def cmd_read(a):
         prompt = "\n\n".join(x for x in [
             a.brief, books,
             "Read the paper below in full and write its note to the given path, using exactly this template:",
-            NOTE_TEMPLATE, f"Paper:\n- {md} -> {draft}", "Keep the note under 1,100 words.",
+            note_template(bool(idx)), f"Paper:\n- {md} -> {draft}", "Keep the note under 1,100 words.",
             INCOMPLETE_RULE.format(what="the paper", also=f" and do not write {draft}")] if x)
         res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, drafts, BOOKS_DIR],
                      effort=lacuna_config.effort("reader"), cwd=out_dir)

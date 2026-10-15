@@ -61,6 +61,9 @@ MUTANTS = [
     ("key-drops-effort", PIPE, "reader_model, reader_effort, a.brief", "reader_model, a.brief"),
     ("key-drops-brief", PIPE, "reader_effort, a.brief, books_fp", "reader_effort, books_fp"),
     ("key-drops-books", PIPE, "reader_effort, a.brief, books_fp", "reader_effort, a.brief"),
+    # books are optional: the look-up section is asked for only when books are offered
+    ("concepts-section-without-books", PIPE, "    if not books_offered:\n        return NOTE_TEMPLATE\n", ""),
+    ("concepts-section-never", PIPE, "note_template(bool(idx))", "note_template(False)"),
     ("key-books-ignore-index-content", PIPE, "books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]",
      "books_fp = hashlib.sha256(books.encode()).hexdigest()[:8]"),
     ("key-books-as-flag", PIPE, "books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]",

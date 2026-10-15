@@ -17,7 +17,8 @@ plus the code proposed grounded, testable changes and found the authors' own ope
   whole. Anything that only looks like failure (a title such as "Partial 3q tetrasomy…", a caveat
   about the Supporting Information, a "- Incomplete:" bullet) is kept, with one warning naming the
   file. The 0.3.1 rule discarded genuine paid output. The reader is now told the `INCOMPLETE` rule
-  too, and a cached note is re-checked on every hit (`PROMPT_VERSION` 2).
+  too, and a cached note is re-checked on every hit. Textbooks are optional: without them, notes no
+  longer carry an empty "Concepts looked up" section (`PROMPT_VERSION` 3).
 - **Your files.** A run never deletes, moves or renames a file it did not write. Edits survive a
   failed run, an annotated `verify` report survives `--overwrite` when the call fails, and a hook's
   slow run no longer turns your edit to another note into Lacuna's. A changed document at a recorded
@@ -36,6 +37,8 @@ plus the code proposed grounded, testable changes and found the authors' own ope
 - **Tools.** `/lacuna-doctor` and `/spend` no longer abort when a check fails. The status line and
   the cache guard survive any malformed input. Every `/spend` subtotal shows the same lower-bound
   range as the headline. Plugin paths with spaces or quotes work.
+- **Your own agents:** `docs/extending.md` §6 shows how to add them around the stages (an `after.*`
+  hook, a Claude Code subagent, a project skill), with an example run end to end.
 - **Known edge cases** that are documented rather than fixed: `docs/LIMITS.md`.
 - **Correction to 0.3.0:** its statement that every fix had a guarding test was not true; a
   revert-by-revert check found about 50 fixes the suite did not notice. Those are now guarded.

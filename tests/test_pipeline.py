@@ -201,6 +201,9 @@ class TestNoteCache(Pipeline):
         self.assertEqual(read_().returncode, 0)
         self.assertIn("NO-BOOKS", self.note())
         self.assertFalse(self.ledger()[-1]["books"], "the ledger records the books offered, not the flag")
+        # Books are optional: with none, the template must not ask for look-ups, or every note fills
+        # with "Not found in the supplied sources" lines that read as claims about the paper.
+        self.assertNotIn("Concepts looked up", self.calls()[-1]["prompt"])
         toc = os.path.join(books, "handbook", "toc.md")
         write(toc, "# Handbook\n\n| chapter | file | pages | ~tokens |\n|---|---|---|---|\n| Priors | 00_priors.txt | 1-20 | 5,000 |\n")
         r = read_()
@@ -209,6 +212,7 @@ class TestNoteCache(Pipeline):
         self.assertIn("BOOKS-OFFERED", self.note())
         self.assertTrue(self.ledger()[-1]["books"])
         self.assertIn(toc, self.calls()[-1]["prompt"], "the reader is told where the index is")
+        self.assertIn("Concepts looked up", self.calls()[-1]["prompt"], "with books, the look-up section is asked for")
         r = read_("--no-books")
         self.assertEqual(len(self.calls()), 2, "--no-books produces the first prompt again, so the first note is served")
         self.assertIn("NO-BOOKS", self.note())

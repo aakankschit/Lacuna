@@ -253,6 +253,12 @@ stable, so you can tell what is safe to build on.
    [extending.md](docs/extending.md#4-the-lacuna-cli) before retrying on 2. Call the CLI; the Python
    modules will be renamed.
 
+**Your own agents** plug in around the stages, not inside them: a Claude Code subagent of yours can
+review every new note (an `after.read` hook), turn a plan into tickets (`after.synth`), or sit
+between `read` and `synth` in a project skill, and `lacuna lit verify` will fact-check its output
+too. Textbooks are optional throughout. [extending.md §6](docs/extending.md#6-adding-your-own-agents-to-the-workflow)
+has a working example.
+
 A worked example: the author's own chemistry project is a separate private plugin that points
 `books` at its corpus, pins `planner` to a model that does not refuse its source material, and sets
 `after.synth` to a script filing each plan into a notebook app. It changes no file in this repo.

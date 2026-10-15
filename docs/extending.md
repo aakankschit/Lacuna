@@ -131,6 +131,55 @@ A private plugin layered on this one typically ships: its own skills (your proje
 file discipline, a notebook integration as an `after.synth` command), its `books/` corpus, its own
 calibration, and nothing else.
 
+## 6. Adding your own agents to the workflow
+
+Lacuna's own stages are fixed (`read` → `synth` → `verify`), but every point between them is a file
+on disk, so your agents plug in around them rather than inside them. Four ways, lightest first.
+
+**a. Swap the model behind a built-in role.** No new agent at all: `config.json` →
+`"models": {"reader": "sonnet", "planner": "opus"}`. The roles are `reader`, `digester`, `planner`,
+`verifier`, `coder` and `tester` (`lacuna config` lists them and their current values), and
+`"effort"` takes the same keys.
+
+**b. Run your agent after a stage, with `after.*`** (§3). The hook receives the stage's output as its
+last argument, so an agent that reviews every new note, or turns a plan into tickets, is a short
+script:
+
+```bash
+#!/bin/sh
+# my-critic.sh — config.json: { "after": { "read": "/path/to/my-critic.sh" } }
+notes="$1"                                     # after.read is given the notes directory
+out="$(dirname "$notes")/critique.md"          # beside the notes, not in them: synth reads every .md there
+claude -p --model sonnet --agent my-critic --allowedTools "Read Grep Write" \
+  --add-dir "$notes" --add-dir "$(dirname "$notes")" <<EOF
+For each note in $notes, list the claims a domain expert would challenge and why.
+Write the result to $out.
+EOF
+```
+
+`--agent my-critic` names a Claude Code subagent (see c). A hook's failure is reported but never
+undoes the stage before it, and its model calls are not in Lacuna's ledger (`lacuna spend` still
+sees them, because it reads every Claude Code transcript). Keep your agent's output out of the notes
+directory: `synth --notes` reads every `.md` file in it as a note. While the hook runs, the directory
+also holds Lacuna's `.lacuna.json` and a `.lacuna-*.lock` that is removed when the run ends; a hook
+that commits or syncs the folder should ignore both.
+
+**c. Define the agent once, as a Claude Code subagent.** Put `my-critic.md` in your project's
+`.claude/agents/` (or `~/.claude/agents/` for every project). The plugin's own
+[`agents/paper-reader.md`](../agents/paper-reader.md), `coder.md` and `test-author.md` are working
+examples to copy: front matter with `name`, `description`, `tools` and `model`, then the
+instructions. Two rules that are easy to get wrong: `model:` must be a plain alias (`haiku`,
+`sonnet`, `opus`), and `${CLAUDE_PLUGIN_ROOT}` does not expand in front matter.
+
+**d. Chain stages and agents in a skill.** For a workflow you rerun, a project skill can say:
+run `lacuna lit read` on these papers, have the `my-critic` agent read the notes, run
+`lacuna lit synth` with the critique as part of `--objective`, then `lacuna lit verify --target`
+on the result. `verify` fact-checks any markdown file against `--repo` and `--notes`, so it works on
+your agents' output too, not only on Lacuna's plans. Branch on the exit codes (§4), not on the text.
+
+What you cannot do is add a stage *inside* `lacuna lit` or change its agents' prompts: the plugin
+directory is replaced on every update. See the next section.
+
 ## Using a notes app (Obsidian, Heptabase, Logseq, a wiki)
 
 Two mechanisms, and which one you need depends on how the app stores its data.
@@ -218,6 +267,8 @@ would change the prompt version and correctly invalidate every cached note you a
 - **Hook ordering.** Plugin hooks are additive but have no guaranteed order; a second plugin's
   `SessionStart` hook must not assume this one ran first. Put anything you depend on in the data
   directory, not in the session environment.
+- **The built-in agents.** The `reader`, `synth` and `verifier` agent definitions live inside
+  `lit_pipeline.py` and are replaced on update. Add your own around them (§6), not instead of them.
 - **The note template and the prompt text.** These change with measurements. When they do,
   `PROMPT_VERSION` in `lit_pipeline.py` is bumped and your note cache correctly misses — so you are
   never silently served notes written under old assumptions.
