@@ -19,19 +19,16 @@ DATA = lacuna_config.DATA
 # A reference-list heading. The leading junk covers numbered headings, bold markers and ACS's
 # "■ REFERENCES", which pymupdf4llm renders as "# ■<sup>**REFERENCES**</sup>" — hence the tags.
 # The heading is the whole line, so "References to prior work" is a section, not a list. A bare
-# "Literature" is left out on purpose: it is as often a literature review as a reference list.
-REF = re.compile(r"\n[#*\s■□●▪•]*(?:<[^>\n]*>)*\**\s*(?:\d+[.)]\s*)?(References?(?: and Notes| Cited| List)?|"
+# "Literature" is left out on purpose: it is as often a literature review as a reference list, and
+# so is a lone singular "Reference" (it labelled six author-year Results paragraphs).
+REF = re.compile(r"\n[#*\s■□●▪•]*(?:<[^>\n]*>)*\**\s*(?:\d+[.)]\s*)?(References(?: and Notes| Cited)?|Reference List|"
                  r"Notes and References|Bibliography|Literature Cited|Cited Literature|Works Cited|"
                  r"List of References)\**(?:<[^>\n]*>)*[:\s]*\n", re.I)
-# One citation entry. Measured on three journal papers, the list cannot be cut as a block: a
-# "Publisher's Note" box lands between entries 2 and 3, Nature puts a second list before Methods,
-# and acknowledgements and Extended Data legends follow the last. So each paragraph is judged.
-# Directly under a reference-list heading, a numbered paragraph that carries a year is an entry.
+# One citation entry, judged one paragraph at a time and only inside a reference list (see drop_entries).
+# Measured on three journal papers, a "Publisher's Note" box lands between entries and legends follow
+# the last, so the list cannot be cut as a block. A numbered paragraph with a year is an entry; so is
+# an unnumbered one that has the year where a citation puts it (an author-year list).
 ENTRY = re.compile(r"\s*(?:[-*]\s+)?(?:\(\d{1,4}\)|\[\d{1,4}\]|\d{1,4}[.)])\s.*\b(?:1[89]|20)\d{2}\b", re.S)
-# Once another heading has passed, body text may have resumed, and a Methods step is a numbered
-# paragraph with a year-like number too ("lysed in 2000 uL", "collected in 2019"): every one of them
-# was deleted. From there a paragraph goes only if it has the shape of a citation — who wrote it
-# (AUTHOR, at the start), or where it appeared (VENUE) — and a year.
 NUMBER = re.compile(r"\s*(?:[-*]\s+)?(?:\(\d{1,4}\)|\[\d{1,4}\]|\d{1,4}[.)])\s+")
 _Y = r"(?:1[89]|20)\d{2}[a-z]?"
 YEAR = re.compile(rf"\b{_Y}\b")
@@ -50,13 +47,14 @@ VENUE = re.compile(
     rf"|{_Y}\s*;\s*\d{{1,4}}\s*(?:\([^)\n]{{1,9}}\))?\s*:\s*[A-Za-z]?\d"  # J Chem. 2020;12(3):45
     rf"|\b\d{{1,4}}\s*(?:\([^)\n]{{1,9}}\)\s*[:,]|:)\s*[A-Za-z]?\d{{1,6}}\s*{_D}\s*[A-Za-z]?\d"  # 581:1–5
     r"|\bdoi\s*:|\bdoi\.org/|\bpp\.\s*\d|\bvol\.\s*\d|\barXiv:\s*\d{4}\.\d{4}", re.I)
-# Where an author-year list puts the year: "(2020)", ", 2020.", "2020;". Enough on its own only
-# directly under a reference-list heading; a sentence can end ", 2019." too.
+# Where an author-year list puts the year: "(2020)", ", 2020.", "2020;".
 CITED_YEAR = re.compile(rf"[,.;:(]\s*{_Y}\)?(?=\s*[.,;:)]|\s*$)")
 LEGEND = re.compile(r"[*_\s]*(?:Extended Data\s+|Supplementary\s+)?(?:Fig(?:ure)?|Table)\b", re.I)
 # A heading in any markup a parser produces. pymupdf4llm writes a same-size bold heading as
 # **Appendix A**, not as `#`, so a list cut to the next `#` swallowed the appendix after it.
 HEADING = re.compile(r"#{1,6}\s+\S.*|(?:(?:\*\*|__|\*|_)[^*_\n]*[^\W\d_][^*_\n]*(?:\*\*|__|\*|_)\s*)+")
+# A run-in label: a paragraph that opens with a bold phrase ("**Data availability.** The data are…").
+RUNIN = re.compile(r"(?:\*\*|__)[^*_\n]*[^\W\d_][^*_\n]*(?:\*\*|__)")
 SECTION = re.compile(r"(?:Appendix|Appendices|Supplementary|Supporting Information|"
                      r"(?:Online |Materials and )?Methods|Acknowledg\w*|Data availability|Code availability|"
                      r"Author contributions|Competing interests|Extended Data)\b", re.I)
@@ -203,64 +201,54 @@ def validate(md, pages, raw_chars=0, measured=True):
 
 def heading(p):
     """Whether a paragraph opens with a heading in any markup a parser produces: `#`, a line wholly
-    in bold or italics, a line in capitals, or a bare section name ("Appendix A", "Methods")."""
+    in bold or italics, a bold run-in label, a line in capitals, or a bare section name."""
     line = p.strip().split("\n", 1)[0].strip()
+    if RUNIN.match(line):
+        return True
     if not line or len(line) > 120:
         return False
     words = re.sub(r"^\d+(?:\.\d+)*[.)]?\s+", "", line)
     letters = [c for c in words if c.isalpha()]
     return bool(HEADING.fullmatch(line) or HEADING.fullmatch(words)
                 or (len(letters) >= 4 and all(c.isupper() for c in letters) and not re.search(r"\d", words))
-                or (len(line) <= 100 and SECTION.match(words)))
+                or SECTION.match(words))
 
 
-def citation(p):
-    """Whether a numbered paragraph has the shape of a reference: a year, and an author list at the
-    start or a journal's volume and pages. A Methods step has a number and a year-like number too."""
-    m = NUMBER.match(p)
-    rest = p[m.end():] if m else ""
-    return bool(m and YEAR.search(rest) and (AUTHOR.match(rest) or VENUE.search(rest)))
-
-
-def author_year(p):
-    """An unnumbered entry of an author-year list: a year, where a citation puts one."""
+def entry(p):
+    """Whether a paragraph inside a reference list is a citation entry."""
     q = p.strip()
-    return bool(YEAR.search(q) and not LEGEND.match(q)
+    return bool(ENTRY.match(p) or not NUMBER.match(p) and YEAR.search(q) and not LEGEND.match(q)
                 and (AUTHOR.match(q) or CITED_YEAR.search(q) or VENUE.search(q)))
 
 
-def body(tail):
-    """Everything after a References heading, minus the citation entries.
+def drop_entries(md):
+    """Drop the citation entries of every reference list, and nothing else.
 
-    Under a reference-list heading, a numbered paragraph with a year goes, and so does an unnumbered
-    one with its year where a citation puts it (an author-year list). Any other heading may mean
-    body text has resumed — Methods, an appendix in bold — so after one, only a numbered paragraph
-    shaped like a citation goes, until the next reference-list heading.
+    A list runs from a References-type heading to the next heading of any markup, and only
+    paragraphs shaped like an entry inside it go. Outside a list nothing is deleted, and when a
+    heading is in doubt the list simply ends there: a reference kept costs a few tokens, a
+    Data-availability section or a Results paragraph deleted loses a finding. (Classifying
+    paragraphs by citation shape everywhere after the first heading did exactly that.)
     """
-    kept, in_list = [], True
-    for p in re.split(r"\n\s*\n", tail):
-        if REF.fullmatch("\n" + p.strip() + "\n"):
-            in_list = True                 # a second list, as Nature puts before Methods
-            continue
-        if heading(p):
+    if not REF.search("\n" + md):  # a heading on the first line has no newline before it
+        return md
+    kept, in_list = [], False
+    for p in re.split(r"\n\s*\n", md):
+        line = "\n" + p.strip().split("\n", 1)[0].strip() + "\n"
+        if REF.fullmatch(line):
+            in_list = True
+        elif heading(p):
             in_list = False
-        elif citation(p) or in_list and (ENTRY.match(p) or not NUMBER.match(p) and author_year(p)):
+        elif in_list and entry(p):
             continue
         kept.append(p)
     return "\n\n".join(kept)
 
 
 def clean(md, strip_refs=True):
-    """Strip citation entries, control characters, and rewrap.
-
-    From the first References heading on, citation entries go one paragraph at a time; prose,
-    headings and legends stay. Cutting the list as a block was measured wrong both ways: to the
-    end of the file it dropped 18% of one paper, legends included; to the next heading it kept
-    all but two entries of another, because the parser puts a heading inside the list.
-    """
-    first = next(REF.finditer(md), None)
-    if first and strip_refs:
-        md = md[:first.start()] + "\n" + body(md[first.end():])
+    """Strip citation entries, control characters, and rewrap."""
+    if strip_refs:
+        md = drop_entries(md)
     md = CTRL.sub("", md)
     return "\n".join(l for ln in md.splitlines()           # a table row stays one line, however wide
                      for l in ([ln] if ln.lstrip().startswith("|") else textwrap.wrap(ln, 300, break_long_words=False) or [""]))

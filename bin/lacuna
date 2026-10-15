@@ -36,7 +36,7 @@ lacuna — find the gaps in a literature and build against them
   lacuna pane [FILE|DIR]             Follow a results file in a rendered markdown viewer.
   lacuna split                       Open a tmux results pane beside this session.
 
-Exit codes: 0 ok, 2 bad input, 3 parse failure, 4 model refused or produced nothing.
+Exit codes: 0 ok, 2 stopped for you to decide (usually before spending), 3 parse failure, 4 model refused or produced nothing.
 USAGE
 }
 

@@ -30,7 +30,7 @@ it. Everything mutable lives in `$LACUNA_DATA`.
 
 ### `bin/lacuna`
 A bash dispatcher. Resolves `$ROOT` from its own location, routes subcommands to scripts, and
-nothing else. It must stay thin: the exit-code contract (0 ok, 2 bad input, 3 parse failure, 4 the
+nothing else. It must stay thin: the exit-code contract (0 ok, 2 stopped for you to decide, usually before spending; 3 parse failure, 4 the
 model refused or produced nothing) is implemented by the scripts, not here.
 
 ### `scripts/lacuna_config.py`

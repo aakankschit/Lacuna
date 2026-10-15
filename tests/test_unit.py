@@ -156,20 +156,21 @@ class TestParse(unittest.TestCase):
                          "a 75k-char parse over one stray byte made --equations exit 3")
 
     def test_reference_entries_are_stripped_and_what_follows_is_kept(self):
-        """Measured on three journal papers: the parser puts a heading inside the list, Nature puts
-        a second list before Methods, and legends follow the citations. So entries go one by one."""
+        """Measured on three journal papers: Nature puts a second list before Methods, a Publisher's
+        Note box sits between entries, and legends follow the citations. So entries go one by one, and
+        only between a References heading and the next heading of any markup."""
         refs = "\n\n(1) Smith, J. Title. J. Chem. 2020, 1, 2.\n\n2. Jones, A. et al (2019) Other.\n\n"
         after = ("### **Publisher's Note**\n\nneutral\n\n3. Brown 2018.\n\n### Acknowledgements\n\nThanks.\n\n"
-                 "**Extended Data Fig. 1 |** legend\n")
+                 "**Extended Data Fig. 1 |** legend\n")   # a heading ends the list: Brown is kept, not guessed at
         for heading in ("# ■<sup>**REFERENCES**</sup>", "## ■ REFERENCES", "**References**", "### **References**",
                         "## 5. References", "Bibliography", "References and Notes", "## Notes and references",
-                        "## REFERENCES CITED", "## Works Cited", "**Literature Cited**", "## Reference", "### Reference List",
+                        "## REFERENCES CITED", "## Works Cited", "**Literature Cited**", "### Reference List",
                         "## List of References"):
             with self.subTest(heading):
                 out = prep_md.clean("# P\n\n## Methods\n\n1. Dock, 2020 style.\n\nbody\n\n" + heading + refs + after)
-                for gone in ("Smith", "Jones", "Brown"):
+                for gone in ("Smith", "Jones"):
                     self.assertNotIn(gone, out)
-                for kept in ("Dock, 2020 style", "body", "neutral", "Thanks", "legend"):
+                for kept in ("Dock, 2020 style", "body", "neutral", "Brown 2018", "Thanks", "legend"):
                     self.assertIn(kept, out)
         out = prep_md.clean("# P\n\nbody\n\n## References\n\nSmith, J. (2020). T.\n\nJones, A. (2019). O.\n\n## Appendix\n\nkept\n")
         self.assertNotIn("Smith", out, "an author-year list has no numbers to spot: cut it to the next heading")
@@ -177,7 +178,7 @@ class TestParse(unittest.TestCase):
         out = prep_md.clean("# P\n\nWe list all the references\nbelow.\n\nmore body\n")
         self.assertIn("more body", out, "the word at the end of a prose line is not a heading")
         for heading in ("## References to prior work", "## Literature review", "## Literature", "## Notes",
-                        "## Reference genomes", "Cited works"):
+                        "## Reference genomes", "Cited works", "## Reference", "**Reference**"):
             with self.subTest(heading):
                 out = prep_md.clean(f"# P\n\n{heading}\n\n1. Smith, J. Title. J. Chem. 12, 1–5 (2019).\n\n"
                                     "Earlier work (Smith, 2019) showed it.\n")
@@ -186,9 +187,9 @@ class TestParse(unittest.TestCase):
 
     def test_what_follows_a_reference_list_is_judged_by_shape(self):
         """Every numbered paragraph with a year-like number after the first References heading was
-        deleted: Methods steps ("lysed in 2000 uL"), and, after an author-year list, everything up to
-        the next `#` heading, so an appendix headed in bold went too. Entries go by the shape of a
-        citation; any heading may end the list; and real entries after one still go."""
+        deleted (Methods steps, "lysed in 2000 uL"), then every citation-shaped paragraph was, which
+        took Data availability, Acknowledgements and author-year Results paragraphs. Now only entries
+        between a References heading and the next heading of any markup go, and nothing else."""
         fill = "Ordinary prose about the method and its evaluation. " * 6
         cases = {
             "Methods after references": (
@@ -197,8 +198,17 @@ class TestParse(unittest.TestCase):
                 "## Methods\n\n1. Cells were incubated at 37 C and lysed in 2000 uL of buffer.\n\n"
                 "2. Spectra were recorded between 1800 and 2100 cm-1.\n\n3) Samples collected in 2019 were split.\n\n"
                 "4. Cells (2 × 10^5, 96-well plates) were cultured as before (Smith et al., 2019).\n\n"
-                "51. Mirdita, M. et al. ColabFold. Nat. Methods 19, 679–682 (2022).\n\n",   # Methods references
-                ["Senior, A. W.", "Mirdita"], ["2000 uL", "1800 and 2100", "collected in 2019", "Smith et al., 2019"]),
+                "51. Mirdita, M. et al. ColabFold. Nat. Methods 19, 679–682 (2022).\n\n",   # kept: unsure, not a list
+                ["Senior, A. W."], ["2000 uL", "1800 and 2100", "collected in 2019", "Smith et al., 2019", "Mirdita"]),
+            "run-in labels and plain headings end the list": (
+                "## References\n\n1. Jumper, J. et al. Highly accurate. Nature 596, 583–589 (2021).\n\n"
+                "**Data availability.** Data are at https://zenodo.org/record/1 (accessed 2021).\n\n"
+                "**Acknowledgements.** We thank Brown, T. 2019.\n\nAuthor contributions\n\nSmith, J. 2020 designed it.\n\n"
+                "Appendix A\n\n1. Step done in 2019.\n\n",
+                ["Jumper"], ["Data are at", "We thank Brown", "Smith, J. 2020 designed", "Step done in 2019"]),
+            "a lone singular Reference line": (
+                "**Reference**\n\nSmith et al. (2019) found the effect; we replicate it.\n\nBrown 2018 showed the same.\n\n",
+                [], ["Smith et al. (2019)", "Brown 2018"]),
             "bold appendix after an author-year list": (
                 "## References\n\nSmith J (2020) A study. Nature 581:1-5.\n\n"
                 "Tom Brown, Benjamin Mann, et al. Language models are few-shot learners. In NeurIPS, 2020.\n\n"
@@ -206,13 +216,16 @@ class TestParse(unittest.TestCase):
                 "**Appendix A. Derivation of the update rule**\n\n"
                 "The update follows Kingma and Ba (2015) with step size eta = 0.01.\n\n",
                 ["Smith J (2020)", "few-shot", "Adam: a method"], ["Appendix A", "eta = 0.01"]),
-            "entries after a stray heading": (
+            "a stray heading ends the list": (
                 "## References\n\n1. Smith, J. A. Title. J. Chem. 12, 1–5 (2019).\n\n## Nature | Vol 596\n\n"
-                "2. Doe, R.; Roe, P. Title. J. Am. Chem. Soc. 2020, 142, 1234−1240.\n\n"
-                "[3] A. Vaswani, N. Shazeer, and N. Parmar, “Attention is all you need,” in Proc. NeurIPS, 2017, pp. 5998–6008.\n\n"
+                "2. Doe, R.; Roe, P. Title. J. Am. Chem. Soc. 2020, 142, 1234−1240.\n\n",
+                ["Smith, J. A."], ["Nature | Vol 596", "Doe, R.;"]),
+            "every entry shape inside the list": (
+                "## References\n\n[3] A. Vaswani, N. Shazeer, and N. Parmar, “Attention is all you need,” in Proc. NeurIPS, 2017, pp. 5998–6008.\n\n"
                 "4. Smith JA, Doe R, Roe P. A trial. N Engl J Med. 2020;382(5):411-420.\n\n"
-                "5. The UniProt Consortium. UniProt in 2021. Nucleic Acids Res. 49, D480–D489 (2021).\n\n",
-                ["Smith, J. A.", "Doe, R.;", "Vaswani", "Smith JA", "UniProt"], ["Nature | Vol 596"]),
+                "5. The UniProt Consortium. UniProt in 2021. Nucleic Acids Res. 49, D480–D489 (2021).\n\n"
+                "**Extended Data Fig. 1 |** legend (2021).\n\n",
+                ["Vaswani", "Smith JA", "UniProt"], ["legend"]),
         }
         for name, (tail, gone, kept) in cases.items():
             with self.subTest(name):
@@ -261,15 +274,15 @@ class TestParse(unittest.TestCase):
         patterns that leaves it alone never reaches an already-parsed document (it happened once).
         When this fails: bump PARSE_VERSION in lit_pipeline.py and record the new fingerprint here."""
         import hashlib, inspect
-        parts = [inspect.getsource(f) for f in (prep_md.validate, prep_md.unreadable, prep_md.clean, prep_md.body,
-                                                 prep_md.heading, prep_md.citation, prep_md.author_year, prep_md.finish)]
+        parts = [inspect.getsource(f) for f in (prep_md.validate, prep_md.unreadable, prep_md.clean,
+                                                 prep_md.heading, prep_md.entry, prep_md.drop_entries, prep_md.finish)]
         parts += [r.pattern for r in (prep_md.REF, prep_md.ENTRY, prep_md.NUMBER, prep_md.YEAR, prep_md.AUTHOR, prep_md.VENUE,
-                                      prep_md.CITED_YEAR, prep_md.LEGEND, prep_md.HEADING, prep_md.SECTION, prep_md.CTRL,
+                                      prep_md.CITED_YEAR, prep_md.LEGEND, prep_md.HEADING, prep_md.RUNIN, prep_md.SECTION, prep_md.CTRL,
                                       prep_md.JUNK)]
         parts += [str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET), str(prep_md.JUNK_SHARE), str(prep_md.STRIP_LIMIT),
                   str(prep_md.UNMEASURED_FLOOR)]
         fingerprint = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-        recorded = {"4": "e837b51bbd46d754"}
+        recorded = {"4": "e837b51bbd46d754", "5": "5ced2b6d8013fb2a"}
         self.assertEqual(recorded.get(L.PARSE_VERSION), fingerprint,
                          f"the parser changed: bump PARSE_VERSION and record {fingerprint!r} for it")
 

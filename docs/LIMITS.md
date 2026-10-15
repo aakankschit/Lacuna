@@ -94,3 +94,24 @@ The pipeline produces notes, a digest, a plan and a fact-check. The fact-check c
 misquoted numbers and mis-attributions, which is the dominant error class — 27 of 75 findings in the
 error taxonomy were a claim attributed to the wrong paper. It does not catch a bad idea, and nothing
 here replaces reading the document when the stakes are high.
+
+## Known edge cases
+
+Found in review, judged rare, and not fixed. One line each: what happens, when, what to do.
+
+- **Interrupting `synth` (SIGTERM/SIGHUP).** The child `claude -p` keeps running (and paying) and leaves its `.lacuna-<pid>-<random>.partial` file beside `--out`; the file is private to that run, so it cannot pass for a retry's plan. Kill the child (`pkill -f "claude -p"`) and delete the `.partial`.
+- **No lock on some network and FUSE mounts.** Where `flock` is unsupported, Lacuna runs without holding its output paths and says once per directory `cannot lock <dir>; concurrent runs into it are not protected`. Do not run two stages into one directory there.
+- **Long non-ASCII names.** Output names are limited by bytes, not characters, so a long CJK name can be refused where APFS would allow it, and on HFS+ a name that passes can still fail after the paid call. Shorten the name.
+- **exFAT/FAT drives.** macOS `._name.md` files in a `--notes` directory are read as notes and make `synth` exit 2. Remove them (`dot_clean`).
+- **Hand-edited `.lacuna.json`.** A `stage` that is a list or object ends in a traceback (exit 1). Delete the record or restore the field.
+- **Litter after a kill.** Empty `cache/drafts/read-*` directories, `.lacuna.json.*.tmp` and `.lacuna-*.lock` files stay behind, and an `after` hook (a git commit, say) runs while lock files exist and can commit them. Ignore `.lacuna-*.lock` in git.
+- **`synth` says to move `<out>.new.md` over `<out>`.** Doing so makes the next `synth` refuse the file as edited. Re-run with `--overwrite` instead.
+- **Unusual output paths.** `--out` under a read-only parent is a traceback (exit 1, not 2). A FIFO at an output path is called "a directory", and `verify --overwrite` over a FIFO report pays and then hangs.
+- **Text that is not UTF-8.** UTF-16, CP1251 and Shift-JIS inputs are refused as binary. Convert them to UTF-8.
+- **Two rules for "is this text".** A `.md`/`.txt` that is mostly unmapped glyphs (Private Use, U+FFFD, `GLYPH<…>`) passes the input check and is read and paid for; a PDF with the same defect is refused at the parse.
+- **`spend` by-model table.** For retried calls it shows the lower end only; the headline figure carries the range.
+- **`pricing.json` aliases.** A key such as `sonnet` is shadowed by the shipped key for the same model, silently. Use the full model id as the key.
+- **Odd transcripts.** A non-numeric `usage.iterations` makes `spend` end in a traceback. An all-zero cache breakdown with a non-zero total is $0 in `spend` and non-zero in the status line.
+- **`idle_minutes`.** Not validated in `lacuna config`, which shows a bad value as given; the cache guard falls back to 60.
+- **Results pane.** Wraps by code points, not display width, so CJK text overflows a narrow pane.
+- **Tests.** An independent pass that reverted guards one at a time found some that no test catches; it was stopped before every one was traced. `tools/mutate.py` and `tools/mutation_battery.py` cover the ones known.

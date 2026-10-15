@@ -173,13 +173,18 @@ def estimate(files, per_agent, model=None, effort=None, cal=None, config=None):
             ests.append({"model": m, "effort": e, "usd": usd,
                          "minutes": float(cal[m][e]["minutes_per_paper"] * biggest_n * waves),
                          "over_budget": warn is not None and usd > warn})
-    # The row `lit read` would actually use. `any_over_budget` is true if ANY row of the table is,
-    # so a model told to gate approval on it asked about a $2.30 run for a $0.018 one.
-    rm, re_ = lacuna_config.model("reader"), lacuna_config.effort("reader")
+    # The row `lit read` would actually use: --model/--effort are the flags it takes too, so the
+    # question "what will this run cost" is asked of them first. `any_over_budget` is true if ANY row
+    # of the table is, so a model told to gate approval on it asked about a $2.30 run for a $0.018 one.
+    rm, re_ = model or lacuna_config.model("reader"), effort or lacuna_config.effort("reader")
     row = next((m for m in known if lacuna_config.canonical(m) == lacuna_config.canonical(rm)), None)
     cu = usd_of(row, re_) if row else None
+    # No calibration row means the cost is unknown, and unknown is not free: gate it.
     configured = {"model": rm, "effort": re_, "calibrated": cu is not None,
-                  "usd": cu, "over_budget": None if cu is None else (warn is not None and cu > warn)}
+                  "usd": cu, "over_budget": True if cu is None else (warn is not None and cu > warn)}
+    if cu is None:
+        warnings.append(f"no calibration for the reader {rm!r} at {re_} effort, so its cost is unknown; "
+                        f"treat the run as over budget and get approval.")
     over = [x for x in ests if x["over_budget"]]
     cheap = min(over, key=lambda x: x["usd"]) if over else None  # min() keeps the first of equals
     new_ctx = IDEATION["notes_tok"] * len(files) + IDEATION["context_tok"]

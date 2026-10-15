@@ -42,7 +42,7 @@ PROMPT_VERSION = "2"
 
 # Bump when prep_md's clean() or validate() changes: the parsed-markdown cache is keyed on this,
 # so without it a change to parsing never reaches a document that has already been parsed.
-PARSE_VERSION = "4"
+PARSE_VERSION = "5"
 
 EX_OK, EX_INPUT, EX_PARSE, EX_MODEL = 0, 2, 3, 4   # exit codes, so callers can branch
 

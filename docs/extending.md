@@ -48,12 +48,18 @@ so adding your own is harmless but has no effect.
   },
   "effort":  { "reader": "medium", "digester": "medium", "planner": "medium",
                "verifier": "high", "coder": "medium", "tester": "medium" },
-  "paths":   { "python": "...", "books": "...", "cache": "...", "results": "...", "ledger": "..." },
+  "paths":   { "python": "~/.lacuna/venv/bin/python", "books": "~/.lacuna/books", "cache": "~/.lacuna/cache",
+               "results": "~/.claude/results", "ledger": "~/.lacuna/cost-ledger.jsonl" },
   "after":   { "read": "", "synth": "", "verify": "" },
   "budget_warn_usd": 2.0,
   "idle_minutes": 60
 }
 ```
+
+These `paths` are the defaults (with the default data directory), so copying the block changes nothing.
+`~` and `$VAR` are expanded; a relative path is taken from the data directory (`$LACUNA_DATA`), never
+from the directory you happen to run in. A path must point at what it names: `ledger` is a file,
+the others are directories.
 
 Each model value is passed verbatim to `claude --model`, so an alias (`haiku`, `sonnet`, `opus`,
 `fable`) or a pinned id (`claude-opus-5`) both work. Prefer an alias unless you need a specific

@@ -125,7 +125,7 @@ familiar material. (Two cells, one run each — suggestive, not established.)
 `lacuna lit estimate` prints cost and wall time per model × effort and says whether the calibration is
 yours or upstream. Show the user the plan and the estimate before starting anything above the
 configured warning threshold (`budget_warn_usd`, default $2), and wait for approval. The test is
-`configured.over_budget` in the `--json` report (the row for the configured reader model and effort);
+`configured.over_budget` in the `--json` report (the row for the configured reader model and effort, or the `--model`/`--effort` you pass; true also when that row has no calibration, because its cost is unknown);
 `any_over_budget` and `cheapest_over_budget` describe the whole table, not the run you are about to start.
 
 ## After the run
