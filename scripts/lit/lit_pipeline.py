@@ -1360,7 +1360,6 @@ def cmd_synth(a):
 
 def cmd_verify(a):
     """Cheap grep-based fact check. The verifier reports in its final message; we save that."""
-    need_file(a.target, "--target")
     need_dir(a.repo, "--repo")
     if a.notes:
         need_dir(a.notes, "--notes")
@@ -1368,6 +1367,7 @@ def cmd_verify(a):
             os.listdir(a.notes)
         except OSError as e:
             refuse_inputs([f"--notes {a.notes} cannot be listed ({e.strerror})"])
+    # Missing, a directory, unreadable, empty or binary: --target is refused here, before any model call.
     refuse_inputs([f"--target {a.target} {why}" for why in [not_content(a.target)] if why])
     if not repo_tree(a.repo).strip():
         refuse_inputs([f"--repo {a.repo} has no files (or none Lacuna can list), so there is no codebase to check against"])

@@ -36,12 +36,15 @@ MUTATIONS = [
     # --- money guarantees ---
     ("synth stops validating --repo", "scripts/lit/lit_pipeline.py",
      '    need_dir(a.repo, "--repo")\n    if a.digest:', "    if a.digest:"),
+    # not_content() is what refuses a missing, unreadable or empty --target since need_file() was
+    # folded into it; removing need_file alone became equivalent
     ("verify stops validating --target", "scripts/lit/lit_pipeline.py",
-     '    need_file(a.target, "--target")\n', ""),
+     '    refuse_inputs([f"--target {a.target} {why}" for why in [not_content(a.target)] if why])\n', ""),
     ("verify files a refusal as a fact check", "scripts/lit/lit_pipeline.py",
      '    if res.get("is_error") or not report.strip():', "    if False:"),
+    # the reader writes a draft of its own; judging the note path instead is the same defect
     ("read infers success from a pre-existing file", "scripts/lit/lit_pipeline.py",
-     "        if os.path.exists(out):\n            os.remove(out)\n", ""),
+     'ok = usable_output(draft, 400, "note"', 'ok = usable_output(out, 400, "note"'),
     ("a long apology counts as output", "scripts/lit/lit_pipeline.py",
      "(judge(head), judge(reply", "(None, judge(reply"),
 
