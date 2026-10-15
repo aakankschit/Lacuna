@@ -165,14 +165,31 @@ it). It travels with the folder, so moving the vault or deleting the cache chang
 
 When a run would replace a file that fails one of those tests, it exits 2 before any model call
 and names every such file: edited since Lacuna wrote it, not recorded as Lacuna's (your own file,
-or one written before 0.3.0 kept records), or the note for a different document with the same file
-name (`main.pdf` from two papers' folders). Move the file or choose another `--out` to keep it;
-re-run with `--overwrite` to replace it. What an `after.*` hook leaves (frontmatter it prepends, say)
-still counts as Lacuna's output; only edits made after the run make a file yours. If `synth --out`
-changes while the run is in progress, it is moved to `<out>.rejected` rather than deleted. Deleting
-`.lacuna.json` is safe: Lacuna then asks before
-replacing anything it finds, and adopts a note again when it is exactly that document's cached
-note.
+or one written before 0.3.0 kept records), the note for a different document with the same file
+name (`main.pdf` from two papers' folders), the note for a document that has changed since (a new
+download saved over the old one and a revised copy of the same paper look alike, so both ask), or a
+file another stage wrote (a paper named `plan.md` read into the folder that holds your plan). Move
+the file or choose another `--out` to keep it; re-run with `--overwrite` to replace it. What an
+`after.*` hook leaves in the directory (frontmatter it prepends to every note there, say) still
+counts as Lacuna's output; only edits made after the run make a file yours. A note you restore to
+exactly that document's cached note is Lacuna's again.
+
+A note, plan or report that changes while its run is in progress is never replaced or deleted.
+When the run succeeds, the file is left as it is and the run exits 2 naming it: a plan or report is
+written beside it as `<out>.new.md`; a note is in the cache, so the same command with `--overwrite`
+puts it there for free. When `read` or `synth` fails, the changed file is moved to `<out>.rejected`
+(the model may have written it); a failed `verify` leaves a changed report where it is. Neither name
+replaces an earlier one: the next is `-2`, then `-3`.
+
+Two runs never write one file at once. A run holds each note, plan or report it will write from
+the check above to its last write; another run that needs the same file exits 2 before any model
+call, naming the run that holds it (its process id). A hold ends when its run ends, however it ends
+(a refusal, Ctrl-C, a killed terminal), so nothing a run leaves behind blocks the next one.
+
+Deleting `.lacuna.json` is safe: Lacuna then asks before replacing anything it finds, and adopts a
+note again when it is exactly that document's cached note. A damaged one is kept as
+`.lacuna.json.damaged-<time>` beside it, the run says so, and a new record is started; the same
+then holds, and a later refusal mentions the damaged copy.
 
 ### A note on frontmatter
 

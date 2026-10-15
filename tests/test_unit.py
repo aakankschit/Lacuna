@@ -805,6 +805,51 @@ class TestFixesThatSurvivedTheirOwnRevert(unittest.TestCase):
 
 class TestOwnershipRecord(unittest.TestCase):
 
+    def test_a_hand_edited_or_old_record_is_read_without_raising(self):
+        """The record is a file in the user's folder: hand-edited, or left by an older Lacuna. Only
+        a well-formed entry with a checksum describes a file Lacuna wrote."""
+        with tempfile.TemporaryDirectory() as d:
+            note = write(os.path.join(d, "a.md"), "note")
+            for label, record, want in [
+                ("an entry that is not a table", {"files": {"a.md": 5, "b.md": {"sha256": "x"}}}, ["b.md"]),
+                ("no files table", {}, []),
+                ("a files table that is a list", {"files": ["a.md"]}, []),
+                ("a source that is not a path", {"files": {"a.md": {"sha256": "x", "source": 5}}}, ["a.md"]),
+                # 0.3.1 kept reservations here, released only on success; one left by a failed run
+                # refused every later read of a same-named document, and made its note "edited since"
+                ("a 0.3.1 reservation", {"files": {"a.md": {"pending": True, "source": "/x/a.md"},
+                                                   "b.md": {"pending": True, "sha256": "x", "source": "/x/b.md"}}},
+                 ["b.md"]),
+            ]:
+                with self.subTest(label):
+                    write(os.path.join(d, ".lacuna.json"), json.dumps(record))
+                    files, _ = L._owners(d)
+                    self.assertEqual(sorted(files), want)
+                    self.assertFalse(any("pending" in e for e in files.values()), "a reservation holds nothing now")
+                    L.not_ours(note, source=os.path.join(d, "doc.md"))
+
+    def test_recording_never_raises_and_a_moved_file_leaves_the_record(self):
+        """record() runs after the stage has been paid for: a record that cannot be written costs a
+        question on the next run, never this run's output. A file an after.* hook moved away is no
+        longer Lacuna's to account for."""
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as d:
+            note = write(os.path.join(d, "n.md"), "note")
+            if os.geteuid() != 0:
+                os.chmod(d, 0o555)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    L.record(note)
+                os.chmod(d, 0o755)
+                self.assertIn("could not record", err.getvalue())
+            L.record(note)
+            before = L.as_recorded(d)
+            os.remove(note)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                L.rerecord(d, before)
+            self.assertEqual((L._owners(d)[0], err.getvalue()), ({}, ""))
+
     def test_two_processes_recording_into_one_directory_lose_nothing(self):
         """Two `lit read` runs into one --out kept 9 of 16 entries: each read the record, added its
         own and replaced the file. The next run refused the other 7 notes as not Lacuna's."""
@@ -1073,6 +1118,11 @@ class TestCacheWritesAreAtomic(unittest.TestCase):
                 lit_pipeline._atomic_copy(__file__, dst)
             self.assertFalse(os.path.exists(dst))
             self.assertEqual([f for f in os.listdir(d) if f.endswith(".part")], [])
+            dst = os.path.join(d, "c.md")              # the copy is made, then cannot be renamed
+            with mock.patch.object(lit_pipeline.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    lit_pipeline._atomic_copy(__file__, dst)
+            self.assertEqual(os.listdir(d), [], "the temporary was left beside the cache entry")
 
 
 class TestStatusMarkerEdges(unittest.TestCase):
@@ -1249,40 +1299,52 @@ class TestStatusMarkerEdges(unittest.TestCase):
                 self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
 
 
-class TestReservationRecord(unittest.TestCase):
-    """A reservation is written before the model runs, so it has no checksum yet. Dropping those
-    from the record let two concurrent runs each believe the note path was free."""
+class TestHolds(unittest.TestCase):
+    """One run writes a given note, plan or report at a time. 0.3.1 reserved a path with a "pending"
+    entry in the record, released only on success: a refused reader, Ctrl-C, a missing parser or a
+    kill left it, and every later read of a same-named document was refused for good, --overwrite
+    included. A hold ends with the process that took it, however that process ends."""
 
     def setUp(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
-        import lit_pipeline
-        self.L = lit_pipeline
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.addCleanup(L.release_all)
+        self.note = os.path.join(self.d, "main.md")
 
-    def test_a_pending_reservation_survives_a_read_of_the_record(self):
-        with tempfile.TemporaryDirectory() as d:
-            note = os.path.join(d, "main.md")
-            a, b = os.path.join(d, "a.md"), os.path.join(d, "b.md")
-            for f in (a, b):
-                with open(f, "w") as fh:
-                    fh.write("x" * 600)
-            self.assertIsNone(self.L.reserve(note, a), "the first claim must succeed")
-            entries = self.L._owners(d)[0]
-            self.assertIn(self.L.name_key(note), entries,
-                          "a reservation without a checksum must stay in the record")
-            self.assertEqual(self.L.reserve(note, b), a,
-                             "a second document must be told who holds the note path")
+    def holder(self):
+        """Another process holding the note path until it is killed or told to exit."""
+        code = (f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'scripts', 'lit')!r})\n"
+                f"import lit_pipeline as L\nL.hold({self.note!r}, 'testing')\nprint('held', flush=True)\n"
+                f"sys.stdin.read()\n")
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        p = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             text=True, env={"HOME": home, "LACUNA_DATA": home, "PATH": "/usr/bin:/bin"})
+        self.addCleanup(p.kill)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        return p
 
-    def test_the_same_document_may_re_reserve_its_own_note(self):
-        with tempfile.TemporaryDirectory() as d:
-            note, a = os.path.join(d, "main.md"), os.path.join(d, "a.md")
-            for f, body in ((a, "x" * 600), (note, "n" * 600)):
-                with open(f, "w") as fh:
-                    fh.write(body)
-            self.L.record(note, a)
-            before = self.L._owners(d)[0][self.L.name_key(note)]["sha256"]
-            self.assertIsNone(self.L.reserve(note, a))
-            self.assertEqual(self.L._owners(d)[0][self.L.name_key(note)]["sha256"], before,
-                             "re-reserving must keep the completed record's checksum")
+    def test_a_hold_ends_with_its_process_however_it_ends(self):
+        for how in ("killed", "exits without releasing"):
+            with self.subTest(how):
+                p = self.holder()
+                info = L.hold(self.note, "reading")
+                self.assertEqual((info["pid"], info["doing"]), (p.pid, "testing"), "who holds it, for the message")
+                if how == "killed":
+                    p.kill()
+                else:
+                    p.stdin.close()
+                p.wait()
+                self.assertIsNone(L.hold(self.note, "reading"), "a hold outlived the run that took it")
+                L.release_all()
+        self.assertEqual(os.listdir(self.d), [], "a released hold leaves nothing behind")
+
+    def test_a_hold_that_cannot_be_taken_is_not_fatal(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file modes")
+        os.chmod(self.d, 0o555)
+        self.addCleanup(os.chmod, self.d, 0o755)
+        self.assertIsNone(L.hold(self.note, "reading"))
 
 
 class TestNameKeyFolding(unittest.TestCase):

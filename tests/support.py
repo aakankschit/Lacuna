@@ -29,6 +29,8 @@ for p in (SCRIPTS, os.path.join(SCRIPTS, "cost"), LIT):
 # Not told, it replies as usual, as a real reader did. "clobber" writes its plan over --out itself
 # instead of the .partial it was given.
 # "body" writes exactly FAKE_BODY to the note or plan path and replies FAKE_REPLY (default: the path).
+# In any mode, FAKE_EDIT names a file the fake appends a line to while it runs: a user editing it then.
+# FAKE_REFUSE_IF refuses any prompt that contains it, so one document of a run can fail.
 FAKE_CLAUDE = r'''#!{py}
 import json, os, re, sys, time
 prompt = sys.stdin.read()
@@ -41,6 +43,11 @@ GAVE_UP = "The text I was given is symbol noise; no sentence survives.\nINCOMPLE
 _d = float(os.environ.get("FAKE_DELAY", 0))      # lets a test overlap two real processes
 if _d:
     import time as _t; _t.sleep(_d)
+if os.environ.get("FAKE_EDIT"):
+    with open(os.environ["FAKE_EDIT"], "a") as f:
+        f.write("EDITED WHILE THE MODEL RAN\n")
+if os.environ.get("FAKE_REFUSE_IF") and os.environ["FAKE_REFUSE_IF"] in prompt:
+    mode = "refuse"
 if mode == "refuse":
     print(json.dumps({{"is_error": True, "result": "I can't help with that.", "total_cost_usd": 0.002}}))
     sys.exit(0)
@@ -105,7 +112,7 @@ print(json.dumps({{"is_error": False, "result": "nothing to do", "total_cost_usd
 FAKE_PARSER_PY = r'''#!/bin/sh
 echo "$@" >> "$FAKE_PARSE_LOG"
 if [ -n "$FAKE_PARSE_FAIL" ]; then echo "parse exploded" >&2; exit 1; fi
-printf '# Parsed\n\n## Abstract\n\nParsed body.\n' > "$4"
+printf '# Parsed\n\n## Abstract\n\nParsed body.\n' > "$4.partial" && mv "$4.partial" "$4"   # as prep_md does
 '''
 
 

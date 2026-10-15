@@ -87,13 +87,19 @@ Other invariants:
   judged by the current check on every hit, so a note cached before the check learned a shape is read
   again (paid) rather than served free. The check covers the shapes models have been seen to use. A
   refusal phrased outside them is still filed, so the reply is the channel to rely on.
-- **Lacuna replaces a file in a user's directory only if it wrote it** — for the same document, in
-  the case of a note — and nobody has edited it since. The evidence is `.lacuna.json` beside the
-  files (`record`, `not_ours`), never the cache: the cache knows that Lacuna wrote some note, not
-  for which document, and is deleted or left behind on another machine. Anything else exits 2 before
-  any model call, naming each file and the way forward (`--overwrite`). The record is locked across
-  processes, re-written after an `after.*` hook, and compared by file identity (`samefile`), not by
-  path, because macOS folds case and Unicode form.
+- **Lacuna replaces a file in a user's directory only if it wrote it** — in the same stage, and for
+  the same document (the same bytes) in the case of a note — and nobody has edited it since. The
+  evidence is `.lacuna.json` beside the files (`record`, `not_ours`), never the cache: the cache
+  knows that Lacuna wrote some note, not for which document, and is deleted or left behind on
+  another machine. Anything else exits 2 before any model call, naming each file and the way
+  forward (`--overwrite`). The record is locked across processes, re-written for every file an
+  `after.*` hook changed, and compared by file identity (`samefile`), not by path, because macOS
+  folds case and Unicode form. A run holds each path it will write from that check to its last
+  write (`hold`: an flock the kernel ends with the process, so a hold never goes stale), and a
+  reader writes a draft of its own, which is what gets cached; the note path is never judged. A
+  note, plan or report that changes while the model runs is never replaced: the run exits 2 with
+  the result beside it (or, for a note, in the cache). A file name too long for its directory
+  stops the run before the model call; cache names are cut to fit.
 
 ### `scripts/lit/prep_md.py`
 PDF → reference-stripped markdown. Parses, **validates**, falls back, and refuses. The validation
