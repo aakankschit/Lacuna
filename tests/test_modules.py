@@ -282,8 +282,25 @@ class TestEstimate(Sandbox):
         self.assertTrue(self.est_json(f, "--model", "haiku", "--effort", "low")["configured"]["over_budget"],
                         "a filter narrows the table, not the question")
         self.config({"budget_warn_usd": 1.0, "models": {"reader": "opus"}})
-        self.assertEqual(self.est_json(f)["configured"],
-                         {"model": "opus", "effort": "medium", "calibrated": False, "usd": None, "over_budget": None})
+        doc = self.est_json(f)
+        self.assertEqual(doc["configured"],
+                         {"model": "opus", "effort": "medium", "calibrated": False, "usd": None, "over_budget": True},
+                         "an unknown cost is gated, never null")
+        self.assertTrue(any("opus" in w and "unknown" in w for w in doc["warnings"]), doc["warnings"])
+
+    def test_the_configured_row_follows_model_and_effort_flags(self):
+        """`lit estimate --model sonnet` priced the run as the configured haiku one, so a gate on
+        `configured` approved `lit read --model sonnet` at the haiku figure."""
+        mk = lambda u: {"usd_per_ktok": u, "minutes_per_paper": 1.0}
+        self.cal({"haiku": {"medium": mk(.001), "high": mk(.002)}, "sonnet": {"medium": mk(5.0)}})
+        self.config({"budget_warn_usd": 1.0})
+        f = self.doc("a.md", 10)
+        self.assertFalse(self.est_json(f)["configured"]["over_budget"])
+        c = self.est_json(f, "--model", "sonnet")["configured"]
+        self.assertEqual((c["model"], c["effort"], c["over_budget"]), ("sonnet", "medium", True))
+        c = self.est_json(f, "--effort", "high")["configured"]
+        self.assertEqual((c["model"], c["effort"]), ("haiku", "high"))
+        self.assertAlmostEqual(c["usd"], 10_000 / 1000 * .002, places=9)
 
     def test_a_mis_shaped_calibration_unreadable_files_and_foreign_types_are_refused_not_tracebacks(self):
         """D11: each of these was a traceback (or, in text mode, a table of nan)."""
@@ -960,6 +977,50 @@ class TestDoctor(Sandbox):
                 self.assertEqual(read(path), body, "doctor must not rewrite it")
                 os.remove(path)
 
+    def test_a_setting_that_fell_back_is_a_note_and_a_stale_calibration_is_called_stale(self):
+        """A mistyped value falls back to its default; doctor called it a blocking MISS ("Fix the MISS
+        lines before anything will work") and /lacuna-doctor, whose injection fails on exit 1, then
+        showed nothing. A copy of the shipped calibration tagged upstream is ignored by `lit estimate`,
+        so doctor must not call it "yours"."""
+        fake = write(self.p("bin2", "claude"), "#!/bin/sh\nexit 0\n", 0o755)
+        env = dict(PATH=f"{os.path.dirname(fake)}:{SAFE_PATH}")
+        for body in ('{"models": {"reader": 5}}', '{"effort": {"reader": true}}', '{"paths": []}'):
+            with self.subTest(body):
+                path = write(os.path.join(self.data, "config.json"), body)
+                r = self.doctor(**env)
+                self.assertEqual(r.returncode, 0, r.stdout)
+                self.assertRegex(r.stdout, r"\[note\] a setting was not used as written")
+                self.assertNotIn("MISS", r.stdout)
+                self.assertNotIn("BLOCKING", r.stdout)
+        os.remove(path)
+        cal = write(os.path.join(self.data, "calibration.json"), '{"_source": "upstream"}')
+        r = self.doctor(**env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("stale copy", r.stdout)
+        self.assertNotIn("yours", r.stdout.split(cal)[1].split("\n\n")[0])
+
+    def test_the_dev_cycle_headless_recipe_passes_effort(self):
+        """The recipe pinned the model and dropped the agents' effort, so a headless coder ran at the
+        CLI default. Effort is a cost multiplier."""
+        skill = read(os.path.join(ROOT, "skills", "dev-cycle", "SKILL.md"))
+        cmd = next(l for l in skill.splitlines() if l.startswith("claude -p"))
+        self.assertIn('--effort "$EFFORT"', cmd)
+        self.assertIn("['effort']['coder']", skill, "and takes it from the configuration")
+
+    def test_every_shell_injection_in_a_command_or_skill_is_guarded(self):
+        """A failing !`cmd` aborts the whole slash-command invocation and Claude never sees the
+        output (code.claude.com, slash-commands). doctor exits 1 exactly when it has something to
+        report, and spend exits 2 on a bad argument, so each injection ends `|| true`."""
+        import glob
+        files = glob.glob(os.path.join(ROOT, "commands", "*.md")) + glob.glob(os.path.join(ROOT, "skills", "*", "SKILL.md"))
+        found = []
+        for f in files:
+            for line in read(f).splitlines():
+                if re.search(r"(?<!`)!`[^`]+`", line):
+                    found.append((f, line))
+                    self.assertRegex(line, r"\|\| true`", f"{os.path.relpath(f, ROOT)}: {line}")
+        self.assertGreaterEqual(len(found), 2, "the check must see the injections it guards")
+
     def test_checks_the_directories_lacuna_resolves(self):
         """cache and books follow config.json and LACUNA_CACHE/LACUNA_BOOKS; doctor checked, and
         created, <data>/cache and <data>/books regardless."""
@@ -1096,10 +1157,21 @@ class TestConfigReport(Sandbox):
         self.assertEqual(json.loads(self.lacuna("config", "--json").stdout)["errors"], [])
 
     def test_config_json_output_is_strict_json(self):
-        write(os.path.join(self.data, "config.json"), '{"budget_warn_usd": NaN}')
-        r = self.lacuna("config", "--json")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        json.loads(r.stdout, parse_constant=lambda c: self.fail(f"{c} is not JSON"))
+        for body in ('{"budget_warn_usd": NaN}', '{"idle_minutes": Infinity}', '{"after": {"read": [NaN]}}'):
+            with self.subTest(body):
+                write(os.path.join(self.data, "config.json"), body)
+                r = self.lacuna("config", "--json")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                json.loads(r.stdout, parse_constant=lambda c: self.fail(f"{c} is not JSON"))
+
+    def test_a_relative_path_is_taken_from_the_data_directory_not_the_cwd(self):
+        """A relative paths.cache followed the cwd, so the cache split and papers were read again."""
+        write(os.path.join(self.data, "config.json"), '{"paths": {"cache": "mycache", "books": "/srv/books"}}')
+        for cwd in (self.p("one"), self.p("two")):
+            os.makedirs(cwd)
+            got = json.loads(self.lacuna("config", "--json", cwd=cwd).stdout)["paths"]
+            self.assertEqual(got["cache"], os.path.join(os.path.abspath(self.data), "mycache"))
+            self.assertEqual(got["books"], "/srv/books", "an absolute path is left alone")
 
     def test_a_price_override_applies_however_the_model_is_named(self):
         """D15: `claude-opus-5-5` in pricing.json priced nothing for a role configured as `opus`,
@@ -1216,6 +1288,20 @@ class TestSplitBook(Sandbox):
                          ["00_New_one.txt", "01_New_two.txt", "99_mine.txt", "index.json", "notes.txt", "toc.md"],
                          "the old split's chapters go; files it did not write stay")
         self.assertEqual([read(m) for m in mine], ["my own notes"] * 2)
+
+    def test_resplit_never_deletes_a_chapter_it_just_wrote(self):
+        """On a case-insensitive disk a re-split with a case-only title change wrote
+        00_INTRODUCTION.txt over 00_Introduction.txt, then deleted the "stale" name: every new
+        chapter gone, exit 0. A symlink makes two names one file on any disk."""
+        r = self.split([[1, "Introduction", 1], [1, "Methods", 3]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        real = os.path.join(self.outdir, "00_Introduction.txt")
+        os.symlink(real, os.path.join(self.outdir, "00_Intro.txt"))
+        r = self.split([[1, "Intro", 1], [1, "Methods", 3]], outdir=self.outdir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for row in self.index():
+            self.assertTrue(os.path.exists(os.path.join(self.outdir, row["file"])), row["file"])
+        self.assertIn("alpha page", self.chapter("00_Intro.txt"))
 
     def test_says_whether_readers_are_offered_the_book(self):
         """Readers are offered <books>/<name>/toc.md and nothing else; a book split anywhere else
