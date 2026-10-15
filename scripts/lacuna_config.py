@@ -19,8 +19,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # expanduser/expandvars because this is typed by hand and exported in shell profiles. Without it
 # "~/lacuna" became a literal "./~/lacuna" next to the cwd while config.json was looked for
 # elsewhere: two data directories, and `doctor` reported every step OK.
-DATA = os.path.expanduser(os.path.expandvars(
-    os.environ.get("LACUNA_DATA") or "~/.lacuna"))
+DATA = os.path.abspath(os.path.expanduser(os.path.expandvars(      # absolute: relative paths.* are joined to it
+    os.environ.get("LACUNA_DATA") or "~/.lacuna")))
 
 # Claude Code's own transcript directory. Not configurable by us — this is where it writes.
 TRANSCRIPTS = os.path.expanduser("~/.claude/projects")
@@ -175,8 +175,10 @@ def load():
     _validate(cfg)
     # Paths are written by hand in config.json, so "~/books" and "$HOME/books" must work.
     # Without this a tilde becomes a literal directory named "~" and the error is baffling.
-    # They are made absolute too: they are handed to agents, which run in another directory.
-    cfg["paths"] = {k: os.path.abspath(os.path.expanduser(os.path.expandvars(v))) if isinstance(v, str) and v else v
+    # They are made absolute too: they are handed to agents, which run in another directory. A
+    # relative one is taken from the data directory, never the cwd: it followed the cwd, so the
+    # cache split in two and papers were read (and paid for) again.
+    cfg["paths"] = {k: os.path.abspath(os.path.join(DATA, os.path.expanduser(os.path.expandvars(v)))) if isinstance(v, str) and v else v
                     for k, v in (cfg.get("paths") or {}).items()}
     return cfg
 
@@ -279,10 +281,14 @@ if __name__ == "__main__":
     prices()
     if "--json" in sys.argv:
         # strict JSON: NaN and Infinity (which json.load accepts from config.json) are not JSON
-        shown = {**cfg, "data_dir": DATA, "prices": {k: list(v) for k, v in prices().items()},
-                 "errors": list(CONFIG_ERRORS)}
-        if isinstance(shown.get("budget_warn_usd"), float) and not math.isfinite(shown["budget_warn_usd"]):
-            shown["budget_warn_usd"] = None
+        def finite(x):
+            if isinstance(x, dict):
+                return {k: finite(v) for k, v in x.items()}
+            if isinstance(x, list):
+                return [finite(v) for v in x]
+            return None if isinstance(x, float) and not math.isfinite(x) else x
+        shown = finite({**cfg, "data_dir": DATA, "prices": {k: list(v) for k, v in prices().items()},
+                        "errors": list(CONFIG_ERRORS)})
         print(json.dumps(shown, indent=2, allow_nan=False))
     else:
         def src(section, key):
