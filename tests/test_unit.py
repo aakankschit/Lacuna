@@ -1390,12 +1390,28 @@ class TestHolds(unittest.TestCase):
                 L.release_all()
         self.assertEqual(os.listdir(self.d), [], "a released hold leaves nothing behind")
 
-    def test_a_hold_that_cannot_be_taken_is_not_fatal(self):
+    def test_a_hold_that_cannot_be_taken_is_not_fatal_and_not_silent(self):
+        """flock fails with EOPNOTSUPP on some network and FUSE mounts, and that was swallowed: nothing
+        was held, two runs into one --out both paid, and one moved the other's plan aside (J4). The
+        run goes on unprotected, says so once per directory, and leaves no lock file behind."""
+        import contextlib, errno
+        warning = f"cannot lock {self.d}; concurrent runs into it are not protected"
+        err = io.StringIO()
+        with mock.patch.object(L.fcntl, "flock", side_effect=OSError(errno.EOPNOTSUPP, "Operation not supported")), \
+                contextlib.redirect_stderr(err):
+            self.assertIsNone(L.hold(self.note, "reading"))
+            self.assertIsNone(L.hold(os.path.join(self.d, "other.md"), "reading"))
+        self.assertEqual(err.getvalue().count(warning), 1, err.getvalue())
+        self.assertEqual(os.listdir(self.d), [], "a lock file nothing holds was left behind")
         if os.geteuid() == 0:
             self.skipTest("root ignores file modes")
-        os.chmod(self.d, 0o555)
-        self.addCleanup(os.chmod, self.d, 0o755)
-        self.assertIsNone(L.hold(self.note, "reading"))
+        d = tempfile.mkdtemp(dir=self.d)          # no lock file can be made: not held, and said
+        os.chmod(d, 0o555)
+        self.addCleanup(os.chmod, d, 0o755)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(L.hold(os.path.join(d, "main.md"), "reading"))
+        self.assertIn(f"cannot lock {d}", err.getvalue())
 
 
 class TestNameKeyFolding(unittest.TestCase):

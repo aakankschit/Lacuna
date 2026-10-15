@@ -362,8 +362,11 @@ MUTANTS = [
      "        try:\n            if os.fstat(fd).st_size:\n                raise BlockingIOError\n"
      "            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"),
     ("holds-not-released", PIPE, "    finally:\n        release_all()", "    finally:\n        pass"),
-    ("hold-failure-fatal", PIPE, "            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)\n        except OSError:\n            return None",
+    ("hold-failure-fatal", PIPE, "            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)\n        except OSError:\n            return _not_held(path)",
      "            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)\n        except OSError:\n            raise"),
+    # J4/F3: flock unsupported was swallowed: nothing held, nothing said, the lock file left behind
+    ("unlockable-dir-silent", PIPE, '        print(f"  ! cannot lock {d}; concurrent runs', '        pass  # print(f"  ! cannot lock {d}; concurrent runs'),
+    ("unlockable-lock-file-left", PIPE, "                os.unlink(lock)          # nothing holds it", "                pass          # nothing holds it"),
     ("legacy-reservation-kept", PIPE, '        if isinstance(v, dict) and isinstance(v.get("sha256"), str):',
      '        if isinstance(v, dict) and (isinstance(v.get("sha256"), str) or v.get("pending") is True):'),
     ("cache-takes-the-note-path", PIPE, "                _atomic_copy(draft, cached)", "                _atomic_copy(out, cached)"),

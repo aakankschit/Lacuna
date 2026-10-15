@@ -941,7 +941,8 @@ def hold(path, doing):
 
     A hold is an flock on a lock file beside the record. The kernel ends it when the process ends,
     however it ends (SIGKILL, a reused pid), so a hold can never go stale. The file says who holds
-    it, for the message. Without fcntl, or where no lock file can be made, a path is not held."""
+    it, for the message. Without fcntl a path is not held; nor where it cannot be locked, and then the
+    run says so (_not_held)."""
     if fcntl is None:
         return None
     lock = os.path.join(os.path.dirname(path),
@@ -952,7 +953,7 @@ def hold(path, doing):
         try:
             fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
         except OSError:
-            return None
+            return _not_held(path)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -964,7 +965,11 @@ def hold(path, doing):
             return {**(info if isinstance(info, dict) else {}), "lock": lock}
         except OSError:
             os.close(fd)
-            return None
+            try:
+                os.unlink(lock)          # nothing holds it, so nothing is left behind
+            except OSError:
+                pass
+            return _not_held(path)
         try:      # released and unlinked between our open and our lock: hold the file now at the path
             ours = os.path.samestat(os.fstat(fd), os.stat(lock))
         except OSError:
@@ -976,6 +981,20 @@ def hold(path, doing):
             _held[lock] = fd
             return None
         os.close(fd)
+    return None
+
+
+_unlockable = set()    # directories already reported
+
+
+def _not_held(path):
+    """No hold on `path`: its filesystem cannot lock (EOPNOTSUPP on some network and FUSE mounts), or no
+    lock file can be made there. The run goes on, and says so once per directory: in silence, two runs
+    into one --out both paid, and one moved the other's plan aside (J4)."""
+    d = os.path.dirname(path)
+    if d not in _unlockable:
+        _unlockable.add(d)
+        print(f"  ! cannot lock {d}; concurrent runs into it are not protected", file=sys.stderr)
     return None
 
 
