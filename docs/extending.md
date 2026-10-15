@@ -106,9 +106,14 @@ lacuna lit read|synth|verify|estimate|split-book
 lacuna spend | lacuna doctor | lacuna config | lacuna pane | lacuna split
 ```
 
-The exit codes are promised to keep their meanings: **0** ok, **2** bad input, **3** parse failure, **4** the model
-refused or produced nothing. A wrapper can branch on those — for example, retry stage `read` with a
-different model on exit 4.
+The exit codes are promised to keep their meanings: **0** ok, **2** refused, **3** parse failure,
+**4** the model refused or produced nothing. A wrapper can branch on those — for example, retry
+stage `read` with a different model on exit 4. Do not retry on 2 without a change: it is bad input,
+a file Lacuna cannot show it wrote (`--overwrite` replaces it), or a file another run is writing
+(`--overwrite` does not override that), each before any model call; or a file that changed while
+its run was in progress, after the call was paid, with the result kept beside it or, for a note, in
+the cache. A 0 can carry a warning on stderr: an output whose opening only looks like a failure is
+kept, and named, for you to check.
 
 ## 5. Skills that name other skills
 

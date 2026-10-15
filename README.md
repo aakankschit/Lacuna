@@ -161,8 +161,10 @@ lacuna lit read papers/*.pdf --out ~/Obsidian/MyVault/Literature/ --brief "..."
 ```
 
 Lacuna replaces a note there only if it wrote it, for that document, and you have not edited it
-since; otherwise it stops before spending anything and says which file and why (`--overwrite` goes
-ahead). See [extending.md](docs/extending.md#lacuna-replaces-only-its-own-files).
+since; otherwise it stops before spending anything and says which file and why (`--overwrite`
+replaces it anyway, but never a file another run is writing). A note you edit while it is being
+read is kept; that run has already paid, exits 2, and leaves its note in the cache. See
+[extending.md](docs/extending.md#lacuna-replaces-only-its-own-files).
 
 **File finished results into an app that is not a folder** (Heptabase, Notion, a tracker)
 
@@ -246,9 +248,10 @@ stable, so you can tell what is safe to build on.
    with the output as its last argument: the notes directory for `read`, a file for the other two.
    This is how results reach a notebook, a ticket or a channel without Lacuna knowing what those
    are. A plain folder of markdown (Obsidian, Logseq) needs no hook: point `--out` at it.
-4. **The `lacuna` command**, with stable exit codes (0 ok, 2 bad input, 3 parse failure, 4 the model
-   refused or produced nothing), so a wrapper can branch on them. Call the CLI; the Python modules
-   will be renamed.
+4. **The `lacuna` command**, with stable exit codes (0 ok, 2 refused, 3 parse failure, 4 the model
+   refused or produced nothing), so a wrapper can branch on them; see
+   [extending.md](docs/extending.md#4-the-lacuna-cli) before retrying on 2. Call the CLI; the Python
+   modules will be renamed.
 
 A worked example: the author's own chemistry project is a separate private plugin that points
 `books` at its corpus, pins `planner` to a model that does not refuse its source material, and sets
