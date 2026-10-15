@@ -66,27 +66,26 @@ Other invariants:
 
 - **Agents run with `cwd` set to the output directory**, so every path handed to one must be
   absolute. Relative paths produce an agent that can read nothing and writes an apology.
-- **Success is judged by content, not size** (`usable_output`). A model that cannot do the job
-  writes a long, fluent explanation that passes any byte threshold; an honest one may say it has
-  nothing ("PARTIAL: literature notes unreadable"). Only the **opening** is judged: the first
-  statement below any YAML frontmatter, headings and furniture (a callout tag, a quote mark, a list
-  number, a code fence, `Status:`), and the headings above it. The same words lower down are
-  findings. At the opening, two things fail the stage. One is a status word set off as the
-  document's state: `(BLOCKED)`, `— Blocked by …`, `PARTIAL:`, `INCOMPLETE:`, "Not completed.". A
-  status word inline, in code or in a name such as PARTIAL LEAST SQUARES does not count, and neither
-  does "Blocked: none". The other is the agent saying it cannot do the job ("I couldn't open any of
-  the notes", "Unfortunately, I was unable to access…", "I'm sorry, but I can't help…"). A verify
-  finding in its `claim -> what you found` form never fails it. The comments above `refusal()` and
-  `_STATUS_WORD` give the rules, and what they deliberately let through ("we", a numbered part such
-  as "Table 3", a status tag on a list item).
-- **Every agent is told to reply `INCOMPLETE: <reason>`** (reader, `synth`, `verify`) rather than
-  write a document about failing, and its reply is read: a line that opens with `INCOMPLETE` fails the
-  stage wherever it stands in the reply. Its own word wins.
+- **Success is judged by content, not size** (`usable_output`, `judge`). A model that cannot do the
+  job writes a long, fluent explanation that passes any byte threshold. **Every agent is told to reply
+  `INCOMPLETE: <reason>`** (reader, `synth`, `verify`) rather than write a document about failing, and
+  real failing models did, in capitals. So a stage fails (exit 4) only on an unambiguous declaration:
+  an UPPERCASE status word (`INCOMPLETE:`, `BLOCKED`, `PARTIAL`, `FAILED`) set off at the document's
+  **opening** (the headings above its first statement and that statement, past any frontmatter and
+  furniture) or at the start of any line of the reply, or the told `INCOMPLETE:` anywhere in a reply;
+  or the agent saying, at the opening, that it could not read or open the input **as a whole** ("I
+  couldn't open any of the notes", "As an AI, I cannot open PDF files", "The paper could not be
+  read"). A status word in a name (PARTIAL LEAST SQUARES, INCOMPLETE-DATA, `FAILED`) does not count,
+  nor does "BLOCKED: none", nor a verify finding in its `claim -> what you found` form, nor a reply
+  that is only a path. What merely looks like a failure — the word in title or lower case ("# Partial
+  3D shape matching", "- Incomplete: no baseline for proposal 5"), a caveat about a part ("I could not
+  access the Supporting Information"), an apology below the opening — is filed, exit 0, with one
+  warning on stderr naming the file. The comments above `judge()` and `_status_word` give the rules.
 - A failed stage must exit non-zero and cache nothing. A refusal must never become a note: a read
   whose note or reply declares failure files nothing, caches nothing and exits 4. A cached note is
   judged by the current check on every hit, so a note cached before the check learned a shape is read
-  again (paid) rather than served free. The check covers the shapes models have been seen to use. A
-  refusal phrased outside them is still filed, so the reply is the channel to rely on.
+  again (paid) rather than served free. A refusal phrased outside these shapes is still filed, so the
+  reply is the channel to rely on.
 - **Lacuna replaces a file in a user's directory only if it wrote it** — in the same stage, and for
   the same document (the same bytes) in the case of a note — and nobody has edited it since. The
   evidence is `.lacuna.json` beside the files (`record`, `not_ours`), never the cache: the cache

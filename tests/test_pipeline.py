@@ -787,6 +787,35 @@ class TestMoneyGuarantees(Pipeline):
         self.assertNotIn("unable to complete", read(cached), "the failed note must not stay cached")
         self.assertNotIn("unable to complete", read(self.p("elsewhere", "alpha.md")))
 
+    def test_a_doubtful_opening_is_filed_with_one_warning(self):
+        """Each stage discarded paid results whose opening only looked like a failure: a title
+        "Partial 3D …", a summary bullet "Incomplete: …", a verify line without its arrow (r2-content
+        E1, E3). They are filed, exit 0, with one warning that names the file."""
+        doubt = "the opening reads like it may not have done the job"
+        body = ("# Partial 3D Shape Matching for Virtual Screening (Kumar 2022)\n\n## Claim\nShape overlap ranks "
+                "actives first (Table 2).\n\n## Key results\n" + "Finding, 42 units (Table 2). " * 40)
+        r = self.read(mode="body", FAKE_BODY=body, FAKE_REPLY="INCOMPLETE: the text is symbol noise")
+        self.assertEqual(r.returncode, 4, "a doubt in the note does not outweigh the reader's own word")
+        r = self.read(mode="body", FAKE_BODY=body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.note(), body, "a paid note was discarded over its title")
+        self.assertEqual(len(self.cached_notes()), 1)
+        note = os.path.join(self.notes, "alpha.md")
+        self.assertIn(f"! {note}: {doubt}", r.stderr)
+        self.assertEqual(r.stderr.count(doubt), 1, "one warning per file")
+        plan = self.p("lit", "plan.md")
+        r = self.synth(plan, mode="body", FAKE_BODY="# Development plan\n\n## 1. Seam\n\n" + "Naming src/a.py. " * 60,
+                       FAKE_REPLY="Wrote it.\n\n- Incomplete: no note gives a baseline for proposal 5.")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("## 1. Seam", read(plan))
+        self.assertIn(f"! {note}: {doubt}", r.stderr, "a note that looks like a failure is still literature")
+        self.assertIn(f"! {plan}: {doubt}", r.stderr)
+        r = self.verify(plan, mode="reply", FAKE_REPLY="- `src/ghost.py` -> not found\n- Incomplete: proposal 2 "
+                                                       "cites the wrong note.")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("cites the wrong note", read(plan + ".unverified.md"))
+        self.assertIn(f"! {plan}.unverified.md: {doubt}", r.stderr)
+
     def test_a_failed_synth_files_nothing_and_leaves_the_last_plan_alone(self):
         """synth judged success by the file at --out, so over an earlier plan a refusal exited 0 and
         fired the hook; and an apology it wrote stayed there for verify and synth --digest to read."""
@@ -836,6 +865,7 @@ class TestMoneyGuarantees(Pipeline):
         for mode, reply in [("refuse", None), ("garbage", None), ("incomplete", None),
                             ("reply", "I cannot help with that request."),
                             ("reply", "INCOMPLETE: none of the files in the codebase could be opened"),
+                            ("reply", "No unverifiable claims found.\n\nINCOMPLETE: the notes directory was empty"),
                             ("reply", "I could not check any claims because the document is not in the codebase.\n"
                                       "- `runs/real/plan.md` -> not found.")]:
             with self.subTest(mode, reply=reply):

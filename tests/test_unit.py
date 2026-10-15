@@ -695,25 +695,29 @@ class TestShippedState(unittest.TestCase):
         self.assertEqual({k: tuple(map(float, v)) for k, v in mod.PRICE.items()}, shipped)
 
 
+def tier(text, reply=False):
+    """What the content check does with `text`: "fail" (exit 4, nothing filed), "warn" (filed, with a
+    warning) or None (filed)."""
+    found = L.judge(text, reply=reply)
+    return found[0] if found else None
+
+
 class TestRefusalPosition(unittest.TestCase):
-    """An apology is recognised by POSITION, not presence.
+    """An apology is recognised by POSITION and SCOPE, not presence.
 
-    Two defects, one in each direction, were shipped here. First a phrase list discarded correct
-    notes ("37 had not completed follow-up"). The fix — look only before the first heading — then
-    let an apology under `## Status` be filed as a plan, with the hook fired and exit 0.
+    Defects were shipped here in both directions, four times. A phrase list discarded correct notes
+    ("37 had not completed follow-up"); looking only before the first heading let an apology under
+    `## Status` be filed; and a grammar that failed a stage on any caveat at the opening discarded
+    45 paid results ("I could not access the Supporting Information"). Only the agent saying it
+    could not do the job as a whole fails a stage now; a caveat about a part, or an apology below
+    the opening, is kept with a warning.
     """
-
-    def setUp(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
-        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
-        import lit_pipeline
-        self.refusal = lit_pipeline.refusal
 
     def test_an_apology_is_caught_wherever_a_block_opens_with_it(self):
         for text, label in [
             ("# Development plan\n\n## Status\n\nNot completed. I could not read any of the notes.",
-             "under a heading"),
-            ("# Plan\n\n- Not completed: I could not read any of the notes.", "as a list item"),
+             "under a heading, after a short sentence"),
+            ("# Plan\n\n- Not completed: I could not read any of the notes.", "as a list item, after a label"),
             ("# Plan\n\n1. I cannot help with that request.", "as a numbered item"),
             ("I could not read any of the supplied files.\n\npadding", "bare opening"),
             ("BLOCKED - not completed.\n\nmore text", "a bare status marker"),
@@ -724,7 +728,6 @@ class TestRefusalPosition(unittest.TestCase):
              "literature claims. Every note in the directory returned a permission error.", "a self-declared partial"),
             ("INCOMPLETE: the notes directory could not be read.", "the agents' own failure line"),
             ("`INCOMPLETE: the notes could not be read`", "echoing the prompt's backticks"),
-            ("1. Incomplete: every note returned EACCES.", "numbered, title case"),
             ("> [!warning] PARTIAL: two of three notes unreadable", "in a callout"),
             ("Status: INCOMPLETE — no literature was readable", "behind a Status: label"),
             ("# Development plan — next iteration (PARTIAL / BLOCKED)\n\n## Read this first", "a real planner's title"),
@@ -737,16 +740,57 @@ class TestRefusalPosition(unittest.TestCase):
             ("# A note (x)\n\n## Claim\nI\u2019m sorry, but I can\u2019t help with summarising this paper.",
              "I'm sorry, but, curly apostrophes, under a heading with no blank line"),
             ("Unfortunately, I was not able to read the paper: every page is symbol noise.", "was not able to"),
-            ("> [!NOTE]\n> I don't have access to the notes directory.", "no access, in a callout"),
+            ("# Plan\n\nI don't have access to the notes, so no plan follows.", "no access to the whole input"),
             ("Both notes are binary garbage. I could not read either of them.", "after one short sentence"),
             ("Unfortunately,\nI could not read any of the notes.", "wrapped over two lines"),
             ("Sorry, unfortunately, I could not read any of the notes.", "two lead-ins"),
             ("No files were found at the given path.", "a verifier that resolved nothing"),
             ("I could not check any claims because the document is not in the codebase.\n- `runs/real/plan.md` -> not found.",
              "a real verifier's reply, its finding below the apology"),
+            # r2-content E6, E8: filed, exit 0.
+            ("# Development plan\n\n_INCOMPLETE: none of the notes could be read._", "underscore emphasis"),
+            ("# Development plan\n\n_I could not read any of the notes, so no proposals follow._", "an underscored apology"),
+            ("**Status:** _BLOCKED_ by unreadable notes", "an underscored marker behind a bold label"),
+            ("# Paper (n.d.)\n\n## Claim\nAs an AI, I cannot open PDF files directly.", "as an AI"),
+            ("# Development plan\n\nI don't have the ability to open these notes; they appear to be binary.",
+             "no ability to"),
+            ("# Paper (n.d.)\n\n## Claim\nThe document could not be read; it contains only symbol noise.",
+             "the whole input, as a passive subject"),
         ]:
             with self.subTest(label):
-                self.assertTrue(self.refusal(text), f"{label} must be recognised as an apology")
+                self.assertEqual(tier(text), "fail", f"{label} must fail the stage")
+
+    def test_a_doubt_is_kept_with_a_warning(self):
+        """The shapes a program cannot tell from a finding. Each was a paid result discarded (r2-content
+        E1-E3), or a failure filed in silence (E5): the user reads the warning and decides."""
+        for text, label in [
+            ("1. Incomplete: every note returned EACCES.", "a status word in title case"),
+            ("# Partial 3D Shape Matching for Virtual Screening (Kumar 2022)\n\n## Claim", "a real title, E1"),
+            ("# Gatekeepers (Zhang 2019)\n\n## Claim\nBlocked by a gatekeeper mutation, the pocket admits only "
+             "type II inhibitors (Fig. 3).", "a real claim, E1"),
+            ("# Development plan\n\nScope note. I could not access the GitHub repository cited in batch_effects.md, "
+             "so proposal 4's baseline is the note's own figure.", "a caveat about a part, E2"),
+            ("# Weighted cycle closure (Li 2023)\n\n> **Note:** I could not access the Supporting Information, so "
+             "Table S1-S4 values are not included.\n\n## Claim", "the Supporting Information, E2"),
+            ("> [!NOTE]\n> I don't have access to the notes directory.", "a directory of the input"),
+            ("# A note (x)\n\n## Claim\nI could not read Table 3 (the scan is blurred); the rest shows X improves Y "
+             "by 12% (Section 4).", "a numbered part"),
+            ("# A note (Vaswani 2017)\n\n## Claim\nUnable to process long sequences in parallel, recurrent models are "
+             "slow to train (Section 1).", "an inability with no subject, about no input"),
+            ("# Digest\n\nThe three papers agree that warm starts cut sampler burn-in by about 40% on the benchmarks "
+             "they share (Table 2). I could not read the supplementary tables, so per-benchmark figures are omitted.",
+             "a caveat after a long first sentence of content"),
+            ("# Plan\n\n- **BLOCKED** until the CUDA build lands: port the scorer", "a status tag on a proposal"),
+            ("# Plan\n\n- BLOCKED by unreadable notes: no proposals can be made.", "the same shape, failing"),
+            ("# Plan\n\nThree proposals follow.\n\n- INCOMPLETE: data for site B (Table 3)", "a marker below the opening"),
+            ("# Plan\n\nThree proposals follow.\n- INCOMPLETE: data for site B (Table 3)", "on the next list item"),
+            ("# Development plan\n\n**Objective:** What should we build next?\n\n## Status\n\nI could not read any of "
+             "the notes, so no proposals follow.", "an apology below the opening, E5"),
+            ("# Paper (n.d.)\n\n## Claim\nI'm sorry, but the provided file appears to contain only garbled symbols.",
+             "an apology about nothing it could not do"),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(tier(text), "warn", f"{label} is kept, with a warning")
 
     def test_the_same_words_inside_a_sentence_are_findings(self):
         for text, label in [
@@ -758,30 +802,21 @@ class TestRefusalPosition(unittest.TestCase):
             ("# PARTIAL LEAST SQUARES for batch correction\n\n## 1. Replace PCA", "a title in capitals"),
             ("# Digest\n\n## Partial results\n\nTwo of three trials were incomplete: see Table 2.", "partial as a word"),
             ('- PARTIAL: "54-69/100" -> the note gives 54-69 for ROCS only', "a verify finding graded PARTIAL"),
-            ("# Plan\n\nThree proposals follow.\n\n- INCOMPLETE: data for site B (Table 3)", "a marker below the opening"),
-            ("# Plan\n\n- **BLOCKED** until the CUDA build lands: port the scorer", "a status tag on a proposal"),
             ("# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim", "a hyphenated title"),
             ("# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA", "a bracketed title"),
             ("# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim", "a title in capitals"),
             # VERDICT3 N10a: findings that open with the words, each discarded after it was paid for.
             ("# A note (Lee 2025)\n\n## Claim\n\nNot completed follow-up in 37 of 412 patients biased the estimate.",
              "a Claim opening 'Not completed follow-up'"),
-            ("# A note (Lee 2025)\n\n## Claim\nNot completed follow-up in 37 of 412 patients biased the estimate.",
-             "the same, with no blank line under the heading"),
+            ("# A note (Lee 2025)\n\n## Claim\nNot completed: follow-up for 37 of 412 patients, which biases the "
+             "hazard ratio upward (Table 2).", "'Not completed:' as a finding's label"),
             ("No files were found matching `src/ghost.py` -> the repo has src/a.py only", "a verify finding"),
             ("I could not verify the following claims:\n\n- `0.83` -> not in any note", "a verify report's first line"),
-            ("# A note (x)\n\n## Claim\nI could not read Table 3 (the scan is blurred); the rest shows X improves Y "
-             "by 12% (Section 4).", "a caveat about a numbered part"),
             ("# A note (Lee 2025)\n\n## Claim\n\nWe could not complete follow-up for 37 of 412 patients, which biases "
              "the estimate (Table 2).", "the paper's authors, as 'we'"),
-            ("# A note (Vaswani 2017)\n\n## Claim\nUnable to process long sequences in parallel, recurrent models are "
-             "slow to train (Section 1).", "a participial phrase with no subject"),
-            ("# Digest\n\nThe three papers agree that warm starts cut sampler burn-in by about 40% on the benchmarks "
-             "they share (Table 2). I could not read the supplementary tables, so per-benchmark figures are omitted.",
-             "a caveat after a long first sentence of content"),
         ]:
             with self.subTest(label):
-                self.assertIsNone(self.refusal(text), f"{label} must not be discarded")
+                self.assertIsNone(tier(text), f"{label} must be filed without a word")
 
 
 class TestFixesThatSurvivedTheirOwnRevert(unittest.TestCase):
@@ -1126,23 +1161,20 @@ class TestCacheWritesAreAtomic(unittest.TestCase):
 
 
 class TestStatusMarkerEdges(unittest.TestCase):
-    """This check has swung between false positives and false negatives three times. Both
-    directions are pinned here so the next narrowing cannot pass silently."""
+    """This check has swung between false positives and false negatives four times. All three
+    outcomes are pinned here so the next narrowing or widening cannot pass silently."""
 
-    def setUp(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
-        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
-        import lit_pipeline
-        self.declared = lit_pipeline.declared_failure
-
-    # The rows are the 0.3.1 fix review's table (F = must fail, P = must pass; the ids are its own),
+    # The rows are the 0.3.1 fix review's table (F = a failure, P = a result; the ids are its own),
     # each a shape a real model could write. Each is judged as the opening of a plan and as a reply.
     BODY = "\n\n## 1. A real proposal\n\n" + "Substantive plan content naming src/widget/sampler.py. " * 60
 
     def judged(self, text):
-        return L.refusal((text + self.BODY)[:1200]), L.reply_failure(text)
+        return tier((text + self.BODY)[:1200]), tier(text, reply=True)
 
     def test_a_status_word_set_off_in_the_opening_is_a_failure(self):
+        """In capitals it fails the stage: the protocol word agents are told to use, and what failing
+        models wrote. In any other case it is as often a title or a finding, so it is a doubt; F10,
+        F11, F12, F40, F46, F54 and F59 failed the stage until the user chose this (r2-content E1)."""
         for text, cid in [
             ('# Development plan (BLOCKED)', 'F01'),
             ('# Development plan — BLOCKED', 'F02'),
@@ -1153,9 +1185,6 @@ class TestStatusMarkerEdges(unittest.TestCase):
             ('# Development plan (PARTIAL)', 'F07'),
             ('# Development plan — PARTIAL', 'F08'),
             ('Status: INCOMPLETE', 'F09'),
-            ('# Development plan (Blocked)', 'F10'),
-            ('# Development plan (blocked)', 'F11'),
-            ('# Development plan — Blocked', 'F12'),
             ('# Development plan – BLOCKED', 'F13'),
             ('# Development plan - BLOCKED', 'F14'),
             ('# Development plan (BLOCKED).', 'F15'),
@@ -1183,13 +1212,11 @@ class TestStatusMarkerEdges(unittest.TestCase):
             ('# Development plan — BLOCKED: none of the notes could be read', 'F37'),
             ('# Development plan (FAILED)', 'F38'),
             ('FAILED: the notes could not be read', 'F39'),
-            ('Status: Blocked — the notes are binary', 'F40'),
             ('**Status:** BLOCKED by unreadable notes', 'F41'),
             ('# Development plan (BLOCKED; notes unreadable)', 'F42'),
             ('# Development plan (BLOCKED / PARTIAL)', 'F43'),
             ('# Development plan — Status: BLOCKED', 'F44'),
             ('> [!WARNING] BLOCKED', 'F45'),
-            ('# Development plan (status: blocked)', 'F46'),
             ('# BLOCKED Development plan', 'F47'),
             ('# Development plan (INCOMPLETE — notes unreadable)', 'F48'),
             ('# Development plan (PARTIAL - 2 of 5 notes readable)', 'F49'),
@@ -1197,21 +1224,30 @@ class TestStatusMarkerEdges(unittest.TestCase):
             ('# Development plan (PARTIAL 2/5 notes)', 'F51'),
             ('# Development plan (BLOCKED pending readable notes)', 'F52'),
             ('# Development plan — BLOCKED until the notes are re-read', 'F53'),
-            ('# Development Plan: Blocked — Notes Unreadable', 'F54'),
             ('# DEVELOPMENT PLAN (BLOCKED)', 'F55'),
             ('# DEVELOPMENT PLAN — BLOCKED BY UNREADABLE NOTES', 'F56'),
             ('# Development plan (PARTIAL / BLOCKED)', 'F57'),
             ('INCOMPLETE: 0 of 12 claims could be checked; the repository is empty', 'F58'),
-            ('# Development plan: Incomplete', 'F59'),
             ('# Development plan — BLOCKED (notes unreadable)', 'F60'),
             ('## BLOCKED', 'F61'),
             ('Development plan — BLOCKED', 'F62'),
         ]:
             with self.subTest(cid, text=text[:50]):
-                doc, reply = self.judged(text)
-                self.assertTrue(doc and reply, f"{cid} {text!r}: document {doc!r}, reply {reply!r}")
-        self.assertEqual(self.declared("**Partial**: the notes were unreadable"), "PARTIAL", "the word, normalised")
-        self.assertEqual(self.declared("# Development plan (FAILED)"), "FAILED")
+                self.assertEqual(self.judged(text), ("fail", "fail"), f"{cid} {text!r}")
+        for text, cid in [
+            ('# Development plan (Blocked)', 'F10'),
+            ('# Development plan (blocked)', 'F11'),
+            ('# Development plan — Blocked', 'F12'),
+            ('Status: Blocked — the notes are binary', 'F40'),
+            ('# Development plan (status: blocked)', 'F46'),
+            ('# Development Plan: Blocked — Notes Unreadable', 'F54'),
+            ('# Development plan: Incomplete', 'F59'),
+            ('**Partial**: the notes were unreadable', 'bold, title case'),
+            ('# Partial 3q tetrasomy: a case series (Ito 2021)', 'a real title, E1'),
+            ('# Failed by Default: Why RBFE Networks Miss Scaffold Hops (Lee 2024)', 'a real title, E1'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), ("warn", "warn"), f"{cid} {text!r}")
 
     def test_a_status_reporting_none_is_a_clean_result(self):
         """"none" must be the whole value: "INCOMPLETE: none of the files could be opened" is a reason."""
@@ -1239,22 +1275,37 @@ class TestStatusMarkerEdges(unittest.TestCase):
             with self.subTest(cid, text=text[:50]):
                 self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
 
-    def test_a_reply_is_searched_for_the_word_it_was_told_to_use(self):
+    def test_a_reply_is_judged_on_every_line(self):
         """Every agent is told to reply INCOMPLETE when it could not read its sources. A real planner
-        put it on line 3, under two lines of prose, and only the first line was read (VERDICT3 N6)."""
-        reply_failure = L.reply_failure
+        put it on line 3, under two lines of prose, and only the first line was read (VERDICT3 N6). A
+        reply is all opening: a marker in capitals at the start of any line fails, and the told word
+        anywhere. "Wrote the plan.\\nBLOCKED: …" was filed until the user chose this rule. A reply that
+        is only a path is not prose: a data directory under …/Failed/ failed every read (E4)."""
         for text in ("Both literature notes are binary garbage -\nno text survives.\nINCOMPLETE: notes unreadable",
                      "/x/plan.md.partial\n\n`INCOMPLETE: two notes are empty`",
-                     "Done. I could not open any of the notes, so the plan rests on the repo alone."):
-            with self.subTest(text[:40]):
-                self.assertTrue(reply_failure(text), text)
-        for text in ("/x/notes/a.md",
-                     "Wrote /x/notes/a.md.\n\nPages 3-12 were garbled; the note says which numbers are missing.",
+                     "Done. I could not open any of the notes, so the plan rests on the repo alone.",
                      "Wrote the plan.\nBLOCKED: proposal 3 waits for the CUDA build.",
-                     "Wrote it.\nINCOMPLETE-data methods are covered in proposal 2.",
-                     "- `src/a.py` -> exists\n- INCOMPLETE: data for site B -> the note has it (Table 3)"):
+                     "`INCOMPLETE`: the paper text is symbol noise",
+                     "The extracted text is symbol noise. INCOMPLETE: no sentence survives.",
+                     "Reply: `INCOMPLETE: the paper text is unreadable`"):
             with self.subTest(text[:40]):
-                self.assertIsNone(reply_failure(text), text)
+                self.assertEqual(tier(text, reply=True), "fail", text)
+        for text in ("Wrote /x/plan.md.partial.\n\nSummary:\n- 6 proposals, most valuable first\n- Incomplete: no "
+                     "note gives a baseline for proposal 5, so its test compares against the current sampler.",
+                     "incomplete: the paper text is symbol noise",
+                     "Wrote /x/0.md. I couldn't access the supplementary material, so SI tables are omitted.",
+                     "- `src/ghost.py` -> not found\n- Incomplete: proposal 2 cites the wrong note."):
+            with self.subTest(text[:40]):
+                self.assertEqual(tier(text, reply=True), "warn", text)
+        for text in ("/x/notes/a.md", "/Users/me/Failed/lacuna-data/cache/drafts/read-abc/0.md",
+                     "`/Users/me/BLOCKED/repo/lit/plan.md.partial`",
+                     "Wrote /x/notes/a.md.\n\nPages 3-12 were garbled; the note says which numbers are missing.",
+                     "Wrote it.\nINCOMPLETE-data methods are covered in proposal 2.",
+                     "- `src/a.py` -> exists\n- INCOMPLETE: data for site B -> the note has it (Table 3)",
+                     "I checked 14 claims; 2 failed:\n\n- `src/ghost.py` -> not found",
+                     "No unverifiable claims found."):
+            with self.subTest(text[:40]):
+                self.assertIsNone(tier(text, reply=True), text)
 
     def test_a_status_word_in_a_name_is_not_a_failure(self):
         """Real titles: a technique, a finding, a code constant. Discarding them is the false positive

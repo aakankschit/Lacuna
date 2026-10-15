@@ -43,7 +43,7 @@ MUTATIONS = [
     ("read infers success from a pre-existing file", "scripts/lit/lit_pipeline.py",
      "        if os.path.exists(out):\n            os.remove(out)\n", ""),
     ("a long apology counts as output", "scripts/lit/lit_pipeline.py",
-     "    hit = refusal(head)\n", "    hit = None\n"),
+     "(judge(head), judge(reply", "(None, judge(reply"),
 
     # --- the extension seam ---
     ("after.* runs without a shell", "scripts/lit/lit_pipeline.py",
