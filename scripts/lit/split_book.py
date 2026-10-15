@@ -167,8 +167,13 @@ def main():
         elif unreadable(text):          # long, and still nothing a grep can match
             print(f"  ! {title!r} (pp. {start}-{end}): {unreadable(text)}", file=sys.stderr)
         rows.append({"file": fn, "title": title, "pages": [start, end], "chars": len(text), "tok": round(len(text) / 2.9)})
-    for fn in stale - {r["file"] for r in rows}:
-        os.remove(os.path.join(outdir, fn))
+    # By file, not by name: on a case-insensitive disk "00_Introduction.txt" and "00_INTRODUCTION.txt"
+    # are one file, and a re-split with a case-only title change deleted every chapter it had written.
+    written = [os.path.join(outdir, r["file"]) for r in rows]
+    for fn in stale:
+        old = os.path.join(outdir, fn)
+        if not any(os.path.samefile(old, w) for w in written if os.path.exists(w)):
+            os.remove(old)
     widest = max(r["pages"][1] - r["pages"][0] + 1 for r in rows)
     if widest > COARSE * doc.page_count:
         print(f"  ! the largest chapter covers {widest} of {doc.page_count} pages — check that toc.md "
