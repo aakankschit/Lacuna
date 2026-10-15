@@ -83,20 +83,53 @@ def main():
         say(WARN, "rich not installed",
             "the results pane falls back to plain text, which works fine\n"
             f"         fix (optional): {sys.executable} -m pip install rich")
+    # prices() and price_meta() read pricing.json, and a file they cannot use lands in CONFIG_ERRORS
+    # only when read, so read before reporting. Each read records it, hence the de-duplication.
+    print("\nsettings")
     meta = lacuna_config.price_meta()
-    say(OK, f"price table retrieved {meta['retrieved']}" + (" (overridden locally)" if meta["overridden"] else ""),
-        "list prices, not your bill — see docs/LIMITS.md")
+    lacuna_config.prices()
+    errors = list(dict.fromkeys(lacuna_config.CONFIG_ERRORS))
+    # A file lacuna could not use is a problem, not an [ok]: doctor once printed [ok] beside a
+    # config.json, pricing.json and calibration.json that were all being ignored.
+    user_cal, stale_cal = os.path.join(lacuna_config.DATA, "calibration.json"), False
+    if os.path.isfile(user_cal):
+        try:
+            with open(user_cal) as f:
+                cal = json.load(f)
+            if not isinstance(cal, dict):
+                raise ValueError("the top level is not an object")
+            stale_cal = cal.get("_source") == "upstream"     # lit_cost ignores such a copy
+        except (OSError, ValueError) as e:
+            errors.append(f"{user_cal}: unusable ({e}). `lit estimate` falls back to the shipped calibration.")
+    broken = lambda name: any(name in e for e in errors)
+    # A whole file lacuna ignores is a problem; one setting that fell back to its default is a note
+    # ("lacuna config" shows the value in effect). A mistyped model name once blocked everything.
+    whole_file = ("not valid JSON", "cannot read", "Ignoring the file", "Using the shipped prices", "unusable")
+    for e in errors:
+        if any(w in e for w in whole_file):
+            say(BAD, "unusable settings file", e)
+        else:
+            say(WARN, "a setting was not used as written", e)
+    if not broken("pricing.json"):
+        say(OK, f"price table retrieved {meta['retrieved']}" + (" (overridden locally)" if meta["overridden"] else ""),
+            "list prices, not your bill — see docs/LIMITS.md")
 
     print("\ndata directory")
-    for name in ("", "cache", "books"):
-        d = os.path.join(lacuna_config.DATA, name) if name else lacuna_config.DATA
+    # exactly the directories the rest of lacuna resolves, config overrides and all
+    dirs = (lacuna_config.DATA, lacuna_config.path("cache"), lacuna_config.path("books"))
+    for d in dict.fromkeys(dirs):
         existed = os.path.isdir(d)
-        os.makedirs(d, exist_ok=True)
-        say(OK, f"{d or lacuna_config.DATA}" + ("" if existed else "   (created)"))
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:         # LACUNA_DATA pointing at a regular file was a traceback
+            say(BAD, f"{d}", f"cannot create it ({e.strerror or e}); set LACUNA_DATA or paths in config.json to a directory you can write")
+            continue
+        say(OK, f"{d}" + ("" if existed else "   (created)"))
     cfg_path = os.path.join(lacuna_config.DATA, "config.json")
     if os.path.exists(cfg_path):
-        say(OK, f"{cfg_path}", "yours; left untouched")
-    else:
+        if not broken("config.json"):
+            say(OK, f"{cfg_path}", "yours; left untouched")
+    elif os.path.isdir(lacuna_config.DATA):
         # Deliberately almost empty. Writing every default here would freeze them: a later release
         # that improves a default would never reach anyone who had ever run `doctor`, and
         # `lacuna config` would report every value as an override the user never made.
@@ -104,14 +137,14 @@ def main():
             json.dump(CONFIG_TEMPLATE, f, indent=2)
         say(OK, f"{cfg_path}   (created empty — defaults are not copied in, so later "
                 f"improvements still reach you)")
-    cal_src = os.path.join(lacuna_config.ROOT, "scripts", "lit", "calibration.json")
-    cal_dst = os.path.join(lacuna_config.DATA, "calibration.json")
-    if not os.path.exists(cal_dst) and os.path.exists(cal_src):
-        shutil.copy(cal_src, cal_dst)
-        say(OK, f"{cal_dst}   (copied from the shipped calibration)",
-            "estimates come from someone else's runs until you have your own; `lacuna lit estimate` says which it used")
-    elif os.path.exists(cal_dst):
-        say(OK, f"{cal_dst}")
+    # The shipped calibration is read from the plugin directory and is NOT copied here: a copy in
+    # the data directory beats every later shipped calibration forever, and `lit estimate` would
+    # keep quoting the old runs. Only a calibration you made yourself belongs in this directory.
+    if stale_cal:
+        say(WARN, f"{user_cal}", "a stale copy of the shipped calibration (an older doctor wrote it); "
+                                 "`lit estimate` ignores it and uses the plugin's. You can delete it.")
+    elif os.path.isfile(user_cal) and not broken(user_cal):
+        say(OK, f"{user_cal}", "yours; left untouched")
 
     print("\nPDF parsers (only needed to read PDFs; markdown and text input work without them)")
     for key, e in EXTRAS.items():

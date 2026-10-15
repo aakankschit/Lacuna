@@ -8,10 +8,11 @@ prove that bad input exits *before* money is spent and that a cache hit really i
 
 No test here calls a model: see support.Sandbox. Run: python3 -m unittest discover -s tests
 """
-import json, os, shutil, signal, subprocess, sys, time, unittest
+import json, os, re, shutil, signal, subprocess, sys, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from support import FAKE_PARSER_PY, LACUNA, ROOT, Sandbox, ls, read, write
+import lit_pipeline as L
 
 
 class Pipeline(Sandbox):
@@ -138,13 +139,15 @@ class TestNoteCache(Pipeline):
         self.assertEqual(len(self.calls()), 5, "a new reader effort")
         os.remove(os.path.join(self.data, "config.json"))
         write(self.alpha, read(self.alpha) + "\nOne more finding.\n")
-        self.assertEqual(self.read().returncode, 0)
+        # A changed document may be another one saved under the same name, so replacing its note
+        # takes --overwrite (TestOwnership); what is asked here is only whether it misses the cache.
+        self.assertEqual(self.read("--overwrite").returncode, 0)
         self.assertEqual(len(self.calls()), 6, "a changed document")
         models = [c["argv"][c["argv"].index("--model") + 1] for c in self.calls()]
         self.assertEqual(models, ["haiku", "haiku", "sonnet", "haiku", "haiku", "haiku"], "--model reaches that run only")
 
         write(self.alpha, read(self.alpha).replace("\nOne more finding.\n", ""))
-        r = self.read("--brief", "BRIEF:other")           # back to step 3's inputs
+        r = self.read("--brief", "BRIEF:other", "--overwrite")      # back to step 3's inputs
         self.assertIn("cached (free)", r.stdout)
         self.assertEqual(len(self.calls()), 6, "unchanged inputs must not call the model again")
         self.assertIn("BRIEF:other", self.note(), "a hit must restore the cached note over whatever --out held")
@@ -153,17 +156,39 @@ class TestNoteCache(Pipeline):
         self.assertEqual(len(self.calls()), 6)
         self.assertEqual(read(os.path.join(other, "alpha.md")), self.note(), "a hit reaches a new --out directory")
 
+    def test_a_cache_entry_is_whole_or_absent(self):
+        """An interrupted copy into the cache left a truncated note, served as a free hit from then
+        on. A copy that fails partway now leaves no entry; the note itself is paid for and placed."""
+        torn = ("import os, shutil\n_copy = shutil.copyfile\n"
+                "def torn(a, b, **k):\n"
+                "    _copy(a, b, **k)\n"
+                "    if os.sep + 'cache' + os.sep in b:\n"
+                "        d = open(b).read(); open(b, 'w').write(d[:500]); raise OSError('interrupted')\n"
+                "shutil.copyfile = torn\n")
+        r = self.read(prelude=torn)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("could not cache the note", r.stderr)
+        r = self.read()
+        self.assertNotIn("cached (free)", r.stdout, "a torn cache entry was served as a free hit")
+        self.assertEqual(len(self.calls()), 2)
+
     def test_one_note_per_document_and_only_over_its_own_notes(self):
         """Note names were taken from the parse-cache file name with any 12-hex "hash" stripped, so
         notes_3f2a9c1b7d4e.md and notes.md shared one note path, and the parallel readers cached
         one paper's note under the other's key. A document passed twice was paid for twice."""
         hexy = write(os.path.join(self.docs, "notes_3f2a9c1b7d4e.md"), read(self.alpha))
         plain = write(os.path.join(self.docs, "notes.md"), read(self.alpha) + "\nAnother paper.\n")
+        # A long name that fits is a name: its cache entry once failed on a temporary name 11 bytes
+        # longer than itself, or on its own 16-byte hash suffix, after the reader had been paid.
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        fits = write(os.path.join(self.docs, "f" * (nm - 16) + ".md"), read(self.alpha) + "\nA third.\n")
+        cut = write(os.path.join(self.docs, "c" * (nm - 8) + ".md"), read(self.alpha) + "\nA fourth.\n")
         for attempt in ("first read", "cache hit"):
-            r = self.lacuna("lit", "read", hexy, plain, self.alpha, self.alpha, "--out", self.notes)
+            r = self.lacuna("lit", "read", hexy, plain, self.alpha, self.alpha, fits, cut, "--out", self.notes)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(len(self.calls()), 3, f"{attempt}: one call per distinct document, none on a hit")
-            self.assertEqual(ls(self.notes), ["alpha.md", "notes.md", "notes_3f2a9c1b7d4e.md"])
+            self.assertEqual(len(self.calls()), 5, f"{attempt}: one call per distinct document, none on a hit")
+            self.assertEqual(ls(self.notes), sorted(["alpha.md", "notes.md", "notes_3f2a9c1b7d4e.md",
+                                                     os.path.basename(fits), os.path.basename(cut)]))
             for name in ls(self.notes):
                 self.assertIn(f"# A note ({name})", self.note(name), f"{attempt}: {name} holds another paper's note")
 
@@ -176,6 +201,9 @@ class TestNoteCache(Pipeline):
         self.assertEqual(read_().returncode, 0)
         self.assertIn("NO-BOOKS", self.note())
         self.assertFalse(self.ledger()[-1]["books"], "the ledger records the books offered, not the flag")
+        # Books are optional: with none, the template must not ask for look-ups, or every note fills
+        # with "Not found in the supplied sources" lines that read as claims about the paper.
+        self.assertNotIn("Concepts looked up", self.calls()[-1]["prompt"])
         toc = os.path.join(books, "handbook", "toc.md")
         write(toc, "# Handbook\n\n| chapter | file | pages | ~tokens |\n|---|---|---|---|\n| Priors | 00_priors.txt | 1-20 | 5,000 |\n")
         r = read_()
@@ -184,6 +212,7 @@ class TestNoteCache(Pipeline):
         self.assertIn("BOOKS-OFFERED", self.note())
         self.assertTrue(self.ledger()[-1]["books"])
         self.assertIn(toc, self.calls()[-1]["prompt"], "the reader is told where the index is")
+        self.assertIn("Concepts looked up", self.calls()[-1]["prompt"], "with books, the look-up section is asked for")
         r = read_("--no-books")
         self.assertEqual(len(self.calls()), 2, "--no-books produces the first prompt again, so the first note is served")
         self.assertIn("NO-BOOKS", self.note())
@@ -280,6 +309,47 @@ class TestOwnership(Pipeline):
         self.assertEqual(r.returncode, 2, r.stderr[-300:])
         self.assertIn(".lacuna.json could not be read", r.stderr)
 
+    def test_what_is_cached_is_what_this_runs_agent_wrote(self):
+        """The reader wrote the note path, and whatever was there when it returned was judged and
+        cached: an earlier note after a refusal, another run's note, an edit made meanwhile. It
+        writes a draft of its own now; the note is replaced only by that draft, and only if nobody
+        changed it during the run."""
+        note = os.path.join(self.notes, "alpha.md")
+        self.assertEqual(self.read("--brief", "BRIEF:one").returncode, 0)
+        first = self.note()
+        r = self.read("--brief", "BRIEF:two", FAKE_EDIT=note)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"KEPT — {note} changed while this run was in progress", r.stdout)
+        self.assertEqual(self.note(), first + "EDITED WHILE THE MODEL RAN\n", "an edit made during the run was lost")
+        r = self.read("--brief", "BRIEF:two", "--overwrite")
+        self.assertIn("cached (free)", r.stdout, "the note this run paid for was not kept")
+        self.assertIn("BRIEF:two", self.note())
+        self.assertNotIn("EDITED", self.note(), "the cache took what was at the note path, not what the agent wrote")
+        edited = self.note() + "EDITED WHILE THE MODEL RAN\n"
+        r = self.read("--brief", "BRIEF:three", mode="refuse", FAKE_EDIT=note)
+        self.assertEqual(r.returncode, 4)
+        self.assertEqual(self.note(), edited, "a failed run moved or deleted a note it did not write (E11)")
+        self.assertEqual(ls(self.notes), ["alpha.md"])
+        self.assertIn("changed during the run and was left as it is", r.stdout)
+
+    def test_each_note_is_recorded_when_it_is_written(self):
+        """A run where one document is refused exits 4 and never reaches the after.read hook. The
+        notes it did write, read or served from the cache, must be recorded all the same: otherwise
+        deleting the cache made the next read refuse them as not Lacuna's."""
+        beta = os.path.join(self.docs, "beta.md")
+        self.assertEqual(self.lacuna("lit", "read", self.alpha, "--out", self.p("first")).returncode, 0)
+        for label in ("read by the model", "served from the cache"):
+            with self.subTest(label):
+                out = self.p(label.split()[0])
+                if label == "read by the model":
+                    shutil.rmtree(os.path.join(self.data, "cache"))
+                r = self.lacuna("lit", "read", self.alpha, beta, "--out", out, FAKE_REFUSE_IF="beta.md")
+                self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+                self.assertIn("cached (free)" if label != "read by the model" else "1/2 notes written", r.stdout)
+                shutil.rmtree(os.path.join(self.data, "cache"))
+                r = self.lacuna("lit", "read", self.alpha, "--out", out)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_a_document_inside_out_under_another_spelling_survives_overwrite(self):
         """macOS folds case and Unicode form: Paper.MD inside --out is the note path Paper.md. The
         self-check compared realpaths, which differ, so --overwrite deleted the document and the
@@ -318,11 +388,207 @@ class TestOwnership(Pipeline):
         self.assertEqual(read(mine), "mine\n", "the file list was written through a symlink")
         r = self.synth(self.p("vault", "other.md"), mode="clobber")
         self.assertEqual(r.returncode, 4)
-        self.assertFalse(os.path.exists(self.p("vault", "other.md")), "the model's failed output was left for the next command")
-        self.assertTrue(os.path.exists(self.p("vault", "other.md.rejected")),
-                        "moved aside, never deleted: --out may have changed because the user edited it")
-        self.assertIn("wrote", r.stderr)
+        self.assertIn("changed during this run", r.stderr, "say that --out is not a checked plan")
         self.assertNotIn("earlier run's output", r.stderr, "the file held this run's output, not an earlier one")
+        self.assertTrue(os.path.exists(self.p("vault", "other.md")),
+                        "never moved or deleted: --out may have changed because the user edited it")
+        self.assertEqual(self.synth(self.p("vault", "other.md")).returncode, 2, "and the next run asks before using it")
+
+    def test_a_file_is_replaced_only_by_the_stage_and_document_that_wrote_it(self):
+        """Same path is not same document: a new download saved as fulltext.md over the last one is
+        another paper, and its note silently replaced the first paper's. Nor is a note a plan: a
+        paper named plan.md replaced the plan synth had recorded beside it, because a plan's record
+        names no document to compare. Records written before the stage was recorded must hold."""
+        lit = self.p("lit")
+        note = os.path.join(lit, "fulltext.md")
+        paper = write(self.p("downloads", "fulltext.md"), "# Paper A about kinases\n\n" + "A. " * 300)
+        read_ = lambda doc, *extra: self.lacuna("lit", "read", doc, "--out", lit, *extra)
+        self.assertEqual(read_(paper).returncode, 0)
+        first = read(note)
+        write(paper, "# Paper B about glaciers\n\n" + "B. " * 300)
+        calls = len(self.calls())
+        r = read_(paper)
+        self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stderr)
+        self.assertIn(f"{note} is the note for {paper}, which has changed since that note was written", r.stderr)
+        self.assertIn("--overwrite", r.stderr)
+        self.assertEqual(read(note), first, "the first paper's note was replaced by the second's")
+        self.assertEqual(read_(paper, "--overwrite").returncode, 0, "--overwrite is the way forward")
+        self.assertIn("Paper B", read(note))
+        copy = write(self.p("copy.md"), read(note))       # a link is the user's, even to the same bytes
+        os.remove(note)
+        os.symlink(copy, note)
+        calls = len(self.calls())
+        self.assertEqual((read_(paper).returncode, len(self.calls())), (2, calls))
+        os.remove(note)
+        write(note, read(copy))
+
+        self.assertEqual(self.read().returncode, 0)               # notes for synth to read
+        plan, x = os.path.join(lit, "plan.md"), write(os.path.join(lit, "x.md"), "# X\n" + "x " * 300)
+        y = write(os.path.join(lit, "y.md"), "# Y\n" + "y " * 300)
+        self.assertEqual(self.synth(plan).returncode, 0)
+        self.assertEqual(self.verify(plan).returncode, 0)
+        self.assertEqual(self.synth(x + ".unverified.md").returncode, 0)
+        self.assertEqual(read_(write(self.p("papers", "y.md.unverified.md"), "# Y paper\n" + "w " * 300)).returncode, 0)
+        named_like = [write(self.p("papers", n), f"# A paper called {n}\n" + "z " * 300)
+                      for n in ("plan.md", "plan.md.unverified.md")]
+        clashes = [
+            ("a note over a plan", ("lit", "read", named_like[0], "--out", lit), plan),
+            ("a note over a verify report", ("lit", "read", named_like[1], "--out", lit), plan + ".unverified.md"),
+            ("a plan over a note", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out", note), note),
+            ("a report over a plan", ("lit", "verify", "--target", x, "--repo", self.repo), x + ".unverified.md"),
+            ("a report over a note", ("lit", "verify", "--target", y, "--repo", self.repo), y + ".unverified.md"),
+        ]
+        same = [("read", (paper,)), ("synth", (plan,)), ("verify", (plan,))]
+        record = os.path.join(lit, ".lacuna.json")
+        for version in ("0.3.2", "0.3.1, which did not record the stage"):
+            if version != "0.3.2":
+                entries = json.loads(read(record))
+                for e in entries["files"].values():
+                    del e["stage"]
+                write(record, json.dumps(entries))
+            for label, argv, kept in clashes:
+                with self.subTest(version=version, clash=label):
+                    before, calls = read(kept), len(self.calls())
+                    r = self.lacuna(*argv)
+                    self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stdout + r.stderr)
+                    self.assertIn(" written by `lacuna lit ", r.stderr)
+                    self.assertEqual(read(kept), before)
+            for stage, args in same:
+                with self.subTest(version=version, same_stage=stage):
+                    r = {"read": lambda: read_(*args), "synth": lambda: self.synth(*args),
+                         "verify": lambda: self.verify(*args)}[stage]()
+                    self.assertEqual(r.returncode, 0, f"its own {stage} output is Lacuna's to replace: {r.stderr}")
+
+    def test_what_an_after_hook_does_to_this_runs_output_is_still_lacunas(self):
+        """A hook that prepends frontmatter, as extending.md suggests, made every later run refuse the
+        note as edited, so what it does to this run's output is re-recorded (B10). Only to this run's
+        output: every file that changed while the hook ran was once re-recorded, and a user's edit to
+        another note during a slow hook became Lacuna's, to be replaced by the next read (F1). A hook
+        that changes other files makes them the user's; the next run asks."""
+        hook = write(self.p("every.py"), "import os, sys\n"
+                     "d = sys.argv[-1] if os.path.isdir(sys.argv[-1]) else os.path.dirname(sys.argv[-1])\n"
+                     "for f in sorted(os.listdir(d)):\n"
+                     "    if f.endswith('.md'):\n"
+                     "        p = os.path.join(d, f)\n"
+                     "        t = open(p).read()\n"
+                     "        open(p, 'w').write('---\\ntags: [lit]\\n---\\n' + t)\n")
+        self.config({"after": {stage: [sys.executable, hook] for stage in ("read", "synth", "verify")}})
+        beta = os.path.join(self.docs, "beta.md")
+        self.assertEqual(self.read().returncode, 0)
+        self.assertEqual(self.read().returncode, 0, "a note its own run's hook changed was refused as edited")
+        self.assertEqual(self.lacuna("lit", "read", beta, "--out", self.notes).returncode, 0)
+        calls = len(self.calls())
+        r = self.read()
+        self.assertEqual((r.returncode, len(self.calls())), (2, calls), "beta's hook changed alpha, and it was adopted")
+        self.assertIn("has been edited since", r.stderr)
+        self.assertEqual(self.read("--overwrite").returncode, 0)
+        self.assertEqual(self.note("beta.md").count("tags: [lit]"), 2, "each run's hook edited every note")
+        r = self.lacuna("lit", "read", beta, "--out", self.notes)
+        self.assertEqual(r.returncode, 2, "a change alpha's hook made to beta became Lacuna's")
+
+        # A note restored from a backup is exactly that document's cached note: adopted, not refused.
+        cache = os.path.join(self.data, "cache", "notes")
+        (cached,) = [f for f in os.listdir(cache) if f.startswith("alpha_")]
+        shutil.copy(os.path.join(cache, cached), os.path.join(self.notes, "alpha.md"))
+        r = self.read()
+        self.assertEqual(r.returncode, 0, f"the note restored from its cached copy was refused:\n{r.stderr}")
+        self.assertIn("cached (free)", r.stdout)
+
+        lit = self.p("lit")
+        plan = os.path.join(lit, "plan.md")
+        self.assertEqual(self.synth(plan).returncode, 0)
+        self.assertEqual(self.synth(plan, "--objective", "again").returncode, 0, "after.synth's change was refused")
+        self.assertEqual(self.verify(plan).returncode, 0)
+        self.assertEqual(self.verify(plan).returncode, 0, "after.verify's change to its report was refused")
+        r = self.synth(plan, "--objective", "and again")
+        self.assertEqual(r.returncode, 2, "after.verify's change to the plan, not its output, was adopted")
+
+    def test_a_plan_or_report_changed_during_the_run_is_never_replaced(self):
+        """--out was checked before the model call and replaced after it, so an edit made while the
+        model ran was lost on a successful run. Neither the edit nor the paid result may be."""
+        hook, marker = self.hook("after")
+        self.config({"after": {"synth": hook, "verify": hook}})
+        os.makedirs(self.notes)
+        write(os.path.join(self.notes, "n.md"), "# n\n" + "content " * 200)
+        plan = self.p("vault", "plan.md")
+        self.assertEqual(self.synth(plan).returncode, 0)
+        first = read(plan)
+        os.remove(marker)
+        edited = first + "EDITED WHILE THE MODEL RAN\n"
+        r = self.synth(plan, FAKE_EDIT=plan)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(read(plan), edited, "the edit made during the run was lost")
+        self.assertIn("# Development plan", read(plan + ".new.md"), "the paid result was lost")
+        self.assertIn(f"This run's plan is in {plan}.new.md", r.stderr)
+        self.assertFalse(os.path.exists(marker), "a result not filed where it was asked for is not handed to the hook")
+        r = self.synth(plan, "--overwrite", FAKE_EDIT=plan)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(read(plan), edited + "EDITED WHILE THE MODEL RAN\n")
+        self.assertTrue(os.path.exists(plan + ".new-2.md"), "the second result replaced the first")
+        fresh = self.p("vault", "fresh.md")
+        self.assertEqual(self.synth(fresh, FAKE_EDIT=fresh).returncode, 2, "--out created during the run")
+        self.assertEqual(read(fresh), "EDITED WHILE THE MODEL RAN\n")
+        edited = read(plan) + "EDITED WHILE THE MODEL RAN\n"
+        r = self.synth(plan, "--overwrite", mode="refuse", FAKE_EDIT=plan)
+        self.assertEqual(r.returncode, 4)
+        self.assertEqual(read(plan), edited, "a failed run moved or deleted a plan it did not write")
+
+        target = write(self.p("vault", "t.md"), "# T\n" + "content " * 200)
+        report = target + ".unverified.md"
+        self.assertEqual(self.verify(target).returncode, 0)
+        first = read(report)
+        os.remove(marker)
+        r = self.verify(target, FAKE_EDIT=report)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(read(report), first + "EDITED WHILE THE MODEL RAN\n")
+        self.assertIn("# Unverified claims in t.md", read(report + ".new.md"))
+        self.assertFalse(os.path.exists(marker))
+        write(target, read(target) + "A new proposal.\n")      # the report no longer describes it
+        r = self.verify(target, "--overwrite", mode="refuse", FAKE_EDIT=report)
+        self.assertEqual(r.returncode, 4)
+        self.assertTrue(os.path.exists(report), "a report edited during a failed run was deleted")
+        # What a run sets aside is named after the file, and cut to fit when it must be.
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        long_t = write(self.p("vault", "t" * (nm - len(".md.unverified.md")) + ".md"), read(target))
+        self.assertEqual(self.verify(long_t).returncode, 0)
+        r = self.verify(long_t, FAKE_EDIT=long_t + ".unverified.md")
+        self.assertEqual(r.returncode, 2, r.stderr[-300:])
+        self.assertEqual(len([f for f in ls(self.p("vault")) if f.startswith("ttt") and ".new" in f]), 1)
+
+    def test_deleting_or_damaging_the_record_makes_every_stage_ask(self):
+        """extending.md says deleting .lacuna.json is safe: Lacuna then asks before replacing
+        anything. verify did not ask, and replaced a report annotated by hand. And a damaged record
+        was silently rewritten with only that run's entries, so later refusals could not say why."""
+        target = write(self.p("lit", "plan.md"), "# Plan\n" + "content " * 200)
+        report = target + ".unverified.md"
+        self.assertEqual(self.verify(target).returncode, 0)
+        write(report, read(report) + "- checked by hand: fine\n")
+        os.remove(self.p("lit", ".lacuna.json"))
+        calls = len(self.calls())
+        r = self.verify(target)
+        self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stdout + r.stderr)
+        self.assertIn("has no record", r.stderr)
+        self.assertIn("checked by hand", read(report))
+        self.assertEqual(self.verify(target, "--overwrite").returncode, 0)
+        self.assertEqual(self.read().returncode, 0)
+        plan = self.p("lit", "digest.md")
+        self.assertEqual(self.synth(plan).returncode, 0)
+        os.remove(self.p("lit", ".lacuna.json"))
+        self.assertEqual(self.synth(plan).returncode, 2, "an unrecorded plan was replaced")
+        os.remove(os.path.join(self.notes, ".lacuna.json"))
+        self.assertEqual(self.read().returncode, 0, "an unrecorded note equal to its cached note is adopted")
+
+        record = os.path.join(self.notes, ".lacuna.json")
+        write(record, "{ not json")
+        r = self.lacuna("lit", "read", os.path.join(self.docs, "beta.md"), "--out", self.notes)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (kept,) = [f for f in os.listdir(self.notes) if f.startswith(".lacuna.json.damaged-")]
+        self.assertEqual(read(os.path.join(self.notes, kept)), "{ not json", "the damaged record was not kept")
+        self.assertIn(f".lacuna.json could not be read (JSONDecodeError); it was kept as {self.notes}/{kept}", r.stderr)
+        write(os.path.join(self.notes, "alpha.md"), self.note() + "\nMy own annotation.\n")
+        r = self.read()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(f"an earlier record here was damaged, and was kept as {kept}", r.stderr)
 
 
 class TestMoneyGuarantees(Pipeline):
@@ -347,6 +613,63 @@ class TestMoneyGuarantees(Pipeline):
         os.chmod(self.p("readonly"), 0o555)
         partial = write(self.p("partial-digest.md"), "# PARTIAL: literature notes unreadable\n\n## Status of this "
                         "digest\n\nThis digest contains no literature claims.\n" + "Padding. " * 120)
+        # A name the filesystem refuses after the model call costs the call and writes nothing.
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        venv_py = write(self.p("venv", "python"), FAKE_PARSER_PY, 0o755)
+        long_pdf = write(self.p("long", "x" * nm), "%PDF")       # no extension: parsed, noted as <name>.md
+        long_target = write(self.p("long", "t" * (nm - 8) + ".md"), "# Plan\n" + "x" * 500)
+        os.makedirs(self.p("dirnote", "alpha.md", "inner"))
+        # An input that is not content: every file argument of every subcommand, each named in the refusal.
+        os.makedirs(self.p("emptyrepo"))
+        dangling = self.p("dangling", "n.md")
+        os.makedirs(os.path.dirname(dangling))
+        os.symlink(self.p("nowhere.md"), dangling)
+        binary = self.p("binnote", "x.md")
+        os.makedirs(os.path.dirname(binary))
+        with open(binary, "wb") as f:
+            f.write(bytes(range(256)) * 20)
+        locked_status = write(self.p("locked-status.md"), "dead end: X\n")
+        os.chmod(locked_status, 0)
+        locked_target = write(self.p("locked-target.md"), "# plan\n" * 50)
+        os.chmod(locked_target, 0)
+        locked_pdf = write(self.p("docs", "locked.pdf"), "%PDF-1.4 not really a pdf")
+        os.chmod(locked_pdf, 0)
+        os.makedirs(self.p("sealed"))
+        os.chmod(self.p("sealed"), 0)
+        for f in (locked_status, locked_target, locked_pdf):
+            self.addCleanup(os.chmod, f, 0o644)
+        self.addCleanup(os.chmod, self.p("sealed"), 0o755)
+        empties = [
+            ("an empty .md document", ("lit", "read", write(self.p("docs", "empty.md"), ""), "--out", self.notes)),
+            ("a whitespace-only .txt document", ("lit", "read", write(self.p("docs", "blank.txt"), " \n\t\n"),
+                                                 "--out", self.notes)),
+            ("a binary .txt document", ("lit", "read", write(self.p("docs", "bin.txt"), "x"), binary, "--out",
+                                        self.notes)),
+            ("a document it cannot read", ("lit", "read", locked_pdf, "--out", self.notes)),
+            ("synth --status it cannot read", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out",
+                                               plan, "--status", locked_status)),
+            ("synth --status that is empty", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out",
+                                              plan, "--status", write(self.p("empty-status.md"), ""))),
+            ("synth --repo with no files", ("lit", "synth", "--notes", self.notes, "--repo", self.p("emptyrepo"),
+                                            "--out", plan)),
+            ("synth --digest that is a few bytes", ("lit", "synth", "--digest", write(self.p("d.md"), "hi\n"),
+                                                    "--repo", self.repo, "--out", plan, "--kind", "plan")),
+            ("synth --digest that is binary", ("lit", "synth", "--digest", binary, "--repo", self.repo, "--out",
+                                               plan, "--kind", "plan")),
+            ("synth --notes holding a binary note", ("lit", "synth", "--notes", os.path.dirname(binary), "--repo",
+                                                     self.repo, "--out", plan)),
+            ("synth --notes holding a dangling link", ("lit", "synth", "--notes", os.path.dirname(dangling),
+                                                       "--repo", self.repo, "--out", plan)),
+            ("verify --target that is empty", ("lit", "verify", "--target", write(self.p("t.md"), ""), "--repo",
+                                               self.repo)),
+            ("verify --target that is binary", ("lit", "verify", "--target", binary, "--repo", self.repo)),
+            ("verify --target it cannot read", ("lit", "verify", "--target", locked_target, "--repo", self.repo)),
+            ("synth --notes directory it cannot read", ("lit", "synth", "--notes", self.p("sealed"), "--repo",
+                                                        self.repo, "--out", plan)),
+            ("verify --notes directory it cannot read", ("lit", "verify", "--target", self.alpha, "--repo",
+                                                         self.repo, "--notes", self.p("sealed"))),
+            ("verify --repo with no files", ("lit", "verify", "--target", self.alpha, "--repo", self.p("emptyrepo"))),
+        ]
         cases = [
             ("two documents, one name", ("lit", "read", *twins, "--out", self.notes)),
             ("a .txt and a .pdf, one name", ("lit", "read", txt, pdf, "--out", self.notes)),
@@ -364,6 +687,10 @@ class TestMoneyGuarantees(Pipeline):
             ("synth from notes it cannot read", ("lit", "synth", "--notes", os.path.dirname(locked), "--repo",
                                                  self.repo, "--out", plan)),
             ("read into a directory it cannot write", ("lit", "read", self.alpha, "--out", self.p("readonly"))),
+            ("synth into a directory it cannot write", ("lit", "synth", "--notes", self.notes, "--repo", self.repo,
+                                                       "--out", self.p("readonly", "plan.md"))),
+            ("a directory at the note path, even with --overwrite", ("lit", "read", self.alpha, "--out",
+                                                                     self.p("dirnote"), "--overwrite")),
             ("synth missing --status", ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out", plan,
                                         "--status", gone)),
             ("missing document", ("lit", "read", f"{self.docs}/nope.md", "--out", self.notes)),
@@ -375,21 +702,90 @@ class TestMoneyGuarantees(Pipeline):
             ("verify missing target", ("lit", "verify", "--target", f"{self.tmp}/nope.md", "--repo", self.repo)),
             ("verify missing repo", ("lit", "verify", "--target", self.alpha, "--repo", gone)),
             ("verify missing notes", ("lit", "verify", "--target", self.alpha, "--repo", self.repo, "--notes", gone)),
+            ("a note name longer than --out allows", ("lit", "read", long_pdf, "--out", self.notes)),
+            ("synth --out too long for its .filelist.txt", ("lit", "synth", "--notes", self.notes, "--repo", self.repo,
+                                                            "--out", self.p("long", "p" * (nm - 5) + ".md"))),
+            ("a verify report name longer than allowed", ("lit", "verify", "--target", long_target, "--repo", self.repo)),
         ]
-        for label, argv in cases:
+        for label, argv in cases + empties:
             if ("cannot read" in label or "cannot write" in label) and os.geteuid() == 0:
                 continue                      # root ignores file modes
             with self.subTest(label):
-                r = self.lacuna(*argv)
+                r = self.lacuna(*argv, LACUNA_PYTHON=venv_py)
                 self.assertEqual(r.returncode, 2, f"{label}: {r.stdout}{r.stderr}")
+                self.assertNotIn("Traceback", r.stderr, f"{label}: bad input must be a message, not a crash")
                 self.assertEqual(self.calls(), [], f"{label} reached a model, which costs real money")
+        # Lacuna's own files are written after the paid call: one it cannot write stops the run first (J5).
+        ledger_dir, cache_file = self.p("ledger-is-a-dir"), write(self.p("cache-is-a-file"), "x")
+        os.makedirs(ledger_dir)
+        sealed_cache = self.p("sealed-cache")
+        for d in (os.path.join(sealed_cache, sub) for sub in ("notes", "md", "drafts")):
+            os.makedirs(d)
+            os.chmod(d, 0o555)
+            self.addCleanup(os.chmod, d, 0o755)
+        for label, argv, env in [
+            ("a ledger that is a directory: read", ("lit", "read", self.alpha, "--out", self.notes),
+             {"LACUNA_LEDGER": ledger_dir}),
+            ("a ledger that is a directory: synth", ("lit", "synth", "--notes", self.notes, "--repo", self.repo,
+                                                     "--out", plan), {"LACUNA_LEDGER": ledger_dir}),
+            ("a ledger that is a directory: verify", ("lit", "verify", "--target", self.alpha, "--repo", self.repo),
+             {"LACUNA_LEDGER": ledger_dir}),
+            ("a cache that is a file", ("lit", "read", self.alpha, "--out", self.notes), {"LACUNA_CACHE": cache_file}),
+            ("a cache it cannot write", ("lit", "read", self.alpha, "--out", self.notes), {"LACUNA_CACHE": sealed_cache}),
+        ]:
+            if "cannot write" in label and os.geteuid() == 0:
+                continue                      # root ignores file modes
+            with self.subTest(label):
+                r = self.lacuna(*argv, **env)
+                self.assertEqual((r.returncode, self.calls()), (2, []), f"{label}: {r.stdout}{r.stderr}")
+                self.assertIn("cannot write its own records", r.stderr)
         self.assertEqual(read(vault_note), "# My own alpha notes\n", "a user's file in --out was overwritten")
         self.assertEqual(read(hand_plan), "# My plan, written by hand\n", "a hand-written plan was overwritten")
         self.assertFalse(os.path.lexists(self.p("elsewhere.md")), "a note was written through a symlink")
         self.assertEqual(read(self.alpha), alpha_text, "the document was deleted or overwritten by its own note")
 
+    def test_every_bad_input_is_named_in_one_refusal(self):
+        blank, empty = write(self.p("docs", "blank.txt"), "  \n"), write(self.p("docs", "empty.md"), "")
+        r = self.lacuna("lit", "read", self.alpha, blank, empty, "--out", self.notes)
+        self.assertEqual((r.returncode, self.calls()), (2, []), r.stderr)
+        self.assertIn(blank, r.stderr)
+        self.assertIn(empty, r.stderr)
+        self.assertNotIn(self.alpha, r.stderr, "a good document is not blamed")
+        self.assertFalse(os.path.exists(self.notes), "a refused run leaves --out alone")
+        r = self.lacuna("lit", "synth", "--notes", self.notes, "--repo", self.p("nope"), "--out", self.p("plan.md"))
+        self.assertIn("is not a directory", r.stderr, "a missing --repo is not an empty one")
+
+    def test_a_status_file_nobody_named_is_skipped_not_refused(self):
+        os.makedirs(self.notes)
+        write(os.path.join(self.notes, "n.md"), "# n\n" + "x" * 500)
+        write(os.path.join(self.repo, "research", "STATUS.md"), "")
+        write(os.path.join(self.repo, "NOTES.md"), "dead end: widget cache\n")
+        r = self.verify(write(self.p("t.md"), "# plan\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        prompt = self.calls()[-1]["prompt"]
+        self.assertIn(os.path.join(self.repo, "NOTES.md"), prompt, "the empty research/STATUS.md is not a status file")
+        self.assertNotIn("research/STATUS.md", prompt)
+
+    def test_verify_prompt_paths_are_absolute(self):
+        """The agent runs in another directory: `research/STATUS.md` named relative checked nothing."""
+        write(os.path.join(self.repo, "research", "STATUS.md"), "# Status\ndead end: widget cache\n")
+        target = write(self.p("t.md"), "# plan\n")
+        for extra in ((), ("--notes", self.notes)):
+            os.makedirs(self.notes, exist_ok=True)
+            r = self.verify(target, *extra)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            prompt = self.calls()[-1]["prompt"]
+            self.assertIn(os.path.join(self.repo, "research", "STATUS.md"), prompt)
+            for rel in re.findall(r"(?<![/\w.-])(?:research|docs|src)/\S+", prompt):
+                self.fail(f"the prompt names {rel} relative to the caller's directory")
+        os.remove(os.path.join(self.repo, "research", "STATUS.md"))
+        self.verify(target)
+        self.assertNotIn("STATUS", self.calls()[-1]["prompt"], "no status file, no instruction to grep one")
+
     def test_a_refusal_is_never_filed_as_a_note(self):
-        for mode in ("refuse", "apology", "prose"):
+        """"incomplete" is VERDICT3 N5: a reader given unreadable text wrote a template-shaped note, and
+        it was cached. It is told the INCOMPLETE rule now, and its reply is read."""
+        for mode in ("refuse", "apology", "prose", "incomplete"):
             with self.subTest(mode):
                 r = self.read(mode=mode)
                 self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
@@ -398,12 +794,56 @@ class TestMoneyGuarantees(Pipeline):
                 self.assertFalse(self.ledger()[-1]["wrote_note"])
                 if mode != "refuse":
                     self.assertNotIn("produced no note file", r.stdout, "it did write one; the content was rejected")
+                if mode == "incomplete":
+                    self.assertIn("INCOMPLETE: the sources could not be read", r.stdout, "say what the reader said")
         # the subtle one: success was once inferred from a file an earlier run had left in --out
         self.assertEqual(self.read("--brief", "BRIEF:one").returncode, 0)
         r = self.read("--brief", "BRIEF:two", mode="refuse")
         self.assertEqual(r.returncode, 4, "a refusal must fail even when an older note is present")
         self.assertNotIn("1/1 notes written", r.stdout)
         self.assertEqual(len(self.cached_notes()), 1, "the stale note must not be cached under the new key")
+        # A note cached before the check learned a shape was served free forever (VERDICT3 N10b): a hit
+        # is judged by today's check, and one that fails it is read again, and paid for, not served.
+        (cached,) = self.cached_notes()
+        cached = os.path.join(self.data, "cache", "notes", cached)
+        write(cached, "# A note (alpha.md)\n\n## Claim\nI\u2019m unable to complete this: I could not read any of "
+                      "the paper.\n\n## Key results\n" + "Nothing. " * 80)
+        calls = len(self.calls())
+        r = self.lacuna("lit", "read", self.alpha, "--out", self.p("elsewhere"), "--brief", "BRIEF:one")
+        self.assertEqual((r.returncode, len(self.calls())), (0, calls + 1), r.stdout + r.stderr)
+        self.assertNotIn("cached (free)", r.stdout)
+        self.assertIn("removed from the cache", r.stderr, "say why a hit was paid for")
+        self.assertNotIn("unable to complete", read(cached), "the failed note must not stay cached")
+        self.assertNotIn("unable to complete", read(self.p("elsewhere", "alpha.md")))
+
+    def test_a_doubtful_opening_is_filed_with_one_warning(self):
+        """Each stage discarded paid results whose opening only looked like a failure: a title
+        "Partial 3D …", a summary bullet "Incomplete: …", a verify line without its arrow (r2-content
+        E1, E3). They are filed, exit 0, with one warning that names the file."""
+        doubt = "the opening reads like it may not have done the job"
+        body = ("# Partial 3D Shape Matching for Virtual Screening (Kumar 2022)\n\n## Claim\nShape overlap ranks "
+                "actives first (Table 2).\n\n## Key results\n" + "Finding, 42 units (Table 2). " * 40)
+        r = self.read(mode="body", FAKE_BODY=body, FAKE_REPLY="INCOMPLETE: the text is symbol noise")
+        self.assertEqual(r.returncode, 4, "a doubt in the note does not outweigh the reader's own word")
+        r = self.read(mode="body", FAKE_BODY=body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.note(), body, "a paid note was discarded over its title")
+        self.assertEqual(len(self.cached_notes()), 1)
+        note = os.path.join(self.notes, "alpha.md")
+        self.assertIn(f"! {note}: {doubt}", r.stderr)
+        self.assertEqual(r.stderr.count(doubt), 1, "one warning per file")
+        plan = self.p("lit", "plan.md")
+        r = self.synth(plan, mode="body", FAKE_BODY="# Development plan\n\n## 1. Seam\n\n" + "Naming src/a.py. " * 60,
+                       FAKE_REPLY="Wrote it.\n\n- Incomplete: no note gives a baseline for proposal 5.")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("## 1. Seam", read(plan))
+        self.assertIn(f"! {note}: {doubt}", r.stderr, "a note that looks like a failure is still literature")
+        self.assertIn(f"! {plan}: {doubt}", r.stderr)
+        r = self.verify(plan, mode="reply", FAKE_REPLY="- `src/ghost.py` -> not found\n- Incomplete: proposal 2 "
+                                                       "cites the wrong note.")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("cites the wrong note", read(plan + ".unverified.md"))
+        self.assertIn(f"! {plan}.unverified.md: {doubt}", r.stderr)
 
     def test_a_failed_synth_files_nothing_and_leaves_the_last_plan_alone(self):
         """synth judged success by the file at --out, so over an earlier plan a refusal exited 0 and
@@ -434,12 +874,13 @@ class TestMoneyGuarantees(Pipeline):
                                  "--kind", "plan", "--objective", "interrupted"], env=self.env(FAKE_MODE="hang"),
                                 cwd=self.tmp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         deadline = time.time() + 20
-        while len(ls(out)) < 3 and time.time() < deadline:     # plan, file list, and the run's output
+        partial = lambda: [f for f in os.listdir(out) if f.endswith(".partial")]
+        while not partial() and time.time() < deadline:     # the run's own output file
             time.sleep(0.05)
         os.killpg(hung.pid, signal.SIGKILL)
         hung.wait()
-        self.assertEqual(len(ls(out)), 3, "the interrupted run never wrote its output")
-        r = self.synth(plan, mode="refuse")
+        self.assertEqual(len(partial()), 1, "the interrupted run never wrote its output")
+        r = self.synth(plan, mode="garbage")
         self.assertEqual(r.returncode, 4, "an interrupted run's output passed for this run's")
         self.assertEqual(read(plan), first)
         self.assertEqual(ls(out), ["plan.md"])
@@ -451,8 +892,10 @@ class TestMoneyGuarantees(Pipeline):
         self.config({"after": {"verify": hook}})
         plan, report = self.p("plan.md"), self.p("plan.md.unverified.md")
         write(plan, "# Plan\n" + "content " * 200)
-        for mode, reply in [("refuse", None), ("garbage", None),
+        for mode, reply in [("refuse", None), ("garbage", None), ("incomplete", None),
                             ("reply", "I cannot help with that request."),
+                            ("reply", "INCOMPLETE: none of the files in the codebase could be opened"),
+                            ("reply", "No unverifiable claims found.\n\nINCOMPLETE: the notes directory was empty"),
                             ("reply", "I could not check any claims because the document is not in the codebase.\n"
                                       "- `runs/real/plan.md` -> not found.")]:
             with self.subTest(mode, reply=reply):
@@ -469,10 +912,23 @@ class TestMoneyGuarantees(Pipeline):
         r = self.verify(plan)
         self.assertEqual((r.returncode, len(self.calls())), (2, calls), "a hand-annotated report was replaced")
         self.assertIn("checked by hand", read(report))
-        self.assertEqual(self.verify(plan, "--overwrite").returncode, 0)
         write(plan, read(plan) + "\nA new proposal.\n")
-        self.assertEqual(self.verify(plan, mode="refuse").returncode, 4)
-        self.assertFalse(os.path.exists(report), "a report must not sit beside a version it never checked")
+        annotated = read(report)
+        r = self.verify(plan, "--overwrite", mode="refuse")
+        self.assertEqual(r.returncode, 4)
+        self.assertEqual(read(report), annotated, "a failed --overwrite deleted the user's annotated report (F4)")
+        self.assertIn("describes another version of it", r.stderr)
+        victim = write(self.p("victim.md"), "keep me\n")
+        os.remove(report)
+        os.symlink(victim, report)
+        self.assertEqual(self.verify(plan, "--overwrite").returncode, 0)
+        self.assertEqual(read(victim), "keep me\n", "--overwrite wrote the report through a symlink")
+        os.remove(report)
+        os.makedirs(report)                               # where a recorded report was
+        calls = len(self.calls())
+        for extra in ((), ("--overwrite",)):
+            r = self.verify(plan, *extra)
+            self.assertEqual((r.returncode, len(self.calls())), (2, calls), r.stdout + r.stderr)
 
     def test_a_missing_tool_or_an_odd_reply_stays_inside_the_exit_codes(self):
         """0, 2, 3, 4 is the contract a caller branches on. A traceback (exit 1) after a paid call
@@ -506,7 +962,7 @@ class TestAfterHooks(Pipeline):
 
     def after(self, cmd, **env):
         self.config({"after": {"synth": cmd}})
-        return self.lacuna("lit", prelude=f"L.after('synth', {self.p('plan.md')!r}); sys.exit(0)", **env)
+        return self.lacuna("lit", prelude=f"L.after('synth', {self.p('plan.md')!r}, [{self.p('plan.md')!r}]); sys.exit(0)", **env)
 
     def test_shell_semantics(self):
         out = self.p("plan.md")
@@ -579,6 +1035,30 @@ class TestPdfPlumbing(Pipeline):
         self.assertEqual(len(self.parse_lines()), 4, "an empty parse must be redone, not handed to a reader")
         self.read_pdf(prelude="L.PARSE_VERSION = '999'")
         self.assertEqual(len(self.parse_lines()), 5, "a change to clean()/validate() must reach parsed documents")
+        nm = os.pathconf(self.tmp, "PC_NAME_MAX")
+        long_pdf = write(self.p("x" * (nm - 4) + ".pdf"), "%PDF-1.4 not really a pdf")
+        for _ in range(2):
+            r = self.lacuna("lit", "read", long_pdf, "--out", self.notes, LACUNA_PYTHON=self.venv_py)
+            self.assertEqual(r.returncode, 0, f"a PDF whose name fits must parse: {r.stderr[-300:]}")
+        self.assertEqual(len(self.parse_lines()), 6, "a long name is parsed once, then served from the cache")
+
+    def test_equations_needs_only_the_marker_venv(self):
+        """`doctor --install-equations` makes venv-marker and nothing else; the README recipe then runs
+        `read --equations`. prep_md.py is standard-library code, so a missing default venv is no reason
+        to refuse, though a PDF read without it must say its truncation check is off."""
+        marker_py = write(os.path.join(self.data, "venv-marker", "bin", "python"), "#!/bin/sh\n", 0o755)
+        gone = self.p("no-such-venv", "python")
+        # sys.executable is what prep_md runs under when there is no venv: the fake stands in for it
+        prelude = f"sys.executable = {self.venv_py!r}"
+        for extra in (("--equations",), ("--parser", "marker"), ("--parser", "docling")):
+            with self.subTest(extra):
+                r = self.read_pdf(*extra, LACUNA_PYTHON=gone, prelude=prelude)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("truncation", r.stderr)
+        self.assertEqual(len(self.parse_lines()), 2, "--equations and --parser marker share one cached parse")
+        r = self.read_pdf(LACUNA_PYTHON=gone, prelude=prelude)
+        self.assertEqual((r.returncode, len(self.parse_lines())), (3, 2), "the default parser still needs its venv")
+        self.assertTrue(os.path.exists(marker_py))
 
     def test_parse_failures_exit_3_before_any_model_call(self):
         r = self.read_pdf(LACUNA_PYTHON=self.p("no-such-venv", "python"))
@@ -590,21 +1070,77 @@ class TestPdfPlumbing(Pipeline):
         self.assertEqual(self.calls(), [])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class TestConcurrentRuns(Pipeline):
+    """One run writes a given note, plan or report at a time, from its ownership check to its final
+    write, and nothing a run leaves behind blocks the next.
 
+    0.3.1 reserved a note path in the record and released it only on success, so a refused reader,
+    Ctrl-C or a kill refused every later read of a same-named document for good, --overwrite
+    included. A re-read dropped its own reservation before its model call, and the same document
+    under another --brief was let through: two agents wrote one path, and a cache key could hold
+    another document's note. Two synths into one --out deleted each other's work."""
 
-class TestConcurrentReads(Pipeline):
-    """Two Lacuna processes reading same-named documents into one --out.
+    def test_a_path_another_run_holds_is_refused_before_paying(self):
+        os.makedirs(self.notes)
+        write(os.path.join(self.notes, "n.md"), "# n\n" + "content " * 200)
+        plan, target = self.p("lit", "plan.md"), write(self.p("lit", "t.md"), "# T\n" + "content " * 200)
+        self.addCleanup(L.release_all)
+        for path in (os.path.join(self.notes, "alpha.md"), plan, target + ".unverified.md"):
+            self.assertIsNone(L.hold(path, "testing"))     # this test process is the other run
+        read_ = ("lit", "read", self.alpha, "--out", self.notes)
+        synth = ("lit", "synth", "--notes", self.notes, "--repo", self.repo, "--out", plan)
+        verify = ("lit", "verify", "--target", target, "--repo", self.repo)
+        for label, argv in [("read", read_), ("read --overwrite", read_ + ("--overwrite",)),
+                            ("the same document under another --brief", read_ + ("--brief", "BRIEF:other")),
+                            ("synth", synth), ("synth --overwrite", synth + ("--overwrite",)),
+                            ("verify", verify), ("verify --overwrite", verify + ("--overwrite",))]:
+            with self.subTest(label):
+                r = self.lacuna(*argv)
+                self.assertEqual((r.returncode, len(self.calls())), (2, 0), r.stdout + r.stderr)
+                self.assertIn(f"another Lacuna run (pid {os.getpid()} ", r.stderr)
+        L.release_all()
+        for argv in (read_, synth, verify):
+            self.assertEqual(self.lacuna(*argv).returncode, 0)
+        self.assertEqual([f for d in (self.notes, self.p("lit")) for f in os.listdir(d) if f.endswith(".lock")], [],
+                         "a run that has ended holds nothing")
 
-    The collision guard and the ownership check both ran before any lock, so each process cached
-    whatever was at the note path when its own agent returned: one note silently replaced the
-    other, and one paper's cache key could end up holding the other paper's note, served free
-    from then on.
-    """
+    def test_nothing_a_run_leaves_behind_blocks_the_next(self):
+        other = write(self.p("elsewhere", "alpha.md"), "# Another alpha\n\n## Abstract\n\n" + "Other. " * 300)
 
-    def test_one_run_wins_and_the_other_is_refused_before_paying(self):
-        import subprocess
+        def later(out):
+            r = self.lacuna("lit", "read", other, "--out", out)
+            self.assertEqual(r.returncode, 0, f"{out}: {r.stderr}")
+
+        out = self.p("refused")
+        self.assertEqual(self.lacuna("lit", "read", self.alpha, "--out", out, mode="refuse").returncode, 4)
+        later(out)
+        out = self.p("collision")
+        self.assertEqual(self.lacuna("lit", "read", self.alpha, other, "--out", out).returncode, 2)
+        later(out)
+        out, calls = self.p("killed"), len(self.calls())
+        killed = subprocess.Popen([LACUNA, "lit", "read", self.alpha, "--out", out], env=self.env(FAKE_MODE="hang"),
+                                  cwd=self.tmp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        deadline = time.time() + 20
+        while len(self.calls()) == calls and time.time() < deadline:     # its reader is running
+            time.sleep(0.05)
+        os.killpg(killed.pid, signal.SIGKILL)
+        killed.wait()
+        later(out)
+        # 0.3.1 left reservations in the record, and the half-written note of a run killed meanwhile
+        old = self.p("old")
+        write(os.path.join(old, ".lacuna.json"), json.dumps(
+            {"files": {"alpha.md": {"name": "alpha.md", "pending": True, "source": self.alpha}}}))
+        later(old)
+        write(os.path.join(old, ".lacuna.json"), json.dumps(
+            {"files": {"alpha.md": {"name": "alpha.md", "pending": True, "source": self.alpha}}}))
+        write(os.path.join(old, "alpha.md"), "# half a note\n")
+        r = self.lacuna("lit", "read", self.alpha, "--out", old)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("has no record", r.stderr, "the note a killed run left was called edited")
+
+    def test_two_runs_at_once_one_wins_and_the_other_is_refused_before_paying(self):
+        """End to end, with real timing: the deterministic tests above are the guard."""
         a = write(self.p("a", "main.md"), "Title A\n\n" + "body " * 300)
         b = write(self.p("b", "main.md"), "Title B\n\n" + "body " * 300)
         out = self.p("notes")
@@ -623,3 +1159,8 @@ class TestConcurrentReads(Pipeline):
         for k in keys:
             cached = read(os.path.join(self.data, "cache", "notes", k))
             self.assertEqual(cached, note, "a cache key must hold its own document's note")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+

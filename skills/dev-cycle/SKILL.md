@@ -88,6 +88,7 @@ where any model string works:
 ```bash
 LAC=${CLAUDE_PLUGIN_ROOT}/bin/lacuna
 CODER=$($LAC config --json | python3 -c "import json,sys;print(json.load(sys.stdin)['models']['coder'])")
+EFFORT=$($LAC config --json | python3 -c "import json,sys;print(json.load(sys.stdin)['effort']['coder'])")
 # --agents takes JSON ({name: {description, prompt, tools}}), built here from the plugin's agent files
 AGENTS=$(python3 - "${CLAUDE_PLUGIN_ROOT}/agents" <<'EOF'
 import json, os, re, sys
@@ -100,8 +101,11 @@ for fn in os.listdir(sys.argv[1]):
 print(json.dumps(out))
 EOF
 )
-claude -p --model "$CODER" --agents "$AGENTS" --agent coder < prompt.txt
+claude -p --model "$CODER" --effort "$EFFORT" --agents "$AGENTS" --agent coder < prompt.txt
 ```
+
+Effort is a cost multiplier (up to 43x), so the recipe passes it: without `--effort` the headless
+agent runs at the CLI's default, not the level the agent file and `config.json` set.
 
 Say which route you took. An agent silently running on a different model than the user configured
 is the kind of thing that invalidates a comparison without anyone noticing.

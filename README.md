@@ -151,6 +151,9 @@ lacuna lit read papers/*.pdf --out notes/      # books are offered automatically
 lacuna lit read papers/*.pdf --out notes/ --no-books    # or skip them
 ```
 
+A book is offered only from a directory of its own directly inside the books directory
+(`lacuna config` shows where that is); `split-book` says so when the directory you give is elsewhere.
+
 **Write notes straight into Obsidian** (any vault is just a folder of markdown)
 
 ```bash
@@ -158,8 +161,10 @@ lacuna lit read papers/*.pdf --out ~/Obsidian/MyVault/Literature/ --brief "..."
 ```
 
 Lacuna replaces a note there only if it wrote it, for that document, and you have not edited it
-since; otherwise it stops before spending anything and says which file and why (`--overwrite` goes
-ahead). See [extending.md](docs/extending.md#lacuna-replaces-only-its-own-files).
+since; otherwise it stops before spending anything and says which file and why (`--overwrite`
+replaces it anyway, but never a file another run is writing). A note you edit while it is being
+read is kept; that run has already paid, exits 2, and leaves its note in the cache. See
+[extending.md](docs/extending.md#lacuna-replaces-only-its-own-files).
 
 **File finished results into an app that is not a folder** (Heptabase, Notion, a tracker)
 
@@ -243,9 +248,16 @@ stable, so you can tell what is safe to build on.
    with the output as its last argument: the notes directory for `read`, a file for the other two.
    This is how results reach a notebook, a ticket or a channel without Lacuna knowing what those
    are. A plain folder of markdown (Obsidian, Logseq) needs no hook: point `--out` at it.
-4. **The `lacuna` command**, with stable exit codes (0 ok, 2 bad input, 3 parse failure, 4 the model
-   refused or produced nothing), so a wrapper can branch on them. Call the CLI; the Python modules
-   will be renamed.
+4. **The `lacuna` command**, with stable exit codes (0 ok, 2 refused, 3 parse failure, 4 the model
+   refused or produced nothing), so a wrapper can branch on them; see
+   [extending.md](docs/extending.md#4-the-lacuna-cli) before retrying on 2. Call the CLI; the Python
+   modules will be renamed.
+
+**Your own agents** plug in around the stages, not inside them: a Claude Code subagent of yours can
+review every new note (an `after.read` hook), turn a plan into tickets (`after.synth`), or sit
+between `read` and `synth` in a project skill, and `lacuna lit verify` will fact-check its output
+too. Textbooks are optional throughout. [extending.md §6](docs/extending.md#6-adding-your-own-agents-to-the-workflow)
+has a working example.
 
 A worked example: the author's own chemistry project is a separate private plugin that points
 `books` at its corpus, pins `planner` to a model that does not refuse its source material, and sets

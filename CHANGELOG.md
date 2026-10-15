@@ -3,6 +3,53 @@
 Dates are the measurement or release date. Price-table changes get their own entry, because a stale
 price table makes every cost figure wrong without looking wrong.
 
+## 0.4.0 — 2026-10-15
+
+Two review rounds of 0.3.1 found about 120 defects. Most of the second round's were caused by the
+first round's fixes, so the last pass simplified rather than patched. Checked against real models
+(numbers in `docs/benchmarks/` are unchanged): 12 papers in 9 fields read at $0.0213 a paper, with no
+invented numbers and 3 factual errors in 546 checked statements; on TACTICS, plans from two papers
+plus the code proposed grounded, testable changes and found the authors' own open problems.
+
+- **Whether a model failed is judged by its protocol, not guessed.** A stage fails (exit 4) only on
+  an unambiguous declaration: an UPPERCASE `INCOMPLETE:`/`BLOCKED`/`PARTIAL`/`FAILED` at the
+  opening or at the start of a reply line, or the model saying it could not read the input as a
+  whole. Anything that only looks like failure (a title such as "Partial 3q tetrasomy…", a caveat
+  about the Supporting Information, a "- Incomplete:" bullet) is kept, with one warning naming the
+  file. The 0.3.1 rule discarded genuine paid output. The reader is now told the `INCOMPLETE` rule
+  too, and a cached note is re-checked on every hit. Textbooks are optional: without them, notes no
+  longer carry an empty "Concepts looked up" section (`PROMPT_VERSION` 3).
+- **Your files.** A run never deletes, moves or renames a file it did not write. Edits survive a
+  failed run, an annotated `verify` report survives `--overwrite` when the call fails, and a hook's
+  slow run no longer turns your edit to another note into Lacuna's. A changed document at a recorded
+  path, or a paper named like your plan, asks first (`--overwrite`). Two runs never write one file at
+  once (a kernel lock, released however a run ends); 0.3.1's stale reservations, which blocked a
+  file name forever, are gone. Where a folder cannot be locked, Lacuna says so and carries on.
+- **Money.** Inputs that cannot be content (empty, binary, unreadable, a missing `--repo`) and
+  output names too long for the filesystem are refused before any model call. So are an unusable
+  ledger or cache path. A config or pricing file Lacuna cannot use is reported by every command that
+  spends, not ignored. `lit estimate` gates on the model and effort you will actually run.
+- **Parsing (`PARSE_VERSION` 5).** References are removed only between a References heading and
+  the next heading; anything uncertain is kept. 0.3.1 deleted numbered Methods steps that contained
+  a year. A parse that is mostly unreadable glyphs is refused, so the fallback parser runs.
+  `split-book` cleans control characters from titles, puts every page in a chapter and never deletes
+  a chapter it just wrote. `--equations` works with only the marker install.
+- **Tools.** `/lacuna-doctor` and `/spend` no longer abort when a check fails. The status line and
+  the cache guard survive any malformed input. Every `/spend` subtotal shows the same lower-bound
+  range as the headline. Plugin paths with spaces or quotes work.
+- **Your own agents:** `docs/extending.md` §6 shows how to add them around the stages (an `after.*`
+  hook, a Claude Code subagent, a project skill), with an example run end to end.
+- **Known edge cases** that are documented rather than fixed: `docs/LIMITS.md`.
+- **Correction to 0.3.0:** its statement that every fix had a guarding test was not true; a
+  revert-by-revert check found about 50 fixes the suite did not notice. Those are now guarded.
+
+## 0.3.1 — 2026-10-14
+
+Fixes three findings of the eighth review (`docs/reviews/VERDICT3.md`): a plan titled
+`(BLOCKED)`, `— BLOCKED` or `: BLOCKED` was filed again; two concurrent reads of same-named documents
+could cache one paper's note under the other's key; and `/spend` counted warm caches as avoidable
+cold rewrites (72 → 16 on the reviewer's machine).
+
 ## 0.3.0 — 2026-10-14
 
 Clears the six caveats of the seventh review (`docs/reviews/VERDICT2.md`). Each was fixed as a

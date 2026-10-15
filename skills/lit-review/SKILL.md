@@ -19,8 +19,10 @@ default, and read `docs/LIMITS.md` before quoting a number to anyone.
 LAC=${CLAUDE_PLUGIN_ROOT}/bin/lacuna
 
 # 0. estimate — free, local token count against the calibration. Do this first.
-#    --json gives a machine-readable report: read `any_over_budget` and `cheapest_over_budget`
-#    rather than parsing the table, and show the user the figure before spending anything.
+#    --json gives a machine-readable report: read `configured` (the model/effort row `lit read`
+#    will actually use: its `usd` and `over_budget`) rather than parsing the table, and show the
+#    user the figure before spending anything. `any_over_budget` is true if ANY row of the table
+#    is, including models you will not use: do not gate on it.
 $LAC lit estimate <pdfs-or-mds> --per-agent 1 --json
 
 # 1. read — one slim cheap-tier agent per document, in parallel. ~$0.015/document, ~60-100 s for up to 8 documents (they run 8 at a time, then in waves).
@@ -108,8 +110,9 @@ From a bake-off of 9 parsers over 3 papers (`docs/benchmarks/pdf-parsers.md`):
 ## Books and long references
 
 `lacuna lit split-book <pdf> <books-dir>/<name>` splits a long document into chapter files plus a
-grep-able `toc.md`. Any book under the configured books directory is offered to readers, which grep
-the index and read only the lines they need. `--no-books` skips them.
+grep-able `toc.md`. A book split into a directory of its own directly inside the configured books
+directory is offered to readers, which grep the index and read only the lines they need; split-book
+warns when it is not. `--no-books` skips them.
 
 **Books do not generate ideas; they prevent mistakes.** In the ablation, idea yield was identical
 with and without them, but errors roughly halved (4.0 → 1.5 per plan for the cheap reader) and
@@ -121,7 +124,9 @@ familiar material. (Two cells, one run each — suggestive, not established.)
 
 `lacuna lit estimate` prints cost and wall time per model × effort and says whether the calibration is
 yours or upstream. Show the user the plan and the estimate before starting anything above the
-configured warning threshold (`budget_warn_usd`, default $2), and wait for approval.
+configured warning threshold (`budget_warn_usd`, default $2), and wait for approval. The test is
+`configured.over_budget` in the `--json` report (the row for the configured reader model and effort, or the `--model`/`--effort` you pass; true also when that row has no calibration, because its cost is unknown);
+`any_over_budget` and `cheapest_over_budget` describe the whole table, not the run you are about to start.
 
 ## After the run
 
@@ -139,9 +144,16 @@ configured warning threshold (`budget_warn_usd`, default $2), and wait for appro
 `read`, `synth` and `verify` replace a file only when Lacuna wrote it (for the same document, in the
 case of a note) and nobody has edited it since; the record is `.lacuna.json` beside the files. When
 one of those is not true they exit 2 before any model call and name every such file and why: edited
-since, no record, or another document's note with the same file name. **Show the user that message
-and ask.** Do not add `--overwrite` on your own: it discards their edits, or another paper's note.
-For two papers with one file name (`main.pdf` in two folders), rename one or use another `--out`.
+since, no record, another document's note with the same file name, a document changed since its note
+was written, or a file another stage wrote. **Show the user that message and ask.** Do not add
+`--overwrite` on your own: it discards their edits, or another paper's note. For two papers with one
+file name (`main.pdf` in two folders), rename one or use another `--out`.
+
+One exit 2 comes after the model call: a note, plan or report that changed while the stage ran is
+left as it is. A plan or report's result is saved beside it as `<out>.new.md`; a note's is cached, and
+the same command with `--overwrite` places it for free. Tell the user and let them choose; never run
+`synth` or `verify` again for it, which pays again. If the message says another Lacuna run is writing
+the file, that run is still going: wait for it rather than retrying.
 
 ## If a model refuses
 

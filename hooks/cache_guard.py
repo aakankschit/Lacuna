@@ -17,7 +17,7 @@ trusted to the cent.
 Settings: LACUNA_IDLE_MIN or `idle_minutes` in config.json (default 60),
 LACUNA_MIN_CTX (40000), LACUNA_GUARD_OFF=1 to disable entirely.
 """
-import json, os, sys, time
+import json, math, os, re, sys, time
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
@@ -29,16 +29,28 @@ except Exception:                                      # the hook must never bre
     _CFG, _PRICES = {}, {}
 
 
-def _num(value, default):
-    """A setting that must be a number. config.json is hand-edited and may hold anything, and a
-    hook that raises at import breaks every prompt in the session."""
+def _num(value, default, lo=0.0, hi=1e9):
+    """A setting that must be a finite number in [lo, hi]. config.json is hand-edited and the
+    environment is typed by hand ("inf", "nan", "-5" all parse as floats), and a hook that raises
+    at import breaks every prompt in the session: anything else is the default."""
+    if isinstance(value, bool):
+        return float(default)
     try:
-        return float(value)
+        v = float(value)
     except (TypeError, ValueError):
         return float(default)
+    return v if math.isfinite(v) and lo <= v <= hi else float(default)
 
 
-IDLE_MIN = _num(os.environ.get("LACUNA_IDLE_MIN") or _CFG.get("idle_minutes"), 60)
+def _count(d, key):
+    """A token count or duration from hook JSON: a finite non-negative number, else None."""
+    v = d.get(key) if isinstance(d, dict) else None
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0 else None
+
+
+# 1 minute to a year of idle; 0 would hold every prompt. A bad environment value falls back to the
+# config file's, then to the default.
+IDLE_MIN = _num(os.environ.get("LACUNA_IDLE_MIN"), _num(_CFG.get("idle_minutes"), 60, 1, 525_600), 1, 525_600)
 MIN_CTX = int(_num(os.environ.get("LACUNA_MIN_CTX"), 40_000))
 GRACE_S = 15 * 60
 STATE = os.path.join(_DATA, "cache_guard")
@@ -63,14 +75,14 @@ def compacted_since(path, after_ts):
             f.seek(0, 2)
             f.seek(max(0, f.tell() - 4_000_000))
             lines = f.read().decode("utf-8", "ignore").splitlines()
-    except OSError:
+    except (OSError, ValueError, TypeError):    # ValueError: a path with a NUL byte
         return False
     for ln in reversed(lines):
         if '"compact' not in ln and "isCompactSummary" not in ln:
             continue
         try:
             e = json.loads(ln)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(e, dict) or not (e.get("isCompactSummary") or e.get("subtype") == "compact_boundary"):
             continue
@@ -78,7 +90,7 @@ def compacted_since(path, after_ts):
         # must not switch the guard off for the whole session.
         try:
             when = datetime.fromisoformat((e.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
-        except ValueError:
+        except (ValueError, AttributeError, OverflowError, OSError):
             continue
         if when >= after_ts:
             return True
@@ -92,12 +104,12 @@ def last_call(path):
             f.seek(0, 2)
             f.seek(max(0, f.tell() - 4_000_000))
             lines = f.read().decode("utf-8", "ignore").splitlines()
-    except OSError:
+    except (OSError, ValueError, TypeError):    # TypeError/ValueError: a path that is not a usable string
         return None
     for ln in reversed(lines):
         try:
             e = json.loads(ln)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         m = e.get("message") if isinstance(e, dict) else None     # valid JSON that is not a call
         u = m.get("usage") if isinstance(m, dict) else None
@@ -110,10 +122,14 @@ def last_call(path):
         # merely mentions "<synthetic>" was skipped, and an idle hour was invented.
         if e["message"].get("model") == "<synthetic>":
             continue
-        ctx = (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-               + u.get("cache_read_input_tokens", 0))
-        ts = datetime.fromisoformat((e.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
-        return ts, ctx, e["message"].get("model", "")
+        ctx = sum(_count(u, k) or 0 for k in ("input_tokens", "cache_creation_input_tokens",
+                                              "cache_read_input_tokens"))
+        try:
+            ts = datetime.fromisoformat((e.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
+        except (ValueError, AttributeError, OverflowError, OSError):
+            continue          # an undated line is not a call we can age; look further back
+        model = e["message"].get("model", "")
+        return ts, ctx, model if isinstance(model, str) else ""
     return None
 
 
@@ -128,8 +144,10 @@ def state(sid, update=None):
     p = os.path.join(STATE, f"{sid}.json")
     if update is None:
         try:
-            return json.load(open(p))
-        except (OSError, ValueError):
+            with open(p) as f:
+                st = json.load(f)
+            return st if isinstance(st, dict) else {}
+        except (OSError, ValueError, RecursionError):
             return {}
     os.makedirs(STATE, exist_ok=True)
     json.dump(update, open(p, "w"))
@@ -145,24 +163,37 @@ def main():
         return
     try:
         d = json.load(sys.stdin)
-    except ValueError:
+    except (ValueError, RecursionError):
         return                      # not our payload; say nothing
-    event, sid = d.get("hook_event_name"), d.get("session_id", "unknown")
-    call = last_call(d.get("transcript_path") or "")
+    if not isinstance(d, dict):
+        return
+    event = d.get("hook_event_name")
+    # Every field is typed before use: `"transcript_path": true` once reached open(True), which is
+    # file descriptor 1, and closing it killed the hook's own output.
+    sid = d.get("session_id")
+    sid = re.sub(r"[^A-Za-z0-9_-]", "_", sid) if isinstance(sid, str) and sid else "unknown"   # it names files
+    tpath = d.get("transcript_path")
+    tpath = tpath if isinstance(tpath, str) else ""
+    prompt = d.get("prompt")
+    call = last_call(tpath)
 
     if event == "SessionStart":
         msg = ROUTING
         if d.get("source") in ("resume", "fork") and (call or "context_tokens" in d):
             # documented resume fields (Claude Code 2.1.251+); fall back to the transcript tail,
             # which is also the only place the model id is available
-            idle = d.get("seconds_since_last_response", (time.time() - call[0]) if call else 0) / 60
-            ctx = d.get("context_tokens", call[1] if call else 0)
+            idle = _count(d, "seconds_since_last_response")
+            idle = (idle if idle is not None else (time.time() - call[0]) if call else 0) / 60
+            ctx = _count(d, "context_tokens")
+            ctx = ctx if ctx is not None else call[1] if call else 0
             model = call[2] if call else ""
-            expired = d.get("prompt_cache_likely_expired", idle >= IDLE_MIN)
+            expired = d.get("prompt_cache_likely_expired")
+            expired = expired if isinstance(expired, bool) else idle >= IDLE_MIN
             if expired and ctx >= MIN_CTX:
                 est, known = rewrite_usd(ctx, model)
-                usd = d.get("estimated_cache_write_usd") or est
-                priced = "" if known or d.get("estimated_cache_write_usd") else " [unpriced model: rough]"
+                given = _count(d, "estimated_cache_write_usd")
+                usd = given or est
+                priced = "" if known or given else " [unpriced model: rough]"
                 msg = (f"Resumed after {idle / 60:.1f} h: the cache has expired, so your first prompt "
                        f"re-caches {ctx / 1000:.0f}k tokens (≈${usd:.2f} at list price{priced}). "
                        f"Cheaper: /clear and start from a written handoff. " + ROUTING)
@@ -175,14 +206,15 @@ def main():
     st = state(sid)
 
     if idle >= IDLE_MIN and ctx >= MIN_CTX:
-        if compacted_since(d.get("transcript_path") or "", ts):
+        if compacted_since(tpath, ts):
             return          # the context was replaced after that call; our figure is meaningless
         if time.time() - st.get("held_at", 0) < GRACE_S:
             state(sid, {**st, "held_at": 0})
             return  # second send after a hold: user chose to go ahead
         saved = os.path.join(STATE, f"{sid}.prompt.txt")
         os.makedirs(STATE, exist_ok=True)
-        open(saved, "w").write(d.get("prompt", ""))
+        with open(saved, "w") as f:
+            f.write(prompt if isinstance(prompt, str) else "")
         state(sid, {**st, "held_at": time.time()})
         emit({"decision": "block", "reason": (
             f"cache_guard held this prompt. The session was idle {idle / 60:.1f} h, longer than the "

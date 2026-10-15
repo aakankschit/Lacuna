@@ -8,12 +8,15 @@ PY="${LACUNA_SYSTEM_PYTHON:-python3}"
 
 command -v tmux >/dev/null || { echo "ccsplit needs tmux. Without it, split your terminal by hand and run: $ROOT/bin/lacuna pane <file>" >&2; exit 2; }
 
-results_dir=$("$PY" -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import lacuna_config; print(lacuna_config.path('results'))")
+# $ROOT as argv, not interpolated into the code: a quote in the plugin path was a SyntaxError
+results_dir=$("$PY" -c "import sys; sys.path.insert(0, sys.argv[1] + '/scripts'); import lacuna_config; print(lacuna_config.path('results'))" "$ROOT")
 mkdir -p "$results_dir"
 proj=$(basename "$PWD")
 export CLAUDE_RESULTS_FILE="$results_dir/${proj}-$(date +%Y%m%d-%H%M%S).md"
 
-viewer="$PY $HERE/results_pane.py $(printf '%q' "$CLAUDE_RESULTS_FILE")"
+# tmux runs this string through a shell, so every word is quoted: a space in the plugin path made
+# the pane die after `lacuna split` had already exited 0
+viewer="$(printf '%q ' "$PY" "$HERE/results_pane.py" "$CLAUDE_RESULTS_FILE")"
 if [ -n "${TMUX:-}" ]; then
   tmux split-window -h -l 45% -c "$PWD" "$viewer"
   tmux select-pane -L

@@ -7,7 +7,7 @@ what it must survive. Whole journeys through the pipeline are in test_pipeline.p
 
 Run: python3 -m unittest discover -s tests
 """
-import json, os, re, subprocess, sys, time, unittest
+import json, os, re, shutil, subprocess, sys, time, unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,7 +19,7 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 STARTUP, HAIKU_TIER = 3_700, 100_000
 TOP_KEYS = {"schema", "documents", "total_tokens", "per_agent", "readers", "largest_reader_tokens",
             "long_context_surcharge", "calibration", "budget_warn_usd", "estimates", "any_over_budget",
-            "cheapest_over_budget", "synthesis", "prices_retrieved", "warnings"}
+            "cheapest_over_budget", "synthesis", "prices_retrieved", "warnings", "configured"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -153,10 +153,11 @@ class TestEstimate(Sandbox):
         self.assertEqual((nothing["estimates"], nothing["any_over_budget"]), ([], False), "filtering to nothing is not a crash")
 
     def test_haiku_surcharge_applies_above_the_tier_to_the_key_haiku_only(self):
-        """R7: 5x for the model keyed exactly `haiku`, strictly above 100,000 reader tokens, with a
+        """R7: 5x for a row that is the haiku tier however it is named (`haiku`, `haiku-5-5`,
+        `claude-haiku-5-5`), but not `myhaiku`; strictly above 100,000 reader tokens, with a
         warning naming --per-agent; and lowering --per-agent clears it."""
         mk = lambda: {"low": {"usd_per_ktok": .001, "minutes_per_paper": 1}}
-        self.cal({"haiku": mk(), "haiku-5-5": mk(), "myhaiku": mk(), "sonnet": mk()})
+        self.cal({"haiku": mk(), "haiku-5-5": mk(), "claude-haiku-5-5": mk(), "myhaiku": mk(), "sonnet": mk()})
         at = write(self.p("at.md"), "a" * 279270)        # 96,300 tokens + 3,700 = 100,000 exactly
         doc = self.est_json(at)
         self.assertEqual(doc["largest_reader_tokens"], HAIKU_TIER)
@@ -168,7 +169,9 @@ class TestEstimate(Sandbox):
         self.assertTrue(any("--per-agent" in w for w in doc["warnings"]), doc["warnings"])
         tokens = 279273 / 2.9
         self.close(self.cell(doc, "haiku", "low")["usd"], tokens / 1000 * .001 * 5, "haiku x5")
-        for m in ("haiku-5-5", "myhaiku", "sonnet"):
+        for m in ("haiku-5-5", "claude-haiku-5-5"):
+            self.close(self.cell(doc, m, "low")["usd"], tokens / 1000 * .001 * 5, m + " x5")
+        for m in ("myhaiku", "sonnet"):
             self.close(self.cell(doc, m, "low")["usd"], tokens / 1000 * .001, m)
         files = [write(self.p(f"h{i}.md"), "a" * (2900 * 60)) for i in range(3)]
         self.assertTrue(self.est_json(*files, "--per-agent", "3")["long_context_surcharge"])
@@ -180,7 +183,15 @@ class TestEstimate(Sandbox):
         self.assertEqual(doc["calibration"], {"source": "upstream", "path": os.path.realpath(SHIPPED_CAL),
                                               "measured": self.shipped()["_measured"]})
         self.assertIn("Calibration: upstream", self.est(self.doc("a.md")).stdout)
-        for src, want in (("upstream", "upstream"), (None, "yours"), ("somebody", "yours")):
+        # a data-directory copy still tagged upstream is a stale copy of the shipped file (doctor
+        # used to make one): the plugin's current numbers win, and the user is told it can go
+        self.cal({"_source": "upstream", "old": {"low": {"usd_per_ktok": .007, "minutes_per_paper": 1.5}}})
+        r = self.est(self.doc("a.md"), "--json")
+        doc = json.loads(r.stdout)
+        self.assertEqual(doc["calibration"]["path"], os.path.realpath(SHIPPED_CAL))
+        self.assertNotIn("old", {e["model"] for e in doc["estimates"]})
+        self.assertIn("stale copy", r.stderr)
+        for src, want in ((None, "yours"), ("somebody", "yours")):
             with self.subTest(src=src):
                 self.cal({**({"_source": src} if src else {}), "mine": {"low": {"usd_per_ktok": .007, "minutes_per_paper": 1.5}}})
                 doc = self.est_json(self.doc("a.md"))
@@ -250,6 +261,102 @@ class TestEstimate(Sandbox):
         self.assertFalse(doc["any_over_budget"], "cost == threshold is not over")
         self.assertIsNone(doc["cheapest_over_budget"])
 
+    def test_the_configured_row_is_the_one_an_approval_gate_reads(self):
+        """`any_over_budget` is true when ANY row of the table is, so a model told to gate approval on
+        it was asking about a $2.30 sonnet/max run for a $0.018 haiku/medium one."""
+        mk = lambda u: {"usd_per_ktok": u, "minutes_per_paper": 1.0}
+        self.cal({"haiku": {"medium": mk(.001)}, "sonnet": {"max": mk(5.0)}})
+        self.config({"budget_warn_usd": 1.0})
+        f = self.doc("a.md", 10)
+        doc = self.est_json(f)
+        self.assertTrue(doc["any_over_budget"])
+        self.assertEqual(doc["configured"], {"model": "haiku", "effort": "medium", "calibrated": True,
+                                             "usd": doc["configured"]["usd"], "over_budget": False})
+        self.assertAlmostEqual(doc["configured"]["usd"], 10_000 / 1000 * .001, places=9)
+        # the configured row, however it is named in the calibration or in the config
+        self.cal({"claude-haiku-5-5": {"medium": mk(.001)}})
+        self.assertTrue(self.est_json(f)["configured"]["calibrated"])
+        self.config({"budget_warn_usd": 1.0, "models": {"reader": "claude-haiku-5-5"}})
+        self.assertTrue(self.est_json(f)["configured"]["calibrated"])
+        self.cal({"haiku": {"medium": mk(1.0)}})
+        self.assertTrue(self.est_json(f, "--model", "haiku", "--effort", "low")["configured"]["over_budget"],
+                        "a filter narrows the table, not the question")
+        self.config({"budget_warn_usd": 1.0, "models": {"reader": "opus"}})
+        doc = self.est_json(f)
+        self.assertEqual(doc["configured"],
+                         {"model": "opus", "effort": "medium", "calibrated": False, "usd": None, "over_budget": True},
+                         "an unknown cost is gated, never null")
+        self.assertTrue(any("opus" in w and "unknown" in w for w in doc["warnings"]), doc["warnings"])
+
+    def test_the_configured_row_follows_model_and_effort_flags(self):
+        """`lit estimate --model sonnet` priced the run as the configured haiku one, so a gate on
+        `configured` approved `lit read --model sonnet` at the haiku figure."""
+        mk = lambda u: {"usd_per_ktok": u, "minutes_per_paper": 1.0}
+        self.cal({"haiku": {"medium": mk(.001), "high": mk(.002)}, "sonnet": {"medium": mk(5.0)}})
+        self.config({"budget_warn_usd": 1.0})
+        f = self.doc("a.md", 10)
+        self.assertFalse(self.est_json(f)["configured"]["over_budget"])
+        c = self.est_json(f, "--model", "sonnet")["configured"]
+        self.assertEqual((c["model"], c["effort"], c["over_budget"]), ("sonnet", "medium", True))
+        c = self.est_json(f, "--effort", "high")["configured"]
+        self.assertEqual((c["model"], c["effort"]), ("haiku", "high"))
+        self.assertAlmostEqual(c["usd"], 10_000 / 1000 * .002, places=9)
+
+    def test_a_mis_shaped_calibration_unreadable_files_and_foreign_types_are_refused_not_tracebacks(self):
+        """D11: each of these was a traceback (or, in text mode, a table of nan)."""
+        f = self.doc("a.md")
+        for name, raw in {"string number": '{"haiku": {"low": {"usd_per_ktok": "0.1", "minutes_per_paper": 1}}}',
+                          "missing field": '{"haiku": {"low": {"usd_per_ktok": 0.1}}}',
+                          "cell is a number": '{"haiku": {"low": 5}}',
+                          "NaN": '{"haiku": {"low": {"usd_per_ktok": NaN, "minutes_per_paper": 1}}}',
+                          "negative": '{"haiku": {"low": {"usd_per_ktok": -1, "minutes_per_paper": 1}}}'}.items():
+            for mode in ((), ("--json",)):
+                with self.subTest(name, json=bool(mode)):
+                    write(os.path.join(self.data, "calibration.json"), raw)
+                    r = self.est(f, *mode)
+                    self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertIn("unusable", r.stderr, "the shipped calibration is used, and the user is told so")
+                    if mode:
+                        self.assertEqual(json.loads(r.stdout)["calibration"]["source"], "upstream")
+        os.remove(os.path.join(self.data, "calibration.json"))
+        locked = write(self.p("locked.md"), "x" * 3000)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o644)
+        folder = os.path.join(self.p("dir"), "folder.md")
+        os.makedirs(folder)
+        write(os.path.join(self.p("dir"), "real.md"), "x" * 3000)
+        for name, args, code in (("unreadable file", [locked], 2), ("a .docx by name", [write(self.p("p.docx"), "x" * 3000)], 2),
+                                 ("a directory named *.md", [self.p("dir")], 0)):
+            with self.subTest(name):
+                if name == "unreadable file" and os.access(locked, os.R_OK):
+                    self.skipTest("running as a user who can read anything")
+                r = self.est(*args, "--json")
+                self.assertEqual((r.returncode, "Traceback" in r.stderr), (code, False), r.stderr[-300:])
+                if code == 0:
+                    self.assertEqual(json.loads(r.stdout)["documents"], 1, "the folder is not a document")
+                else:
+                    self.assertEqual(r.stdout, "")
+
+    def test_a_directory_of_uppercase_extensions_is_priced(self):
+        d = self.p("docs")
+        write(os.path.join(d, "A.MD"), "a" * 3000)
+        write(os.path.join(d, "B.TXT"), "b" * 3000)
+        self.assertEqual(self.est_json(d)["documents"], 2)
+
+    def test_a_calibration_warning_is_in_the_report_only_when_that_file_is_in_use(self):
+        write(os.path.join(self.data, "calibration.json"), "[1]")
+        f = self.doc("a.md")
+        r = self.est(f)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("unusable", r.stderr, "text mode says so on stderr")
+        self.assertTrue(any("unusable" in w for w in json.loads(self.est(f, "--json").stdout)["warnings"]))
+        code = ("import sys, json; sys.path.insert(0, %r)\nimport lit_cost as C\n"
+                "r, x = C.estimate([%r], 1, cal=C.json.load(open(%r)))\nprint(json.dumps(r['warnings']))\n") % (
+                LIT, f, SHIPPED_CAL)
+        r = self.run_py(["-c", code])
+        self.assertEqual((r.returncode, json.loads(r.stdout)), (0, []), "an explicit calibration inherits no warning")
+
     def test_bad_budget_disables_the_check_with_a_warning(self):
         """R11: config.json is hand-edited. A non-number warns and disables; 0, negative and
         null disable silently; a traceback is never the answer."""
@@ -300,12 +407,24 @@ class TestEstimate(Sandbox):
         r = self.est("--help")
         self.assertIn(r.returncode, (0, 2))
         self.assertIn("--json", r.stdout + r.stderr)
+        # the help text is generated from READABLE, so it cannot drift from what the scan accepts
+        exts = self.run_py(["-c", f"import sys; sys.path.insert(0, {LIT!r}); import lit_cost; "
+                                  f"print(*lit_cost.READABLE)"]).stdout.split()
+        self.assertGreater(len(exts), 3)
+        for e in exts:
+            with self.subTest(ext=e):
+                self.assertIn(e, " ".join(r.stdout.split()))
 
     def test_unreadable_pdf_is_refused_rather_than_priced_at_zero(self):
         """Exit 2 when a PDF yields no text; exit 3 when there is no extractor at all. Never
         "$0.00, exit 0", which told a user the run was free."""
         pdf = write(self.p("broken.pdf"), "%PDF-1.4 not really a pdf")
         r = self.est(pdf, LACUNA_PYTHON=self.p("no-venv", "python"))
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        # the extension test is case-insensitive, as the directory scan is: an uppercase .PDF was
+        # priced as raw text (its bytes counted as words) instead of going through the extractor
+        upper = write(self.p("BROKEN2.PDF"), "%PDF-1.4 not really a pdf")
+        r = self.est(upper, LACUNA_PYTHON=self.p("no-venv", "python"))
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
         self.assertEqual(self.est(pdf, "--json", LACUNA_PYTHON=self.p("no-venv", "python")).stdout, "")
         silent = write(self.p("venv", "python"), "#!/bin/sh\nexit 0\n", 0o755)   # a parser that extracts nothing
@@ -359,9 +478,30 @@ class TestEstimate(Sandbox):
         """R16: the two documents that tell a model how to call this."""
         usage_lines = [l for l in read(os.path.join(ROOT, "bin", "lacuna")).splitlines() if "lacuna lit estimate" in l]
         self.assertTrue(any("--json" in l for l in usage_lines), usage_lines)
+        # every flag a subcommand accepts is in its entry of `lacuna --help` (--overwrite, the flag
+        # every refusal names, was missing)
+        usage = self.lacuna("--help").stdout.splitlines()
+        for entry, script, args in (
+                ("  lacuna doctor", os.path.join(ROOT, "scripts", "doctor.py"), []),
+                ("  lacuna spend", os.path.join(ROOT, "scripts", "cost", "spend.py"), []),
+                ("  lacuna lit read", os.path.join(LIT, "lit_pipeline.py"), ["read"]),
+                ("  lacuna lit synth", os.path.join(LIT, "lit_pipeline.py"), ["synth"]),
+                ("  lacuna lit verify", os.path.join(LIT, "lit_pipeline.py"), ["verify"]),
+                ("  lacuna lit estimate", LIT_COST, [])):
+            with self.subTest(entry=entry):
+                i = next(n for n, l in enumerate(usage) if l.startswith(entry))
+                text = usage[i]
+                for l in usage[i + 1:]:
+                    if not l.startswith(" " * 18):          # the command's own continuation lines
+                        break
+                    text += " " + l
+                helped = self.run_py([script, *args, "--help"]).stdout
+                flags = set(re.findall(r"(?m)^\s+(?:-\w, )?(--[a-z][\w-]*)", helped)) - {"--help"}
+                self.assertGreater(len(flags), 0)
+                self.assertEqual(flags - set(re.findall(r"--[a-z][\w-]*", text)), set(), text)
         skill = read(os.path.join(ROOT, "skills", "lit-review", "SKILL.md"))
         self.assertIn("lit estimate", skill)
-        self.assertIn("any_over_budget", skill, "the skill must name the field it gates approval on")
+        self.assertIn("configured.over_budget", skill, "the skill must name the field it gates approval on")
 
 
 # --------------------------------------------------------------------------------------------
@@ -449,9 +589,65 @@ class TestSpend(Sandbox):
         self.assertIn("$0.01–$0.41 list price, a lower bound", s)       # +100k sonnet 1h write, $0.40
         self.assertIn("1 call(s) were retried", s)
         self.assertIn("$1.32–$1.72 list price, a lower bound", fleet, "a fork's copied calls are counted once")
+        self.assertIn("1 call(s) were retried", fleet, "the fleet report says so too, not only the session's")
         s, _ = self.spend("--session", self.session)
         self.assertIn("$1.06 list price, a lower bound", s, "no retries: one figure, still called a lower bound")
         self.assertNotIn("retried", s)
+
+    def test_every_subtotal_shows_the_range_not_only_the_headline(self):
+        """The docs say every figure is a lower bound with earlier attempts as the top of a range.
+        The subagent line, the per-model and per-kind fleet figures and the category split priced
+        only the last attempt, beside a headline that was a range."""
+        now = datetime.now(timezone.utc) - timedelta(minutes=5)
+        sid = "dddd4444-0000-0000-0000-000000000000"
+        proj = os.path.join(self.home, ".claude", "projects", "-work-sub")
+        main = jsonl(os.path.join(proj, sid + ".jsonl"), [call("zm1", "claude-sonnet-5-5", now, usage(out=1_000))])
+        retried = call("zs1", "claude-opus-5-5", now, {**usage(out=1_000), "iterations": [
+            {**usage(out=500_000), "model": "claude-opus-5-5", "type": "message"},     # +$10.00 if billed
+            {**usage(out=1_000), "model": "claude-opus-5-5", "type": "message"}]})
+        jsonl(os.path.join(proj, sid, "subagents", "a.jsonl"), [retried])
+        s, fleet = self.spend("--session", main)
+        sub = next(l for l in s.splitlines() if "subagents:" in l)
+        self.assertIn("subagents: 1 runs, $0.02–$10.02", sub)
+        self.assertIn("opus-5-5 ×1 $0.02–$10.02", sub)
+        self.assertIn("subagents $0.27–$10.27", fleet)
+        self.assertIn("opus-5-5 $0.02–$10.02", fleet)
+        self.assertIn("work-sub $0.03–$10.03", fleet)
+        # the session's own category split and expensive-turn list, for a retried main-thread call
+        t = jsonl(os.path.join(proj, "eeee5555.jsonl"), [call("zr1", "claude-opus-5-5", now, {**usage(out=1_000), "iterations": [
+            {**usage(out=500_000), "model": "claude-opus-5-5", "type": "message"},
+            {**usage(out=1_000), "model": "claude-opus-5-5", "type": "message"}]})])
+        late = now - timedelta(hours=3)
+        cold = jsonl(os.path.join(proj, "ffff6666.jsonl"), [
+            call("zc1", "claude-opus-5-5", late, usage(0, 0, 100_000, 10)),
+            call("zc2", "claude-opus-5-5", now, {**usage(0, 100_000, 0, 10), "iterations": [
+                {**usage(out=500_000), "model": "claude-opus-5-5", "type": "message"},
+                {**usage(0, 100_000, 0, 10), "model": "claude-opus-5-5", "type": "message"}]})])
+        s, fleet = self.spend("--session", cold)
+        self.assertRegex(s, r"1 cold rewrites cost \$\d+\.\d\d–\$")
+        self.assertRegex(fleet, r"\d cold rewrites \$\d+\.\d\d–\$")
+        with open(t, "a") as f:
+            f.write("[" * 100_000 + "\n")           # nested past the recursion limit: a torn line, not a crash
+        s, _ = self.spend("--session", t)
+        self.assertIn("output+thinking $0.02–$10.02", s)
+        self.assertIn("$0.020–$10.020", s, "the most-expensive-turns list")
+
+    def test_a_warm_cache_with_a_big_new_write_is_not_labelled_a_cold_rewrite(self):
+        """The per-turn label in the session table had its own copy of the old fixed-threshold rule;
+        only the count line used is_cold. A call that read 11,115 of the previous 11,117 tokens and
+        wrote 43,903 45 s later is the cache working."""
+        now = datetime.now(timezone.utc) - timedelta(minutes=5)
+        s_ = "claude-sonnet-5-5"
+        t = jsonl(os.path.join(self.home, ".claude", "projects", "-w-p", "aaaa.jsonl"), [
+            call("wa", s_, now - timedelta(seconds=45), usage(0, 11_117, 0, 100)),
+            call("wb", s_, now, usage(0, 43_903, 11_115, 100))])
+        s, _ = self.spend("--session", t)
+        self.assertNotIn("cold rewrite", s)
+        late = jsonl(os.path.join(self.home, ".claude", "projects", "-w-p", "bbbb.jsonl"), [
+            call("wc", s_, now - timedelta(hours=3), usage(0, 50_000, 0, 100)),
+            call("wd", s_, now, usage(0, 52_000, 0, 100))])
+        s, _ = self.spend("--session", late)
+        self.assertIn("cold rewrite", s)
 
     def test_session_id_prefix_resolves_and_an_unknown_id_exits_2(self):
         jsonl(os.path.join(self.proj, "zzzz9999.jsonl"), [call("x", "claude-haiku-5-5", datetime.now(timezone.utc), usage(out=10))])
@@ -535,6 +731,26 @@ class TestStatusline(Sandbox):
         self.assertIn("last $", narrow)
         r = self.run_py([os.path.join(ROOT, "statusline", "statusline.py")], input="not json")
         self.assertEqual((r.returncode, r.stderr), (0, ""), "a status line that prints a traceback is worse than none")
+        # every field is typed: `true` as a path was open(True), file descriptor 1, and closing it
+        # killed the status line's own stdout (exit 120). A wrong-typed field blanks its segment.
+        for name, over in {"bool path": {"transcript_path": True}, "int path": {"transcript_path": 1},
+                           "list path": {"transcript_path": ["x"]}, "NUL path": {"transcript_path": "a\0b"},
+                           "model": {"model": 5}, "model name": {"model": {"display_name": 7, "id": []}},
+                           "effort": {"effort": "high"}, "window": {"context_window": [1]},
+                           "usage": {"context_window": {"current_usage": {"input_tokens": "9", "cache_read_input_tokens": [1]},
+                                                        "context_window_size": "big"}},
+                           "nan": {"context_window": {"current_usage": {"input_tokens": float("nan")}}},
+                           "cache": {"prompt_cache": {"expires_at": "soon", "hit_ratio": [1], "ttl": 5}},
+                           "rates": {"rate_limits": {"five_hour": {"used_percentage": float("inf"), "resets_at": "x"},
+                                                     "seven_day": 5}},
+                           "cost": {"cost": {"total_cost_usd": "free"}}, "cwd": {"cwd": 5, "workspace": {"project_dir": 3}},
+                           "top level": []}.items():
+            with self.subTest(name):
+                r = self.run_py([os.path.join(ROOT, "statusline", "statusline.py")],
+                                input=json.dumps(over if isinstance(over, dict) else over).replace("NaN", "NaN"))
+                self.assertEqual((r.returncode, r.stderr), (0, ""))
+                if isinstance(over, dict):
+                    self.assertIn("session", strip_ansi(r.stdout), "a valid segment is still printed")
 
     def test_reads_the_data_dir_prices_and_transcript_as_the_cli_does(self):
         """It is self-contained by design, and fell behind the CLI three ways at once: "~" in
@@ -651,7 +867,46 @@ class TestCacheGuard(Sandbox):
         tp = self.transcript(timedelta(hours=3), with_timestamp=False)
         r = self.prompt(tp)
         self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
-        for cfg in ({"idle_minutes": "sixty"}, {"idle_minutes": None}):
+        # hook JSON of the wrong type: `true` as a path is open(True), file descriptor 1
+        tp = self.transcript(timedelta(hours=3))
+        for name, over in {"bool path": {"transcript_path": True}, "list path": {"transcript_path": [tp]},
+                           "NUL path": {"transcript_path": "a\0b"}, "sid": {"session_id": ["x"], "transcript_path": tp},
+                           "path-like sid": {"session_id": "../../escape", "transcript_path": tp},
+                           "prompt": {"prompt": 5, "transcript_path": tp},
+                           "resume numbers": {"hook_event_name": "SessionStart", "source": "resume", "transcript_path": tp,
+                                              "seconds_since_last_response": "long", "context_tokens": [1],
+                                              "estimated_cache_write_usd": "x", "prompt_cache_likely_expired": "yes"}}.items():
+            with self.subTest(name):
+                r = self.guard({"hook_event_name": "UserPromptSubmit", "session_id": "s9", **over})
+                self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+                if r.stdout.strip():
+                    json.loads(r.stdout)                  # whatever it says is still valid hook JSON
+        for stray in ("escape.json", "escape.prompt.txt"):      # a session id names files: it cannot climb out
+            self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.data), stray)), stray)
+        # whatever else goes wrong (here: the state directory is a file) still exits 0
+        import shutil
+        shutil.rmtree(os.path.join(self.data, "cache_guard"), ignore_errors=True)
+        write(os.path.join(self.data, "cache_guard"), "in the way")
+        r = self.prompt(self.transcript(timedelta(hours=3)), sid="s4")
+        self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+        os.remove(os.path.join(self.data, "cache_guard"))
+        r = self.guard({"hook_event_name": "SessionStart", "session_id": "s6", "transcript_path": True})
+        self.assertIn("Routing", json.loads(r.stdout)["systemMessage"], "a bool path must not close the hook's stdout")
+        # a transcript line nested past the recursion limit is skipped like any torn line
+        r = self.prompt(self.transcript(timedelta(hours=3), extra=["[" * 100_000]), sid="s5")
+        self.assertEqual(json.loads(r.stdout)["decision"], "block")
+        # an unusable number in the environment is the default, not an OverflowError at import
+        for var in ("LACUNA_MIN_CTX", "LACUNA_IDLE_MIN"):
+            for bad in ("inf", "-inf", "nan", "-5", "1e999", "0", "abc"):
+                with self.subTest(var=var, value=bad):
+                    r = self.guard({"hook_event_name": "SessionStart", "source": "startup", "session_id": "t"}, **{var: bad})
+                    self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+                    self.assertIn("60 min", json.loads(r.stdout)["systemMessage"])
+        r = self.guard({"hook_event_name": "UserPromptSubmit", "session_id": "s7", "prompt": "x",
+                        "transcript_path": self.transcript(timedelta(hours=3), ctx=50_000)}, LACUNA_MIN_CTX="inf")
+        self.assertEqual(json.loads(r.stdout)["decision"], "block", "MIN_CTX=inf is the 40k default, not 'never hold'")
+        for cfg in ({"idle_minutes": "sixty"}, {"idle_minutes": None}, {"idle_minutes": float("inf")},
+                    {"idle_minutes": -1}, {"idle_minutes": 0}, {"idle_minutes": True}):
             with self.subTest(cfg):
                 self.config(cfg)
                 r = self.guard({"hook_event_name": "SessionStart", "source": "startup", "session_id": "t"})
@@ -684,8 +939,11 @@ class TestDoctor(Sandbox):
         self.assertRegex(r.stdout, r"fix: \S*bin/lacuna doctor --install-pdf", "a new user has no `lacuna` on PATH yet")
         self.assertIn("1 BLOCKING", r.stdout)
         # NOT the count of optional pieces: it varies with whether rich and tmux are installed
-        for rel in ("cache", "books", "config.json", "calibration.json"):
+        for rel in ("cache", "books", "config.json"):
             self.assertTrue(os.path.exists(os.path.join(self.data, rel)), rel)
+        # a copy here would beat every later shipped calibration forever (lit_cost prefers the data dir)
+        self.assertFalse(os.path.exists(os.path.join(self.data, "calibration.json")),
+                         "doctor must not copy the shipped calibration into the data directory")
         self.assertFalse([d for d in os.listdir(self.data) if d.startswith("venv")], "no venv without --install-*")
         cfg = json.loads(read(os.path.join(self.data, "config.json")))
         self.assertEqual(cfg.get("models"), {}, "defaults are not baked in: a later release's better default must reach this user")
@@ -700,6 +958,85 @@ class TestDoctor(Sandbox):
                 self.assertNotIn("Traceback", r.stderr)
                 self.assertIn("left untouched", r.stdout)
                 self.assertEqual((read(cfg), read(cal)), (body, '{"_source": "mine"}'))
+
+    def test_reports_a_settings_file_it_could_not_use(self):
+        """A malformed config.json, pricing.json or calibration.json is ignored by every other
+        command, and doctor once printed [ok] beside each and exited 0."""
+        fake = write(self.p("bin2", "claude"), "#!/bin/sh\nexit 0\n", 0o755)
+        env = dict(PATH=f"{os.path.dirname(fake)}:{SAFE_PATH}")
+        self.assertEqual(self.doctor(**env).returncode, 0, "precondition: nothing else is wrong")
+        for name, body in (("config.json", '{"models": {"coder": "x",}}'), ("pricing.json", '{"models": {"a": [1,],}}'),
+                           ("calibration.json", '{"haiku": {')):
+            with self.subTest(name):
+                path = write(os.path.join(self.data, name), body)
+                r = self.doctor(**env)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertRegex(r.stdout, r"\[MISS\][^\n]*\n\s+" + re.escape(path), "the file is named, as a problem")
+                self.assertNotRegex(r.stdout, r"\[ok  \] " + re.escape(path), "an unusable file is not [ok]")
+                self.assertEqual(read(path), body, "doctor must not rewrite it")
+                os.remove(path)
+
+    def test_a_setting_that_fell_back_is_a_note_and_a_stale_calibration_is_called_stale(self):
+        """A mistyped value falls back to its default; doctor called it a blocking MISS ("Fix the MISS
+        lines before anything will work") and /lacuna-doctor, whose injection fails on exit 1, then
+        showed nothing. A copy of the shipped calibration tagged upstream is ignored by `lit estimate`,
+        so doctor must not call it "yours"."""
+        fake = write(self.p("bin2", "claude"), "#!/bin/sh\nexit 0\n", 0o755)
+        env = dict(PATH=f"{os.path.dirname(fake)}:{SAFE_PATH}")
+        for body in ('{"models": {"reader": 5}}', '{"effort": {"reader": true}}', '{"paths": []}'):
+            with self.subTest(body):
+                path = write(os.path.join(self.data, "config.json"), body)
+                r = self.doctor(**env)
+                self.assertEqual(r.returncode, 0, r.stdout)
+                self.assertRegex(r.stdout, r"\[note\] a setting was not used as written")
+                self.assertNotIn("MISS", r.stdout)
+                self.assertNotIn("BLOCKING", r.stdout)
+        os.remove(path)
+        cal = write(os.path.join(self.data, "calibration.json"), '{"_source": "upstream"}')
+        r = self.doctor(**env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("stale copy", r.stdout)
+        self.assertNotIn("yours", r.stdout.split(cal)[1].split("\n\n")[0])
+
+    def test_the_dev_cycle_headless_recipe_passes_effort(self):
+        """The recipe pinned the model and dropped the agents' effort, so a headless coder ran at the
+        CLI default. Effort is a cost multiplier."""
+        skill = read(os.path.join(ROOT, "skills", "dev-cycle", "SKILL.md"))
+        cmd = next(l for l in skill.splitlines() if l.startswith("claude -p"))
+        self.assertIn('--effort "$EFFORT"', cmd)
+        self.assertIn("['effort']['coder']", skill, "and takes it from the configuration")
+
+    def test_every_shell_injection_in_a_command_or_skill_is_guarded(self):
+        """A failing !`cmd` aborts the whole slash-command invocation and Claude never sees the
+        output (code.claude.com, slash-commands). doctor exits 1 exactly when it has something to
+        report, and spend exits 2 on a bad argument, so each injection ends `|| true`."""
+        import glob
+        files = glob.glob(os.path.join(ROOT, "commands", "*.md")) + glob.glob(os.path.join(ROOT, "skills", "*", "SKILL.md"))
+        found = []
+        for f in files:
+            for line in read(f).splitlines():
+                if re.search(r"(?<!`)!`[^`]+`", line):
+                    found.append((f, line))
+                    self.assertRegex(line, r"\|\| true`", f"{os.path.relpath(f, ROOT)}: {line}")
+        self.assertGreaterEqual(len(found), 2, "the check must see the injections it guards")
+
+    def test_checks_the_directories_lacuna_resolves(self):
+        """cache and books follow config.json and LACUNA_CACHE/LACUNA_BOOKS; doctor checked, and
+        created, <data>/cache and <data>/books regardless."""
+        cache, books = self.p("elsewhere", "cache"), self.p("elsewhere", "books")
+        r = self.doctor(LACUNA_CACHE=cache, LACUNA_BOOKS=books)
+        for d in (cache, books):
+            self.assertTrue(os.path.isdir(d), d)
+            self.assertRegex(r.stdout, r"\[ok  \] " + re.escape(d))
+        self.assertEqual([x for x in ("cache", "books") if os.path.exists(os.path.join(self.data, x))], [])
+
+    def test_a_data_directory_that_is_a_file_is_a_problem_not_a_traceback(self):
+        blocker = write(self.p("afile"), "x")
+        r = self.doctor(LACUNA_DATA=blocker)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(r.stdout, r"\[MISS\] " + re.escape(blocker))
 
     def test_finds_claude_and_probes_a_parser_by_the_symbols_actually_used(self):
         """`import marker` succeeds for any marker version (a namespace package), so the probe
@@ -736,6 +1073,120 @@ class TestConfigReport(Sandbox):
         self.assertEqual(json.loads(self.lacuna("config", "--json").stdout)["models"]["planner"], "mine")
         self.assertEqual(self.calls(), [])
 
+    def test_absurdly_nested_json_files_are_reported_not_raised(self):
+        """json.load raises RecursionError on deep nesting, which is not a ValueError: every command
+        died on a hand-edited config.json, though this module must never raise on bad input."""
+        deep = "[" * 100_000 + "]" * 100_000
+        for name in ("config.json", "pricing.json", "calibration.json"):
+            with self.subTest(name):
+                write(os.path.join(self.data, name), deep)
+                r = self.lacuna("config")
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                self.assertNotIn("Traceback", r.stderr)
+                r = self.lacuna("lit", "estimate", write(self.p("a.md"), "x " * 500))
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                self.assertNotIn("Traceback", r.stderr)
+                os.remove(os.path.join(self.data, name))
+        write(os.path.join(self.data, "config.json"), deep)
+        self.assertIn("not valid JSON", self.lacuna("config").stdout)
+
+    def test_a_config_or_pricing_file_that_was_not_used_is_said_by_every_command_that_spends(self):
+        """A trailing comma sent `synth` to the default planner, skipped the user's after.synth hook
+        and priced at shipped rates, and only `lacuna config` ever mentioned it."""
+        doc = self.doc_file()
+        write(os.path.join(self.data, "config.json"), '{"models": {"planner": "sonnet"},}')
+        runs = {"lit estimate": self.lacuna("lit", "estimate", doc),
+                "spend": self.lacuna("spend"),
+                "lit verify": self.lacuna("lit", "verify", "--target", self.p("nope.md"), "--repo", self.tmp)}
+        for name, r in runs.items():
+            with self.subTest(name):
+                self.assertIn("config.json", r.stderr)
+                self.assertIn("not valid JSON", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.calls(), [])
+        os.remove(os.path.join(self.data, "config.json"))
+        for body, needle in (("[1, 2", "pricing.json: not valid JSON"), ("[1]", "should be an object"),
+                             ('{"models": {"opus-5-5": "12345", "sonnet-5-5": [1, -2, 3, 4, 5]}}', "opus-5-5")):
+            with self.subTest(body):
+                write(os.path.join(self.data, "pricing.json"), body)
+                for r in (self.lacuna("lit", "estimate", doc), self.lacuna("spend")):
+                    self.assertIn(needle, r.stderr)
+        os.remove(os.path.join(self.data, "pricing.json"))
+        for r in (self.lacuna("lit", "estimate", doc), self.lacuna("spend")):
+            self.assertEqual(r.stderr, "", "nothing to say when the files are fine")
+        # a hook and the status line are not the place to talk
+        write(os.path.join(self.data, "config.json"), '{"models": {},}')
+        r = self.run_py([os.path.join(ROOT, "hooks", "cache_guard.py")], input='{"hook_event_name": "SessionStart"}')
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+
+    def doc_file(self):
+        return write(self.p("a.md"), "a" * 3000)
+
+    def test_wrong_typed_settings_fall_back_to_the_default_and_say_so(self):
+        """D10: a number for a model crashed estimate, read and synth; `"cache": true` made a
+        directory named ./True; `config` showed the raw value rather than the one in effect."""
+        doc = self.doc_file()
+        for cfg in ({"models": {"planner": 5}}, {"models": {"planner": ["sonnet"]}}, {"models": {"reader": {"id": "x"}}},
+                    {"effort": {"reader": 5}}, {"paths": {"cache": True}}, {"paths": {"python": ["a"]}},
+                    {"after": {"read": 5}}, {"after": {"read": ["/bin/echo", "x"]}}, {"paths": {"cache": "a\u0000b"}}, {"models": {"reader": "  "}}):
+            with self.subTest(cfg):
+                self.config(cfg)
+                for args in (("config",), ("config", "--json"), ("lit", "estimate", doc, "--json"), ("lit", "estimate", doc)):
+                    r = self.lacuna(*args)
+                    self.assertEqual(r.returncode, 0, f"{args}: {r.stderr[-300:]}")
+                    self.assertNotIn("Traceback", r.stderr)
+                out = json.loads(self.lacuna("config", "--json").stdout)
+                self.assertEqual(out["models"], json.loads(json.dumps(out["models"])))
+                for section in ("models", "effort", "paths"):
+                    for k, v in out[section].items():
+                        self.assertIsInstance(v, str, f"{section}.{k} shows the value in effect")
+                        self.assertTrue(v.strip())
+        self.config({"models": {"planner": 5}, "paths": {"cache": True}})
+        r = self.lacuna("config")
+        self.assertIn("planner should be text, not 5", r.stdout)
+        self.assertIn("planner=claude-opus-5", r.stdout, "the default is shown, not 5")
+        self.assertNotRegex(r.stdout, r"planner=5")
+        r = self.lacuna("lit", "read", doc, "--out", self.p("out"))
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "True")), "a bool is not a path")
+
+    def test_a_null_or_empty_setting_means_the_default_and_is_not_an_error(self):
+        self.config({"effort": {"reader": None}, "models": {"planner": ""}, "paths": {"cache": None}})
+        r = self.lacuna("config")
+        self.assertNotIn("should be text", r.stdout)
+        self.assertEqual(json.loads(self.lacuna("config", "--json").stdout)["errors"], [])
+
+    def test_config_json_output_is_strict_json(self):
+        for body in ('{"budget_warn_usd": NaN}', '{"idle_minutes": Infinity}', '{"after": {"read": [NaN]}}'):
+            with self.subTest(body):
+                write(os.path.join(self.data, "config.json"), body)
+                r = self.lacuna("config", "--json")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                json.loads(r.stdout, parse_constant=lambda c: self.fail(f"{c} is not JSON"))
+
+    def test_a_relative_path_is_taken_from_the_data_directory_not_the_cwd(self):
+        """A relative paths.cache followed the cwd, so the cache split and papers were read again."""
+        write(os.path.join(self.data, "config.json"), '{"paths": {"cache": "mycache", "books": "/srv/books"}}')
+        for cwd in (self.p("one"), self.p("two")):
+            os.makedirs(cwd)
+            got = json.loads(self.lacuna("config", "--json", cwd=cwd).stdout)["paths"]
+            self.assertEqual(got["cache"], os.path.join(os.path.abspath(self.data), "mycache"))
+            self.assertEqual(got["books"], "/srv/books", "an absolute path is left alone")
+
+    def test_a_price_override_applies_however_the_model_is_named(self):
+        """D15: `claude-opus-5-5` in pricing.json priced nothing for a role configured as `opus`,
+        because the alias resolves to `opus-5-5`."""
+        f = self.doc_file()
+        base = json.loads(self.lacuna("config", "--json").stdout)["prices"]
+        self.assertIn("opus-5-5", base)
+        write(os.path.join(self.data, "pricing.json"), json.dumps({"models": {"claude-opus-5-5": [1, 2, 3, 4, 77]}}))
+        self.config({"models": {"planner": "opus"}})
+        prices = json.loads(self.lacuna("config", "--json").stdout)["prices"]
+        self.assertEqual(prices["opus-5-5"], [1, 2, 3, 4, 77])
+        self.assertNotIn("claude-opus-5-5", prices)
+        syn = json.loads(self.lacuna("lit", "estimate", f, "--json").stdout)["synthesis"]
+        self.assertAlmostEqual(syn["usd"], syn["context_tokens"] * 3 / 1e6 + 8_000 * 77 / 1e6, places=9)
+
 
 FAKE_PYMUPDF = '''
 import json, os
@@ -750,7 +1201,9 @@ class _Doc:
         self.metadata = {"title": _spec.get("title", "")}
     def get_toc(self): return [tuple(x) for x in _spec["toc"]]
     def __getitem__(self, i): return _Page(self._pages[i])
-def open(path): return _Doc()
+def open(path):
+    if _spec.get("corrupt"): raise RuntimeError("Failed to open file %r." % path)
+    return _Doc()
 '''
 
 
@@ -760,10 +1213,10 @@ class TestSplitBook(Sandbox):
 
     PAGES = ["alpha page", "beta page", "gamma page", "delta page", "epsilon page"]
 
-    def split(self, toc, pages=None, title="My Book"):
+    def split(self, toc, pages=None, title="My Book", outdir=None, corrupt=False):
         write(self.p("fake", "pymupdf.py"), FAKE_PYMUPDF)
-        write(self.p("spec.json"), json.dumps({"pages": pages or self.PAGES, "toc": toc, "title": title}))
-        self.outdir = self.p("books", "mybook")
+        write(self.p("spec.json"), json.dumps({"pages": pages or self.PAGES, "toc": toc, "title": title, "corrupt": corrupt}))
+        self.outdir = outdir or self.p("books", "mybook")
         return self.run_py([os.path.join(LIT, "split_book.py"), write(self.p("book.pdf"), "%PDF"), self.outdir],
                            PYTHONPATH=self.p("fake"), FAKE_PDF_SPEC=self.p("spec.json"))
 
@@ -805,6 +1258,63 @@ class TestSplitBook(Sandbox):
         g = subprocess.run(["grep", "-c", "page", os.path.join(self.outdir, "00_Introduction.txt")], capture_output=True, text=True)
         self.assertEqual(g.returncode, 0, "grep found nothing in the chapter file")
         self.assertNotIn("Binary file", g.stdout + g.stderr)
+        # The same, from a bookmark title: it is the chapter file's first line and a row of toc.md.
+        r = self.split([[1, "Chapter 1\x00", 1], [1, "Chapter 2\rKernels | Priors", 3]], title="Bayes\x00Opt")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        toc = self.chapter("toc.md")
+        self.assertEqual(re.findall(r"[\x00-\x08\x0b-\x1f\x7f]", toc + self.chapter("00_Chapter_1.txt")), [])
+        self.assertIn("| Chapter 2 Kernels \\| Priors | `01_Chapter_2_Kernels_Priors.txt` |", toc,
+                      "a `|` in a title must not start a new column")
+        g = subprocess.run(["grep", "-c", "alpha", os.path.join(self.outdir, "00_Chapter_1.txt")], capture_output=True, text=True)
+        self.assertEqual((g.returncode, g.stdout.strip()), (0, "1"), g.stdout + g.stderr)
+
+    def test_warns_of_a_chapter_with_no_readable_text(self):
+        """A font with no Unicode map extracts as U+FFFD: a long chapter that no grep can match."""
+        r = self.split([[1, "Readable", 1], [1, "Garbled", 3]],
+                       pages=["alpha page " * 40, "beta page " * 40, "\ufffd" * 400, "\ue012" * 400, "epsilon page"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("'Garbled' (pp. 3-5): 800 unreadable glyphs", r.stderr)
+        self.assertNotIn("'Readable'", r.stderr)
+
+    def test_resplit_replaces_its_own_chapters_and_nothing_else(self):
+        """Re-splitting into the same directory left the old chapters beside the new toc.md, and
+        every grep over the book found them."""
+        r = self.split([[1, f"Old chapter {i}", i] for i in range(1, 6)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mine = [write(os.path.join(self.outdir, n), "my own notes") for n in ("notes.txt", "99_mine.txt")]
+        r = self.split([[1, "New one", 1], [1, "New two", 3]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.outdir)),
+                         ["00_New_one.txt", "01_New_two.txt", "99_mine.txt", "index.json", "notes.txt", "toc.md"],
+                         "the old split's chapters go; files it did not write stay")
+        self.assertEqual([read(m) for m in mine], ["my own notes"] * 2)
+
+    def test_resplit_never_deletes_a_chapter_it_just_wrote(self):
+        """On a case-insensitive disk a re-split with a case-only title change wrote
+        00_INTRODUCTION.txt over 00_Introduction.txt, then deleted the "stale" name: every new
+        chapter gone, exit 0. A symlink makes two names one file on any disk."""
+        r = self.split([[1, "Introduction", 1], [1, "Methods", 3]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        real = os.path.join(self.outdir, "00_Introduction.txt")
+        os.symlink(real, os.path.join(self.outdir, "00_Intro.txt"))
+        r = self.split([[1, "Intro", 1], [1, "Methods", 3]], outdir=self.outdir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for row in self.index():
+            self.assertTrue(os.path.exists(os.path.join(self.outdir, row["file"])), row["file"])
+        self.assertIn("alpha page", self.chapter("00_Intro.txt"))
+
+    def test_says_whether_readers_are_offered_the_book(self):
+        """Readers are offered <books>/<name>/toc.md and nothing else; a book split anywhere else
+        exited 0 and was silently never offered."""
+        books = os.path.join(self.data, "books")
+        r = self.split([[1, "Only", 1]], outdir=os.path.join(books, "gp"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"offered it as {os.path.join(books, 'gp', 'toc.md')}", r.stdout)
+        self.assertNotIn("NOT offered", r.stderr)
+        r = self.split([[1, "Only", 1]], outdir=self.p("mybooks", "gp"))
+        self.assertEqual(r.returncode, 0, "the chapters are fine; only the offer is missing")
+        self.assertIn("NOT offered", r.stderr)
+        self.assertIn(os.path.join(books, "gp"), r.stderr, "and it says where to put the book instead")
 
     def test_picks_a_useful_toc_level_and_tolerates_unsorted_or_shared_pages(self):
         """A book organised in Parts has a handful of level-1 entries over hundreds of pages;
@@ -834,6 +1344,11 @@ class TestSplitBook(Sandbox):
         self.assertEqual(r.returncode, 2)
         self.assertIn("no table of contents", r.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.outdir, "toc.md")), "a book that cannot be split must not be offered to readers")
+        r = self.split([[1, "Only", 1]], corrupt=True)
+        self.assertEqual(r.returncode, 3, "a PDF pymupdf cannot open is a parse failure, not a crash")
+        self.assertIn("could not read book.pdf (RuntimeError: Failed to open file", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(os.path.exists(self.outdir), "nothing was written")
 
 
 class TestPrepMdCLI(Sandbox):
@@ -869,6 +1384,39 @@ class TestResultsPane(Sandbox):
         self.assertIn("Title", r.stdout)
         self.assertIn("bold", r.stdout)
 
+    def test_plain_text_frame_fits_the_terminal(self):
+        """Without rich a long paragraph is one line the terminal wraps, so a 10-row frame needed
+        26 rows and scrolled the header away."""
+        block = self.blocked_rich()
+        probe = write(self.p("draw.py"),
+                      "import io, os, re, sys\nsys.path.insert(0, os.path.dirname(sys.argv[1]))\n"
+                      "import results_pane as RP\nassert not RP.HAVE_RICH\n"
+                      "RP.shutil.get_terminal_size = lambda *a, **k: os.terminal_size((40, 10))\n"
+                      "p = RP.Pane(sys.argv[2]); p.render(); out, real = io.StringIO(), sys.stdout\n"
+                      "sys.stdout = out; p.draw(); sys.stdout = real\n"
+                      "lines = re.sub(r'\\x1b\\[[0-9;?]*[A-Za-z]', '', out.getvalue()).split('\\n')\n"
+                      "print(len(lines), sum(max(1, -(-len(l) // 40)) for l in lines))\n")
+        doc = write(self.p("long.md"), "# Results\n\n" + "\n\n".join("A long paragraph is one line. " * 8 for _ in range(8)) + "\n")
+        r = self.run_py([probe, self.PANE, doc], PYTHONPATH=os.path.dirname(block))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.split(), ["10", "10"], "frame lines, physical rows: both must equal the terminal height")
+
+    def test_a_dangling_symlink_in_the_results_directory_is_skipped(self):
+        d = self.p("pane-dir")
+        write(os.path.join(d, "new.md"), "# Still here\n")
+        os.symlink(self.p("gone.md"), os.path.join(d, "old.md"))
+        r = self.run_py([self.PANE, d, "--once"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Still here", r.stdout)
+
+    def blocked_rich(self):
+        return write(self.p("block", "sitecustomize.py"),
+                     "import sys\nfrom importlib.abc import MetaPathFinder\n"
+                     "class Block(MetaPathFinder):\n"
+                     "    def find_spec(self, name, path=None, target=None):\n"
+                     "        if name == 'rich' or name.startswith('rich.'): raise ImportError('blocked for test')\n"
+                     "sys.meta_path.insert(0, Block())\n")
+
     def test_flags_and_typos_are_not_targets(self):
         """`--once` and `--help` were once taken as the target and created directories of that
         name; a mistyped file name became a directory too."""
@@ -892,6 +1440,100 @@ class TestResultsPane(Sandbox):
         r = self.run_py([alone, "--once"], cwd=cwd, LACUNA_RESULTS="~/pane-results")
         self.assertEqual((r.returncode, os.listdir(cwd)), (0, []), r.stderr)
         self.assertTrue(os.path.isdir(os.path.join(self.home, "pane-results")))
+
+
+# --------------------------------------------------------------------------------------------
+# the plugin's own path: a quote or a space in it, and the pane protocol that prints commands
+# --------------------------------------------------------------------------------------------
+
+class TestPluginPath(Sandbox):
+    """The plugin is installed wherever the user's HOME is. `$ROOT` was interpolated into a
+    `python -c` string (a quote was a SyntaxError) and into the tmux pane command unquoted (a space
+    left `lacuna split` exiting 0 with a dead pane)."""
+
+    def plugin(self, name="O'Brien plugins"):
+        root = os.path.join(self.tmp, name, "lacuna")
+        for d in ("bin", "scripts", "hooks"):
+            shutil.copytree(os.path.join(ROOT, d), os.path.join(root, d), ignore=shutil.ignore_patterns("__pycache__"))
+        return root
+
+    def fake_tmux(self):
+        """Runs the pane command the way tmux does: one string, through a shell, no terminal."""
+        log = self.p("tmux.log")
+        write(os.path.join(self.bin, "tmux"),
+              '#!/bin/bash\necho "tmux $*" >> "$TMUX_LOG"\n'
+              'if [ "$1" = split-window ]; then sh -c "${@: -1}" </dev/null >> "$TMUX_LOG" 2>&1; '
+              'echo "pane exit=$?" >> "$TMUX_LOG"; fi\n', 0o755)
+        write(os.path.join(self.bin, "claude"), "#!/bin/sh\nexit 0\n", 0o755)
+        return log
+
+    def test_split_book_survives_quotes_and_spaces_in_the_plugin_path(self):
+        py = write(self.p("bookpy"), '#!/bin/sh\necho "$@" > "$BOOK_LOG"\n', 0o755)
+        for name in ("O'Brien plugins", 'say "hi" \\ $HOME'):
+            with self.subTest(name):
+                root, log = self.plugin(name), self.p("book.log")
+                r = subprocess.run([os.path.join(root, "bin", "lacuna"), "lit", "split-book", "b.pdf", "out"],
+                                   capture_output=True, text=True, cwd=self.tmp,
+                                   env=self.env(LACUNA_PYTHON=py, BOOK_LOG=log))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(os.path.join(root, "scripts", "lit", "split_book.py"), read(log))
+
+    def test_split_hands_tmux_a_pane_command_that_runs(self):
+        log = self.fake_tmux()
+        for name in ("O'Brien plugins", "My Plugins"):
+            with self.subTest(name):
+                root = self.plugin(name)
+                os.makedirs(self.p("proj dir"), exist_ok=True)
+                r = subprocess.run([os.path.join(root, "bin", "lacuna"), "split"], capture_output=True, text=True,
+                                   cwd=self.p("proj dir"), env=self.env(TMUX="/x,1,0", TMUX_LOG=log))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("pane exit=0", read(log), "the pane command died: " + read(log)[-400:])
+                os.remove(log)
+
+    def test_the_pane_commands_the_protocol_prints_run_with_spaces_in_both_paths(self):
+        """The model prints the `Results pane:` and tmux lines from the protocol, with the real
+        paths filled in. Unquoted, a space gave `expected one FILE or DIR` (exit 2)."""
+        root, log = self.plugin(), self.fake_tmux()
+        results = write(self.p("res dir", "My Project-1.md"), "# Findings here\n")
+        hook = self.run_py([os.path.join(root, "hooks", "results_hook.py")], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x")
+        sources = {"hook": json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]}
+        for rel in (("skills", "results-pane", "SKILL.md"), ("output-styles", "results-pane.md")):
+            sources[rel[-1]] = read(os.path.join(ROOT, *rel)).replace("${CLAUDE_PLUGIN_ROOT}", root)
+        for name, text in sources.items():
+            line = re.search(r"(?m)^\s*Results pane:\s+(.+)$", text).group(1).replace("<full path>", results)
+            tmux = re.search(r"(?m)^\s*tmux:\s+(tmux .+?)\s{2,}\(", text).group(1).replace("<full path>", results)
+            for what, cmd in (("open", line), ("tmux", tmux)):
+                with self.subTest(name, command=what):
+                    if os.path.exists(log):
+                        os.remove(log)             # each command must show the document itself
+                    r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, cwd=self.tmp,
+                                       env=self.env(TMUX_LOG=log), stdin=subprocess.DEVNULL)
+                    self.assertEqual(r.returncode, 0, f"{cmd}\n{r.stderr}")
+                    self.assertIn("Findings here", r.stdout + (read(log) if os.path.exists(log) else ""))
+
+    def test_results_hook_never_raises_and_says_the_real_path(self):
+        root = self.plugin()
+        hook, results = os.path.join(root, "hooks", "results_hook.py"), self.p("r.md")
+        proto = os.path.join(root, "scripts", "panes", "protocol.md")
+        shown = self.run_py([hook], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        ctx = json.loads(shown.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(shown.stdout.isascii(), "the output must not depend on the locale")
+        self.assertIn(results, ctx)
+        self.assertIn(os.path.join(root, "bin", "lacuna"), ctx, "${CLAUDE_PLUGIN_ROOT} is literal text to the model")
+        self.assertNotIn("${CLAUDE_PLUGIN_ROOT}", ctx)
+        # The protocol holds non-ASCII characters; the locale's codec must not decide whether it reads.
+        ascii_only = dict(LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
+        enc = self.run_py(["-c", "import locale; print(locale.getpreferredencoding(False))"], **ascii_only).stdout.strip()
+        if enc.upper().replace("_", "-") not in ("ASCII", "US-ASCII", "ANSI-X3.4-1968"):
+            self.skipTest(f"cannot force an ASCII locale here (got {enc})")
+        r = self.run_py([hook], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x", **ascii_only)
+        self.assertEqual((r.returncode, "Traceback" in r.stderr), (0, False), r.stderr[-300:])
+        self.assertIn(results, r.stdout, "it must still say something, not just survive")
+        with open(proto, "wb") as f:                      # an unreadable protocol: still exit 0, quietly
+            f.write(b"\xff\xfe not utf-8")
+        r = self.run_py([hook], input="{}", CLAUDE_RESULTS_FILE=results, TMUX="x")
+        self.assertEqual((r.returncode, r.stdout, "Traceback" in r.stderr), (0, "", False))
 
 
 if __name__ == "__main__":

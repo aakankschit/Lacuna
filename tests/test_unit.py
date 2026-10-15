@@ -7,12 +7,12 @@ CLI, a hook, the pipeline) belongs in test_modules.py or test_pipeline.py. See T
 
 Run: python3 -m unittest discover -s tests
 """
-import json, os, re, shutil, subprocess, sys, tempfile, unittest
+import io, json, os, re, shutil, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from support import ROOT, read, write
-import lacuna_config, ccost, prep_md
+import lacuna_config, ccost, prep_md, split_book
 import lit_pipeline as L
 
 
@@ -128,33 +128,138 @@ class TestParse(unittest.TestCase):
             "no headings": (self.GOOD.replace("#", ""), 4, 0, "heading"),
             "no section word": ("# A Title\n\n## Something\n\n" + "word " * 4000, 4, 0, "section"),
         }
+        # A font with no Unicode map: readable headings over a body of unmapped glyphs, as long as
+        # the PDF's own count (which includes them). It passed, and a reader was paid to read it.
+        for name, glyph in (("U+FFFD", "\ufffd"), ("Private Use", "\ue012"), ("docling", "GLYPH<c=3,font=/AB+Minion> ")):
+            md = "".join(f"## {h}\n\n" + (glyph * 60 + " ") * 40 + "\n\n" for h in ("Abstract", "Introduction", "Methods", "Results"))
+            cases[f"unmapped glyphs ({name})"] = (md, 12, len(md), "unreadable")
         for name, (md, pages, raw_chars, word) in cases.items():
             with self.subTest(name):
                 bad = prep_md.validate(md, pages, raw_chars)
                 self.assertTrue(any(word in b for b in bad), f"{name}: {bad}")
+        # ...and the other direction: other scripts are letters, and digits, symbols, equations and
+        # a Word bullet font in Private Use are not a reason to refuse a paper.
+        bullets = "\uf0b7 " * 60
+        readable = {
+            "Chinese": "本文研究了蛋白质结构预测的方法，并在三个数据集上进行了评估。" * 40 + bullets,
+            "Russian": "Мы исследуем метод выборки и оцениваем его на трёх наборах данных. " * 30 + bullets,
+            "equations": ("We minimise $\\mathcal{L}(\\theta) = \\sum_i \\| y_i - f_\\theta(x_i) \\|^2$ over 𝜃 ∈ ℝ^d, "
+                          "so ∇𝓛 = 0 at 1.5 × 10^-3; \uf061\uf062 ≤ ∑ ∫ ∂ ± √. ") * 30,
+            "numeric tables": "| 0.123 | 0.456 | 0.789 | 1.234 | 5.678 |\n" * 200 + bullets,
+        }
+        for name, text in readable.items():
+            with self.subTest(name):
+                md = "".join(f"## {h}\n\n{text}\n\n" for h in ("Abstract", "Introduction", "Methods", "Results"))
+                self.assertEqual(prep_md.validate(md, 4, len(md)), [], name)
         self.assertEqual(prep_md.validate(self.GOOD + "\x01\x02\x03", 4), [],
                          "a handful of control characters is cosmetic (clean() strips them); rejecting "
                          "a 75k-char parse over one stray byte made --equations exit 3")
 
     def test_reference_entries_are_stripped_and_what_follows_is_kept(self):
-        """Measured on three journal papers: the parser puts a heading inside the list, Nature puts
-        a second list before Methods, and legends follow the citations. So entries go one by one."""
+        """Measured on three journal papers: Nature puts a second list before Methods, a Publisher's
+        Note box sits between entries, and legends follow the citations. So entries go one by one, and
+        only between a References heading and the next heading of any markup."""
         refs = "\n\n(1) Smith, J. Title. J. Chem. 2020, 1, 2.\n\n2. Jones, A. et al (2019) Other.\n\n"
         after = ("### **Publisher's Note**\n\nneutral\n\n3. Brown 2018.\n\n### Acknowledgements\n\nThanks.\n\n"
-                 "**Extended Data Fig. 1 |** legend\n")
+                 "**Extended Data Fig. 1 |** legend\n")   # a heading ends the list: Brown is kept, not guessed at
         for heading in ("# ■<sup>**REFERENCES**</sup>", "## ■ REFERENCES", "**References**", "### **References**",
-                        "## 5. References", "Bibliography", "References and Notes"):
+                        "## 5. References", "Bibliography", "References and Notes", "## Notes and references",
+                        "## REFERENCES CITED", "## Works Cited", "**Literature Cited**", "### Reference List",
+                        "## List of References"):
             with self.subTest(heading):
                 out = prep_md.clean("# P\n\n## Methods\n\n1. Dock, 2020 style.\n\nbody\n\n" + heading + refs + after)
-                for gone in ("Smith", "Jones", "Brown"):
+                for gone in ("Smith", "Jones"):
                     self.assertNotIn(gone, out)
-                for kept in ("Dock, 2020 style", "body", "neutral", "Thanks", "legend"):
+                for kept in ("Dock, 2020 style", "body", "neutral", "Brown 2018", "Thanks", "legend"):
                     self.assertIn(kept, out)
         out = prep_md.clean("# P\n\nbody\n\n## References\n\nSmith, J. (2020). T.\n\nJones, A. (2019). O.\n\n## Appendix\n\nkept\n")
         self.assertNotIn("Smith", out, "an author-year list has no numbers to spot: cut it to the next heading")
         self.assertIn("kept", out)
         out = prep_md.clean("# P\n\nWe list all the references\nbelow.\n\nmore body\n")
         self.assertIn("more body", out, "the word at the end of a prose line is not a heading")
+        for heading in ("## References to prior work", "## Literature review", "## Literature", "## Notes",
+                        "## Reference genomes", "Cited works", "## Reference", "**Reference**"):
+            with self.subTest(heading):
+                out = prep_md.clean(f"# P\n\n{heading}\n\n1. Smith, J. Title. J. Chem. 12, 1–5 (2019).\n\n"
+                                    "Earlier work (Smith, 2019) showed it.\n")
+                self.assertIn("Smith, J. Title", out, f"{heading!r} is a section, not a reference list")
+                self.assertIn("Earlier work", out)
+
+    def test_what_follows_a_reference_list_is_judged_by_shape(self):
+        """Every numbered paragraph with a year-like number after the first References heading was
+        deleted (Methods steps, "lysed in 2000 uL"), then every citation-shaped paragraph was, which
+        took Data availability, Acknowledgements and author-year Results paragraphs. Now only entries
+        between a References heading and the next heading of any markup go, and nothing else."""
+        fill = "Ordinary prose about the method and its evaluation. " * 6
+        cases = {
+            "Methods after references": (
+                "## References\n\n1. Jumper, J. et al. Highly accurate protein structure prediction. Nature 596, 583–589 (2021).\n\n"
+                "2. Senior, A. W., Evans, R. & Jumper, J. Improved prediction. Nature 577, 706–710 (2020).\n\n"
+                "## Methods\n\n1. Cells were incubated at 37 C and lysed in 2000 uL of buffer.\n\n"
+                "2. Spectra were recorded between 1800 and 2100 cm-1.\n\n3) Samples collected in 2019 were split.\n\n"
+                "4. Cells (2 × 10^5, 96-well plates) were cultured as before (Smith et al., 2019).\n\n"
+                "51. Mirdita, M. et al. ColabFold. Nat. Methods 19, 679–682 (2022).\n\n",   # kept: unsure, not a list
+                ["Senior, A. W."], ["2000 uL", "1800 and 2100", "collected in 2019", "Smith et al., 2019", "Mirdita"]),
+            "run-in labels and plain headings end the list": (
+                "## References\n\n1. Jumper, J. et al. Highly accurate. Nature 596, 583–589 (2021).\n\n"
+                "**Data availability.** Data are at https://zenodo.org/record/1 (accessed 2021).\n\n"
+                "**Acknowledgements.** We thank Brown, T. 2019.\n\nAuthor contributions\n\nSmith, J. 2020 designed it.\n\n"
+                "Appendix A\n\n1. Step done in 2019.\n\n",
+                ["Jumper"], ["Data are at", "We thank Brown", "Smith, J. 2020 designed", "Step done in 2019"]),
+            "a lone singular Reference line": (
+                "**Reference**\n\nSmith et al. (2019) found the effect; we replicate it.\n\nBrown 2018 showed the same.\n\n",
+                [], ["Smith et al. (2019)", "Brown 2018"]),
+            "bold appendix after an author-year list": (
+                "## References\n\nSmith J (2020) A study. Nature 581:1-5.\n\n"
+                "Tom Brown, Benjamin Mann, et al. Language models are few-shot learners. In NeurIPS, 2020.\n\n"
+                "Diederik P Kingma and Jimmy Ba. Adam: a method for stochastic optimization. In ICLR, 2015.\n\n"
+                "**Appendix A. Derivation of the update rule**\n\n"
+                "The update follows Kingma and Ba (2015) with step size eta = 0.01.\n\n",
+                ["Smith J (2020)", "few-shot", "Adam: a method"], ["Appendix A", "eta = 0.01"]),
+            "a stray heading ends the list": (
+                "## References\n\n1. Smith, J. A. Title. J. Chem. 12, 1–5 (2019).\n\n## Nature | Vol 596\n\n"
+                "2. Doe, R.; Roe, P. Title. J. Am. Chem. Soc. 2020, 142, 1234−1240.\n\n",
+                ["Smith, J. A."], ["Nature | Vol 596", "Doe, R.;"]),
+            "every entry shape inside the list": (
+                "## References\n\n[3] A. Vaswani, N. Shazeer, and N. Parmar, “Attention is all you need,” in Proc. NeurIPS, 2017, pp. 5998–6008.\n\n"
+                "4. Smith JA, Doe R, Roe P. A trial. N Engl J Med. 2020;382(5):411-420.\n\n"
+                "5. The UniProt Consortium. UniProt in 2021. Nucleic Acids Res. 49, D480–D489 (2021).\n\n"
+                "**Extended Data Fig. 1 |** legend (2021).\n\n",
+                ["Vaswani", "Smith JA", "UniProt"], ["legend"]),
+        }
+        for name, (tail, gone, kept) in cases.items():
+            with self.subTest(name):
+                out = prep_md.clean(f"# P\n\n## Abstract\n\n{fill}\n\n" + tail)
+                for g in gone:
+                    self.assertNotIn(g, out)
+                for k in kept + ["Ordinary prose"]:
+                    self.assertIn(k, out)
+        out = prep_md.clean("# Annual report\n\nContents\n\nSummary\n\nFindings\n\nReferences\n\n"
+                            f"## Summary\n\n{fill}\n\n## Findings\n\n1. By 2030 the programme must double its enrolment.\n\n"
+                            "2. In 2024, 41% of sites reported a shortage.\n\n## References\n\n1. Agency X. Report 2023.\n")
+        self.assertIn("By 2030", out, "a contents list naming References is not a reference list")
+        self.assertIn("In 2024, 41%", out)
+        self.assertNotIn("Agency X", out, "the real list at the end still goes")
+
+    def test_cleaning_is_validated_and_keeps_references_rather_than_body(self):
+        """validate() judged only the raw parse. A cut that takes more than references can be, or
+        that leaves a text validate() would refuse, keeps the references instead: they cost tokens,
+        a lost section costs the paper."""
+        refs = "## References\n\n" + "".join(f"{i}. Smith, J. Title {i}. Nature {i}, 1–5 (2020).\n\n" for i in range(1, 60))
+        for name, md, pages in (
+                ("most of the parse", "# P\n\n## Abstract\n\n" + "word " * 300 + "\n\n" + refs, 1),
+                ("under the floor once cut", "# P\n\n## Abstract\n\n" + "word " * 200 + "\n\n" + refs[:900], 4)):
+            with self.subTest(name):
+                self.assertEqual(prep_md.validate(md, pages), [], "the fixture must pass as parsed")
+                text, why = prep_md.finish(md, pages)
+                self.assertIn("Smith, J. Title 1.", text, "the references stay")
+                self.assertIn("stripping references would remove", why)
+        text, why = prep_md.finish(self.GOOD + "\n\n" + refs[:900], 4)
+        self.assertIsNone(why)
+        self.assertNotIn("Smith, J.", text, "an ordinary paper is still stripped")
+        md = "# P\n\n## Abstract\n\n" + "word " * 300 + "\n\n" + refs
+        self.convert({"pymupdf4llm": md}, pages=1, quiet=False)
+        self.assertIn("falling back", self.stderr, "lit_pipeline relays only lines that say so")
 
     def test_control_characters_removed_and_long_lines_wrapped(self):
         out = prep_md.clean("# P\n\n" + ("abcdefghi " * 100) + "\x01\x02\n")
@@ -169,11 +274,15 @@ class TestParse(unittest.TestCase):
         patterns that leaves it alone never reaches an already-parsed document (it happened once).
         When this fails: bump PARSE_VERSION in lit_pipeline.py and record the new fingerprint here."""
         import hashlib, inspect
-        parts = [inspect.getsource(prep_md.validate), inspect.getsource(prep_md.clean), inspect.getsource(prep_md.body),
-                 prep_md.REF.pattern, prep_md.ENTRY.pattern, prep_md.HEADING.pattern, prep_md.CTRL.pattern,
-                 str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET)]
+        parts = [inspect.getsource(f) for f in (prep_md.validate, prep_md.unreadable, prep_md.clean,
+                                                 prep_md.heading, prep_md.entry, prep_md.drop_entries, prep_md.finish)]
+        parts += [r.pattern for r in (prep_md.REF, prep_md.ENTRY, prep_md.NUMBER, prep_md.YEAR, prep_md.AUTHOR, prep_md.VENUE,
+                                      prep_md.CITED_YEAR, prep_md.LEGEND, prep_md.HEADING, prep_md.RUNIN, prep_md.SECTION, prep_md.CTRL,
+                                      prep_md.JUNK)]
+        parts += [str(prep_md.KEEP_FRACTION), str(prep_md.CTRL_BUDGET), str(prep_md.JUNK_SHARE), str(prep_md.STRIP_LIMIT),
+                  str(prep_md.UNMEASURED_FLOOR)]
         fingerprint = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-        recorded = {"3": "8fc42ad5f8c4f200"}
+        recorded = {"4": "e837b51bbd46d754", "5": "5ced2b6d8013fb2a"}
         self.assertEqual(recorded.get(L.PARSE_VERSION), fingerprint,
                          f"the parser changed: bump PARSE_VERSION and record {fingerprint!r} for it")
 
@@ -190,8 +299,9 @@ class TestParse(unittest.TestCase):
         self.assertNotIn("File \"", err)
         self.assertNotIn("^^^", err, "indented source and caret lines are noise")
 
-    def convert(self, outputs, pages=4, **kw):
-        """Run convert() with parsers stubbed: (ok, parsers called, text written or None)."""
+    def convert(self, outputs, pages=4, stats_error=None, quiet=True, **kw):
+        """Run convert() with parsers stubbed: (ok, parsers called, text written or None); what it
+        said on stderr is left in self.stderr. `stats_error` is what pdf_stats() raises."""
         called, out = [], os.path.join(self.tmp, "out.md")
         if os.path.exists(out):
             os.remove(out)
@@ -200,10 +310,18 @@ class TestParse(unittest.TestCase):
             called.append(parser)
             md = outputs.get(parser)
             return (md, None) if md is not None else (None, f"{parser}: venv missing")
-        with mock.patch.object(prep_md, "parse", fake_parse), \
-                mock.patch.object(prep_md, "pdf_stats", lambda pdf: (pages, 0)), \
-                mock.patch("sys.stderr"), mock.patch("sys.stdout"):
-            ok, _ = prep_md.convert("x.pdf", out, quiet=True, **kw)
+
+        def fake_stats(pdf):
+            if stats_error:
+                raise stats_error
+            return pages, 0
+        err = io.StringIO()
+        try:
+            with mock.patch.object(prep_md, "parse", fake_parse), mock.patch.object(prep_md, "pdf_stats", fake_stats), \
+                    mock.patch("sys.stderr", err), mock.patch("sys.stdout"):
+                ok, _ = prep_md.convert("x.pdf", out, quiet=quiet, **kw)
+        finally:
+            self.stderr = err.getvalue()
         return ok, called, (read(out) if os.path.exists(out) else None)
 
     def test_parser_order_fallback_and_refusal(self):
@@ -221,16 +339,87 @@ class TestParse(unittest.TestCase):
         for name, outputs, kw in [("none available", {}, {}),
                                   ("all invalid", {"pymupdf4llm": self.BAD, "docling": self.BAD}, {}),
                                   ("forced invalid", {"docling": self.BAD}, {"forced": "docling"}),
-                                  ("equations invalid", {"marker": self.BAD}, {"equations": True})]:
+                                  ("equations invalid", {"marker": self.BAD}, {"equations": True}),
+                                  # pymupdf could not open the PDF to count it: one page of twenty
+                                  # passed as the whole paper, with the truncation check silently off
+                                  ("PDF not measurable", {"pymupdf4llm": self.GOOD, "docling": self.GOOD},
+                                   {"stats_error": prep_md.Unmeasured("pymupdf.FileDataError: cannot open")})]:
             with self.subTest(name):
                 ok, _, text = self.convert(outputs, pages=20, **kw)
                 self.assertFalse(ok, f"{name}: a parse that failed validation was accepted")
                 self.assertIsNone(text, f"{name}: the bad parse was written")
+                if "stats_error" in kw:
+                    self.assertIn("could not count the PDF's own pages", self.stderr, "and it says why")
+        # ...but with no pymupdf installed at all nothing can count it: `doctor --install-equations`
+        # makes only the marker venv, and --equations must still work there, saying the check is off,
+        # under the checks that need no page count.
+        none = prep_md.NoPymupdf("no default parser venv at /x")
+        ok, _, text = self.convert({"marker": self.GOOD}, equations=True, stats_error=none)
+        self.assertTrue(ok, self.stderr)
+        self.assertIn("truncation check is off", self.stderr)
+        one_page = "# A Paper\n\n## Abstract\n\n" + "word " * 280
+        ok, _, text = self.convert({"marker": one_page}, equations=True, stats_error=none)
+        self.assertFalse(ok, "a page of text is not a paper when nothing can say how long the PDF is")
+        self.assertIn("no pymupdf to count", self.stderr)
+
+    def test_pdf_stats_tells_a_missing_pymupdf_from_a_pdf_it_cannot_read(self):
+        """The first is a setup (only the marker venv); the second is evidence against the PDF."""
+        def stats(returncode=0, stdout="", stderr="", venv=sys.executable):
+            run = mock.Mock(return_value=mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr))
+            with mock.patch.object(prep_md.subprocess, "run", run), mock.patch.dict(prep_md.VENVS, {"pymupdf4llm": venv}):
+                return prep_md.pdf_stats("x.pdf")
+        self.assertEqual(stats(stdout="12 34567\n"), (12, 34567))
+        for name, kw in (("no venv", {"venv": os.path.join(self.tmp, "no-venv", "python")}),
+                         ("venv without pymupdf", {"stdout": "no pymupdf\n"})):
+            with self.subTest(name), self.assertRaises(prep_md.NoPymupdf):
+                stats(**kw)
+        with self.assertRaises(prep_md.Unmeasured) as cm:
+            stats(returncode=1, stderr="Traceback ...\npymupdf.FileDataError: Failed to open file 'x.pdf'.\n")
+        self.assertNotIsInstance(cm.exception, prep_md.NoPymupdf)
+        self.assertIn("FileDataError", str(cm.exception))
         # A write that dies part-way (here, on a character it cannot encode; in life, a kill or a full
         # disk) must leave no file: the pipeline serves whatever is at that path as a finished parse.
         with self.assertRaises(UnicodeEncodeError):
             self.convert({"pymupdf4llm": self.GOOD + "\ud800"})
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "out.md")), "a partial parse was left in the cache")
+
+
+class TestBookPlan(unittest.TestCase):
+    """Which pages go in which chapter file. A page in no file is a page no reader can find."""
+
+    def chapters(self, toc, pages):
+        with mock.patch("sys.stderr"):
+            return split_book.plan(toc, pages)
+
+    def test_every_page_lands_in_one_chapter(self):
+        """Split at level 2, a book lost its level-1 List of Symbols and filed its Appendix under
+        the last chapter; pages before the first bookmark were dropped at any level."""
+        toc = [[1, "List of Symbols", 1], [1, "Part I", 5]] + [[2, f"Chapter {c}", 5 + (c - 1) * 19] for c in range(1, 6)]
+        toc += [[1, "Part II", 100]] + [[2, f"Chapter {c}", 100 + (c - 6) * 18] for c in range(6, 11)]
+        toc += [[1, "Appendix A", 191]]
+        sections = toc[:-1] + [[1, "Appendix A", 191], [2, "A.1 Integrals", 195]]
+        for name, book, pages, first, last in (
+                ("level 2 beside level-1 leaves", toc, 200, ("List of Symbols", 1, 4), ("Appendix A", 191, 200)),
+                ("a level-1 appendix with sections", sections, 200, ("List of Symbols", 1, 4), ("A.1 Integrals", 195, 200)),
+                ("first bookmark on page 15", [[1, "Chapter 1", 15], [1, "Chapter 2", 40]], 60,
+                 ("Before the first bookmark", 1, 14), ("Chapter 2", 40, 60))):
+            with self.subTest(name):
+                level, chapters = self.chapters(book, pages)
+                self.assertEqual((chapters[0], chapters[-1]), (first, last))
+                covered = [p for _, a, b in chapters for p in range(a, b + 1)]
+                self.assertEqual(covered, list(range(1, pages + 1)), "every page once, in order")
+        level, chapters = self.chapters(toc, 200)
+        self.assertEqual(level, 2)
+        self.assertIn(("Chapter 10", 172, 190), chapters, "the appendix is not filed under the last chapter")
+        self.assertNotIn("Part I", [t for t, _, _ in chapters], "a Part that starts with its first chapter is not a chapter")
+        self.assertIn(("Appendix A", 191, 194), self.chapters(sections, 200)[1], "its pages before A.1 are its own")
+
+    def test_titles_are_one_clean_line(self):
+        """A NUL in a bookmark title went into toc.md and its chapter's first line, and `rg` then
+        skipped the chapter as binary."""
+        self.assertEqual(split_book.one_line("Chapter 1\x00"), "Chapter 1")
+        self.assertEqual(split_book.one_line("Chapter 2\rKernels\n\tand priors"), "Chapter 2 Kernels and priors")
+        self.assertEqual(split_book.one_line(None), "")
 
 
 class TestPipelineHelpers(unittest.TestCase):
@@ -253,11 +442,40 @@ class TestPipelineHelpers(unittest.TestCase):
     def test_find_status_order_and_explicit_path(self):
         self.assertIsNone(L.find_status(self.repo))
         for rel in ["NOTES.md", "docs/STATUS.md", "STATUS.md", "research/STATUS.md"]:   # lowest first
-            self.touch(rel)
+            self.touch(rel, "# Status\ndead end: X\n")
             self.assertEqual(L.find_status(self.repo), os.path.join(self.repo, rel), f"{rel} wins once it exists")
         mine = self.touch("elsewhere/MINE.md")
         self.assertEqual(L.find_status(self.repo, mine), mine)
         self.assertIsNone(L.find_status(self.repo, os.path.join(self.repo, "typo.md")))
+
+    def test_not_content_refuses_what_cannot_be_read_and_passes_real_text(self):
+        def check(data, **kw):
+            return L.not_content(write(os.path.join(self.repo, "f.txt"), data) if isinstance(data, str)
+                                 else self._raw(data), **kw)
+        for label, data in [("empty", ""), ("whitespace", " \n\t\n "), ("NUL byte", b"text\0text" * 50),
+                            ("all 256 byte values", bytes(range(256)) * 20),
+                            ("mostly control characters", "\x01\x02\x03\x04 ok" * 100)]:
+            with self.subTest(label):
+                self.assertTrue(check(data), f"{label} is not content")
+        # Both directions: odd but real text must pass.
+        for label, data in [("accents", "caf\u00e9 na\u00efve r\u00e9sum\u00e9 \u00fcber " * 40),
+                            ("CJK", "\u81ea\u7136\u8a00\u8a9e\u51e6\u7406\u306e\u7814\u7a76 " * 40),
+                            ("emoji and math", "\u2200x \u2208 \u211d: x\u00b2 \u2265 0 \U0001f600 " * 40),
+                            ("form feeds and tabs", "page one\n\f\npage two\t\ttabbed\r\n" * 40),
+                            ("a few stray controls", "A real paragraph about sampling. " * 60 + "\x1b[0m\x07"),
+                            ("latin-1 bytes in prose", ("Une \u00e9tude sur l'eau. " * 60).encode("latin-1")),
+                            ("one line", "# T\n")]:
+            with self.subTest(label):
+                self.assertIsNone(check(data), f"{label} is content")
+        self.assertIn("characters", check("hi\n", min_chars=400))
+        self.assertIsNone(check("x" * 400, min_chars=400))
+        self.assertIn("cannot be read", L.not_content(os.path.join(self.repo, "nope.txt")))
+
+    def _raw(self, data):
+        path = os.path.join(self.repo, "raw.bin")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
 
     def test_books_block_offers_only_books_with_a_toc(self):
         books = os.path.join(self.repo, "books")
@@ -365,6 +583,45 @@ class TestTranscriptMoney(unittest.TestCase):
         cold = sorted(calls[i]["id"] for i in ccost.avoidable_colds(calls))
         self.assertEqual(cold, ["cold", "idle"])
 
+    def test_a_small_context_is_judged_by_the_same_rule_as_a_large_one(self):
+        """VERDICT3 N3: a session whose second call reads all of the first call's context and writes
+        a big tool result 45 s later is the cache working, not an idle re-cache; and a re-cache after
+        an idle hour counts even when the whole context is under 40k. Fixed thresholds got both wrong."""
+        from datetime import datetime, timedelta, timezone
+        base = datetime(2026, 10, 13, 12, 0, 0, tzinfo=timezone.utc)
+        O, S = "claude-opus-5-5", "claude-sonnet-5-5"
+
+        def row(mid, after, write, read, model=O):
+            return {"type": "assistant", "timestamp": (base + after).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "message": {"id": mid, "model": model, "usage": {
+                        "input_tokens": 5, "output_tokens": 500, "cache_creation_input_tokens": write,
+                        "cache_read_input_tokens": read}}}
+        td = lambda **k: timedelta(**k)
+        cases = {   # name: (rows, ids that are avoidable cold rewrites)
+            "warm: reads all of the previous 11,117, writes 43,903, 45 s later":
+                ([row("a", td(), 11_117, 0), row("b", td(seconds=45), 43_903, 11_115)], []),
+            "cache invalidated 30 s on is not idle":
+                ([row("a", td(), 100_000, 0), row("b", td(seconds=30), 101_000, 0)], []),
+            "a /model switch ten minutes on is not idle":
+                ([row("a", td(), 100_000, 0), row("b", td(minutes=10), 101_000, 0, S)], []),
+            "idle two hours, a 50k context re-written":
+                ([row("a", td(), 50_000, 0), row("b", td(hours=2), 52_000, 0)], ["b"]),
+            "idle three hours on a context that was under 40k":
+                ([row("a", td(), 30_000, 0), row("b", td(minutes=1), 2_000, 30_000), row("c", td(hours=3), 45_000, 0)], ["c"]),
+            "a ten-minute tool run outlives the five-minute cache":
+                ([row("a", td(), 80_000, 0), row("b", td(minutes=10), 82_000, 0)], ["b"]),
+            "the first write of a session is the price of starting":
+                ([row("a", td(), 60_000, 0)], []),
+        }
+        for name, (rows, want) in cases.items():
+            with self.subTest(name):
+                with tempfile.TemporaryDirectory() as d:
+                    p = os.path.join(d, "t.jsonl")
+                    with open(p, "w") as f:
+                        f.write("".join(json.dumps(r) + "\n" for r in rows))
+                    calls = ccost.load(p)
+                self.assertEqual(sorted(calls[i]["id"] for i in ccost.avoidable_colds(calls)), want)
+
     def test_refused_attempts_are_priced_apart_from_the_call(self):
         """The top-level usage is the last attempt only; earlier ones sit in usage.iterations, each
         with its own model. Their cost is reported as the top of a range, never added in."""
@@ -451,25 +708,29 @@ class TestShippedState(unittest.TestCase):
         self.assertEqual({k: tuple(map(float, v)) for k, v in mod.PRICE.items()}, shipped)
 
 
+def tier(text, reply=False):
+    """What the content check does with `text`: "fail" (exit 4, nothing filed), "warn" (filed, with a
+    warning) or None (filed)."""
+    found = L.judge(text, reply=reply)
+    return found[0] if found else None
+
+
 class TestRefusalPosition(unittest.TestCase):
-    """An apology is recognised by POSITION, not presence.
+    """An apology is recognised by POSITION and SCOPE, not presence.
 
-    Two defects, one in each direction, were shipped here. First a phrase list discarded correct
-    notes ("37 had not completed follow-up"). The fix — look only before the first heading — then
-    let an apology under `## Status` be filed as a plan, with the hook fired and exit 0.
+    Defects were shipped here in both directions, four times. A phrase list discarded correct notes
+    ("37 had not completed follow-up"); looking only before the first heading let an apology under
+    `## Status` be filed; and a grammar that failed a stage on any caveat at the opening discarded
+    45 paid results ("I could not access the Supporting Information"). Only the agent saying it
+    could not do the job as a whole fails a stage now; a caveat about a part, or an apology below
+    the opening, is kept with a warning.
     """
-
-    def setUp(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
-        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
-        import lit_pipeline
-        self.refusal = lit_pipeline.refusal
 
     def test_an_apology_is_caught_wherever_a_block_opens_with_it(self):
         for text, label in [
             ("# Development plan\n\n## Status\n\nNot completed. I could not read any of the notes.",
-             "under a heading"),
-            ("# Plan\n\n- Not completed: I could not read any of the notes.", "as a list item"),
+             "under a heading, after a short sentence"),
+            ("# Plan\n\n- Not completed: I could not read any of the notes.", "as a list item, after a label"),
             ("# Plan\n\n1. I cannot help with that request.", "as a numbered item"),
             ("I could not read any of the supplied files.\n\npadding", "bare opening"),
             ("BLOCKED - not completed.\n\nmore text", "a bare status marker"),
@@ -480,13 +741,69 @@ class TestRefusalPosition(unittest.TestCase):
              "literature claims. Every note in the directory returned a permission error.", "a self-declared partial"),
             ("INCOMPLETE: the notes directory could not be read.", "the agents' own failure line"),
             ("`INCOMPLETE: the notes could not be read`", "echoing the prompt's backticks"),
-            ("1. Incomplete: every note returned EACCES.", "numbered, title case"),
             ("> [!warning] PARTIAL: two of three notes unreadable", "in a callout"),
             ("Status: INCOMPLETE — no literature was readable", "behind a Status: label"),
             ("# Development plan — next iteration (PARTIAL / BLOCKED)\n\n## Read this first", "a real planner's title"),
+            # VERDICT3 N6: each of these was filed, exit 0, with the hook fired.
+            ("# Development plan\n\n> [!WARNING]\n> PARTIAL: literature notes unreadable", "a callout tag on its own line"),
+            ("---\ntitle: Plan\ntags: [lit]\n---\n\nPARTIAL: literature notes unreadable", "after YAML frontmatter"),
+            ("```\nINCOMPLETE: the notes could not be read\n```", "in a code fence"),
+            ("# Development plan\n\nI couldn't open any of the literature notes, so no proposals follow.", "couldn't open"),
+            ("# Development plan\n\nI was unable to access the notes, so what follows is generic.", "was unable to access"),
+            ("# A note (x)\n\n## Claim\nI\u2019m sorry, but I can\u2019t help with summarising this paper.",
+             "I'm sorry, but, curly apostrophes, under a heading with no blank line"),
+            ("Unfortunately, I was not able to read the paper: every page is symbol noise.", "was not able to"),
+            ("# Plan\n\nI don't have access to the notes, so no plan follows.", "no access to the whole input"),
+            ("Both notes are binary garbage. I could not read either of them.", "after one short sentence"),
+            ("Unfortunately,\nI could not read any of the notes.", "wrapped over two lines"),
+            ("Sorry, unfortunately, I could not read any of the notes.", "two lead-ins"),
+            ("No files were found at the given path.", "a verifier that resolved nothing"),
+            ("I could not check any claims because the document is not in the codebase.\n- `runs/real/plan.md` -> not found.",
+             "a real verifier's reply, its finding below the apology"),
+            # r2-content E6, E8: filed, exit 0.
+            ("# Development plan\n\n_INCOMPLETE: none of the notes could be read._", "underscore emphasis"),
+            ("# Development plan\n\n_I could not read any of the notes, so no proposals follow._", "an underscored apology"),
+            ("**Status:** _BLOCKED_ by unreadable notes", "an underscored marker behind a bold label"),
+            ("# Paper (n.d.)\n\n## Claim\nAs an AI, I cannot open PDF files directly.", "as an AI"),
+            ("# Development plan\n\nI don't have the ability to open these notes; they appear to be binary.",
+             "no ability to"),
+            ("# Paper (n.d.)\n\n## Claim\nThe document could not be read; it contains only symbol noise.",
+             "the whole input, as a passive subject"),
         ]:
             with self.subTest(label):
-                self.assertTrue(self.refusal(text), f"{label} must be recognised as an apology")
+                self.assertEqual(tier(text), "fail", f"{label} must fail the stage")
+
+    def test_a_doubt_is_kept_with_a_warning(self):
+        """The shapes a program cannot tell from a finding. Each was a paid result discarded (r2-content
+        E1-E3), or a failure filed in silence (E5): the user reads the warning and decides."""
+        for text, label in [
+            ("1. Incomplete: every note returned EACCES.", "a status word in title case"),
+            ("# Partial 3D Shape Matching for Virtual Screening (Kumar 2022)\n\n## Claim", "a real title, E1"),
+            ("# Gatekeepers (Zhang 2019)\n\n## Claim\nBlocked by a gatekeeper mutation, the pocket admits only "
+             "type II inhibitors (Fig. 3).", "a real claim, E1"),
+            ("# Development plan\n\nScope note. I could not access the GitHub repository cited in batch_effects.md, "
+             "so proposal 4's baseline is the note's own figure.", "a caveat about a part, E2"),
+            ("# Weighted cycle closure (Li 2023)\n\n> **Note:** I could not access the Supporting Information, so "
+             "Table S1-S4 values are not included.\n\n## Claim", "the Supporting Information, E2"),
+            ("> [!NOTE]\n> I don't have access to the notes directory.", "a directory of the input"),
+            ("# A note (x)\n\n## Claim\nI could not read Table 3 (the scan is blurred); the rest shows X improves Y "
+             "by 12% (Section 4).", "a numbered part"),
+            ("# A note (Vaswani 2017)\n\n## Claim\nUnable to process long sequences in parallel, recurrent models are "
+             "slow to train (Section 1).", "an inability with no subject, about no input"),
+            ("# Digest\n\nThe three papers agree that warm starts cut sampler burn-in by about 40% on the benchmarks "
+             "they share (Table 2). I could not read the supplementary tables, so per-benchmark figures are omitted.",
+             "a caveat after a long first sentence of content"),
+            ("# Plan\n\n- **BLOCKED** until the CUDA build lands: port the scorer", "a status tag on a proposal"),
+            ("# Plan\n\n- BLOCKED by unreadable notes: no proposals can be made.", "the same shape, failing"),
+            ("# Plan\n\nThree proposals follow.\n\n- INCOMPLETE: data for site B (Table 3)", "a marker below the opening"),
+            ("# Plan\n\nThree proposals follow.\n- INCOMPLETE: data for site B (Table 3)", "on the next list item"),
+            ("# Development plan\n\n**Objective:** What should we build next?\n\n## Status\n\nI could not read any of "
+             "the notes, so no proposals follow.", "an apology below the opening, E5"),
+            ("# Paper (n.d.)\n\n## Claim\nI'm sorry, but the provided file appears to contain only garbled symbols.",
+             "an apology about nothing it could not do"),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(tier(text), "warn", f"{label} is kept, with a warning")
 
     def test_the_same_words_inside_a_sentence_are_findings(self):
         for text, label in [
@@ -498,14 +815,21 @@ class TestRefusalPosition(unittest.TestCase):
             ("# PARTIAL LEAST SQUARES for batch correction\n\n## 1. Replace PCA", "a title in capitals"),
             ("# Digest\n\n## Partial results\n\nTwo of three trials were incomplete: see Table 2.", "partial as a word"),
             ('- PARTIAL: "54-69/100" -> the note gives 54-69 for ROCS only', "a verify finding graded PARTIAL"),
-            ("# Plan\n\nThree proposals follow.\n\n- INCOMPLETE: data for site B (Table 3)", "a marker below the opening"),
-            ("# Plan\n\n- **BLOCKED** until the CUDA build lands: port the scorer", "a status tag on a proposal"),
             ("# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim", "a hyphenated title"),
             ("# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA", "a bracketed title"),
             ("# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim", "a title in capitals"),
+            # VERDICT3 N10a: findings that open with the words, each discarded after it was paid for.
+            ("# A note (Lee 2025)\n\n## Claim\n\nNot completed follow-up in 37 of 412 patients biased the estimate.",
+             "a Claim opening 'Not completed follow-up'"),
+            ("# A note (Lee 2025)\n\n## Claim\nNot completed: follow-up for 37 of 412 patients, which biases the "
+             "hazard ratio upward (Table 2).", "'Not completed:' as a finding's label"),
+            ("No files were found matching `src/ghost.py` -> the repo has src/a.py only", "a verify finding"),
+            ("I could not verify the following claims:\n\n- `0.83` -> not in any note", "a verify report's first line"),
+            ("# A note (Lee 2025)\n\n## Claim\n\nWe could not complete follow-up for 37 of 412 patients, which biases "
+             "the estimate (Table 2).", "the paper's authors, as 'we'"),
         ]:
             with self.subTest(label):
-                self.assertIsNone(self.refusal(text), f"{label} must not be discarded")
+                self.assertIsNone(tier(text), f"{label} must be filed without a word")
 
 
 class TestFixesThatSurvivedTheirOwnRevert(unittest.TestCase):
@@ -528,6 +852,51 @@ class TestFixesThatSurvivedTheirOwnRevert(unittest.TestCase):
 
 
 class TestOwnershipRecord(unittest.TestCase):
+
+    def test_a_hand_edited_or_old_record_is_read_without_raising(self):
+        """The record is a file in the user's folder: hand-edited, or left by an older Lacuna. Only
+        a well-formed entry with a checksum describes a file Lacuna wrote."""
+        with tempfile.TemporaryDirectory() as d:
+            note = write(os.path.join(d, "a.md"), "note")
+            for label, record, want in [
+                ("an entry that is not a table", {"files": {"a.md": 5, "b.md": {"sha256": "x"}}}, ["b.md"]),
+                ("no files table", {}, []),
+                ("a files table that is a list", {"files": ["a.md"]}, []),
+                ("a source that is not a path", {"files": {"a.md": {"sha256": "x", "source": 5}}}, ["a.md"]),
+                # 0.3.1 kept reservations here, released only on success; one left by a failed run
+                # refused every later read of a same-named document, and made its note "edited since"
+                ("a 0.3.1 reservation", {"files": {"a.md": {"pending": True, "source": "/x/a.md"},
+                                                   "b.md": {"pending": True, "sha256": "x", "source": "/x/b.md"}}},
+                 ["b.md"]),
+            ]:
+                with self.subTest(label):
+                    write(os.path.join(d, ".lacuna.json"), json.dumps(record))
+                    files, _ = L._owners(d)
+                    self.assertEqual(sorted(files), want)
+                    self.assertFalse(any("pending" in e for e in files.values()), "a reservation holds nothing now")
+                    L.not_ours(note, source=os.path.join(d, "doc.md"))
+
+    def test_recording_never_raises_and_a_moved_file_leaves_the_record(self):
+        """record() runs after the stage has been paid for: a record that cannot be written costs a
+        question on the next run, never this run's output. A file an after.* hook moved away is no
+        longer Lacuna's to account for."""
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as d:
+            note = write(os.path.join(d, "n.md"), "note")
+            if os.geteuid() != 0:
+                os.chmod(d, 0o555)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    L.record(note)
+                os.chmod(d, 0o755)
+                self.assertIn("could not record", err.getvalue())
+            L.record(note)
+            before = {L.name_key(note): L._sha(note)}
+            os.remove(note)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                L.rerecord(d, before)
+            self.assertEqual((L._owners(d)[0], err.getvalue()), ({}, ""))
 
     def test_two_processes_recording_into_one_directory_lose_nothing(self):
         """Two `lit read` runs into one --out kept 9 of 16 entries: each read the record, added its
@@ -614,6 +983,139 @@ class TestMalformedExternalData(unittest.TestCase):
             self.assertGreater(split["output"], 0)
 
 
+class TestWrongShapedTranscripts(unittest.TestCase):
+    """Transcripts are written by other software. Each guard below survived its own revert at 0.3.1,
+    and the status line carries its own copy of every one (it is self-contained by design), so each
+    case runs through ccost and through statusline."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "cost"))
+        sys.path.insert(0, os.path.join(ROOT, "statusline"))
+        import importlib, statusline
+        cls.sl = importlib.reload(statusline)
+
+    def rows(self, *rows):
+        d = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "t.jsonl")
+        with open(p, "w") as f:
+            f.write("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows))
+        return p
+
+    @staticmethod
+    def line(mid="m1", model="claude-opus-5-5", usage=None, **kw):
+        u = {"input_tokens": 10, "output_tokens": 1000, "cache_read_input_tokens": 100_000,
+             "cache_creation_input_tokens": 1000}
+        u.update(usage or {})
+        return {"type": "assistant", "timestamp": "2026-10-14T00:00:00Z",
+                "message": {"id": mid, "model": model, "usage": u, **kw}}
+
+    def test_ccost_load_skips_or_zeroes_what_is_not_the_expected_shape(self):
+        good = self.line("good")
+        odd = self.line("odd")
+        odd["message"]["usage"]["iterations"] = [3, {"output_tokens": 2}, {"output_tokens": 1}]
+        odd["message"]["usage"]["cache_creation"] = "1h"
+        cases = {
+            "usage is a list": ([{**self.line("a"), "message": {"id": "a", "model": "m", "usage": [1]}}, good], ["good"]),
+            "iterations hold a non-object": ([odd], ["odd"]),
+            "string, bool and NaN counts": ([self.line("c", usage={"output_tokens": "1000", "input_tokens": True,
+                                                                      "cache_read_input_tokens": float("nan")})], ["c"]),
+            "model is a number": ([self.line("d", model=5)], ["d"]),
+            "content is a number": ([self.line("e", content=7)], ["e"]),
+            "timestamp is a number": ([{**self.line("f"), "timestamp": 1760400000}], ["f"]),
+        }
+        for name, (rows, want) in cases.items():
+            with self.subTest(name):
+                calls = ccost.load(self.rows(*rows))
+                self.assertEqual([c["id"] for c in calls], want)
+                for c in calls:
+                    ccost.split(c), ccost.earlier_usd(c), ccost.ts(c["ts"]), ccost.short(c["model"])   # none may raise
+        c = ccost.load(self.rows(self.line("c", usage={"output_tokens": "1000"})))[0]
+        self.assertEqual(ccost.split(c)[0]["output"], 0, "a string count is 0, not 1000 and not a crash")
+        self.assertEqual(ccost.ts("yesterday"), 0)
+        self.assertEqual(ccost.ts(None), 0)
+        self.assertEqual(ccost.ts(1760400000), 0, "a numeric timestamp is no timestamp, and must not raise")
+
+    def test_the_status_line_reads_the_same_shapes_the_same_way(self):
+        sl = self.sl
+        self.assertEqual([sl._n({"x": v}, "x") for v in (None, "1000", True, float("nan"), float("inf"), 7)],
+                         [0, 0, 0, 0, 0, 7])
+        sl.cost({"output_tokens": 5}, 5)                      # a model that is not text prices at the fallback
+        sl.cost({"output_tokens": 5}, ["x"])
+        good = self.line("good")
+        wrong = {
+            "iterations is an object": {"iterations": {"a": 1}},
+            "iterations hold a non-object": {"iterations": [3, {"output_tokens": 2}, {"output_tokens": 1}]},
+            "string count": {"output_tokens": "1000"},
+        }
+        for name, extra in wrong.items():
+            with self.subTest(name):
+                row = self.line("w", usage=extra)
+                got = sl.last_turn(self.rows(row))
+                self.assertIsNotNone(got, "the segment survives a field of the wrong type")
+        got = sl.last_turn(self.rows(self.line("w", model=5)))
+        self.assertIsNotNone(got)
+        # an attempt is priced at its own model: a haiku refusal under an opus call is not an opus one
+        two = self.line("t", usage={"iterations": [
+            {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 300_000,
+             "cache_read_input_tokens": 0, "model": "claude-haiku-5-5"},
+            {"input_tokens": 10, "output_tokens": 1000, "cache_creation_input_tokens": 1000,
+             "cache_read_input_tokens": 100_000, "model": "claude-opus-5-5"}]})
+        _, earlier = sl.last_turn(self.rows(two))
+        want = 300_000 * 0.20 / 1e6                           # haiku-5-5's 1h write; opus-5-5's would be 8.00 -> $2.40
+        self.assertAlmostEqual(earlier, want, places=6)
+        c = ccost.load(self.rows(two))[0]
+        self.assertAlmostEqual(ccost.earlier_usd(c), want, places=6, msg="ccost prices the attempt at its own model too")
+
+    def test_prices_that_are_negative_or_not_finite_are_dropped_by_every_reader(self):
+        sl = self.sl
+        for name, table in {"negative": [1, -2, 3, 4, 5], "infinite": [1, float("inf"), 3, 4, 5],
+                            "nan": [1, float("nan"), 3, 4, 5]}.items():
+            with self.subTest(name):
+                self.assertEqual(lacuna_config._price_table({"models": {"x": table}}), {})
+                self.assertEqual(sl._price_table({"models": {"x": table}}), {})
+        for reader in (lacuna_config._price_table, sl._price_table):
+            self.assertEqual(list(reader({"models": {"claude-opus-5-5": [1, 2, 3, 4, 5]}})), ["opus-5-5"],
+                             "a price keyed by the full model id is the alias's price too")
+
+    def test_the_cache_guard_skips_a_compact_looking_line_that_is_not_an_object(self):
+        sys.path.insert(0, os.path.join(ROOT, "hooks"))
+        import cache_guard
+        p = self.rows('"isCompactSummary"', '[1, "compact_boundary"]', '5')
+        self.assertFalse(cache_guard.compacted_since(p, 0))
+
+
+class TestFleetReportOrder(unittest.TestCase):
+    """A fork copies its parent's calls, message ids and all, into a new file; the fleet report
+    counts each id once, in the first file it meets. That file must not depend on what order the
+    filesystem lists them in, or the same disk gives a different "by project" on another machine."""
+
+    def test_the_first_file_in_sorted_order_is_credited_whatever_order_glob_returns(self):
+        import contextlib, io
+        from datetime import datetime, timezone
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "cost"))
+        import spend
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = json.dumps({"type": "assistant", "timestamp": now, "message": {
+            "id": "same", "model": "claude-sonnet-5-5", "usage": {"output_tokens": 1_000_000}}}) + "\n"
+        with tempfile.TemporaryDirectory() as root:
+            for proj in ("-work-aaa", "-work-zzz"):
+                os.makedirs(os.path.join(root, proj))
+                with open(os.path.join(root, proj, "s.jsonl"), "w") as f:
+                    f.write(row)
+            real = spend.glob.glob
+            for name, order in {"as listed": lambda xs: xs, "reversed": lambda xs: list(reversed(xs))}.items():
+                with self.subTest(name), mock.patch.object(spend, "ROOT", root), \
+                        mock.patch.object(spend.glob, "glob", lambda *a, **k: order(real(*a, **k))):
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        spend.COLOR = False
+                        spend.fleet_report(7)
+                    self.assertIn("work-aaa $10.00", out.getvalue())
+                    self.assertNotIn("work-zzz", out.getvalue())
+
+
 class TestEstimateAndReadAgree(unittest.TestCase):
     """`lit estimate` exists so nobody is surprised by a bill. It quoted three extensions while
     `read` accepted six, so a mixed folder was priced for a fraction of what the run paid for."""
@@ -664,76 +1166,265 @@ class TestCacheWritesAreAtomic(unittest.TestCase):
                 lit_pipeline._atomic_copy(__file__, dst)
             self.assertFalse(os.path.exists(dst))
             self.assertEqual([f for f in os.listdir(d) if f.endswith(".part")], [])
+            dst = os.path.join(d, "c.md")              # the copy is made, then cannot be renamed
+            with mock.patch.object(lit_pipeline.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    lit_pipeline._atomic_copy(__file__, dst)
+            self.assertEqual(os.listdir(d), [], "the temporary was left beside the cache entry")
 
 
 class TestStatusMarkerEdges(unittest.TestCase):
-    """This check has swung between false positives and false negatives three times. Both
-    directions are pinned here so the next narrowing cannot pass silently."""
+    """This check has swung between false positives and false negatives four times. All three
+    outcomes are pinned here so the next narrowing or widening cannot pass silently."""
+
+    # The rows are the 0.3.1 fix review's table (F = a failure, P = a result; the ids are its own),
+    # each a shape a real model could write. Each is judged as the opening of a plan and as a reply.
+    BODY = "\n\n## 1. A real proposal\n\n" + "Substantive plan content naming src/widget/sampler.py. " * 60
+
+    def judged(self, text):
+        return tier((text + self.BODY)[:1200]), tier(text, reply=True)
+
+    def test_a_status_word_set_off_in_the_opening_is_a_failure(self):
+        """In capitals it fails the stage: the protocol word agents are told to use, and what failing
+        models wrote. In any other case it is as often a title or a finding, so it is a doubt; F10,
+        F11, F12, F40, F46, F54 and F59 failed the stage until the user chose this (r2-content E1)."""
+        for text, cid in [
+            ('# Development plan (BLOCKED)', 'F01'),
+            ('# Development plan — BLOCKED', 'F02'),
+            ('# Development plan: BLOCKED', 'F03'),
+            ('# Development plan [BLOCKED]', 'F04'),
+            ('# Development plan **BLOCKED**', 'F05'),
+            ('# Development plan — BLOCKED.', 'F06'),
+            ('# Development plan (PARTIAL)', 'F07'),
+            ('# Development plan — PARTIAL', 'F08'),
+            ('Status: INCOMPLETE', 'F09'),
+            ('# Development plan – BLOCKED', 'F13'),
+            ('# Development plan - BLOCKED', 'F14'),
+            ('# Development plan (BLOCKED).', 'F15'),
+            ('# Development plan 🚫 BLOCKED', 'F16'),
+            ('# 🚫 Development plan — BLOCKED 🚫', 'F17'),
+            ('# Development plan (*BLOCKED*)', 'F18'),
+            ('Development plan (BLOCKED)\n==========================', 'F19'),
+            ('# Development plan (BLOCKED) #', 'F20'),
+            ('# Development plan (BLOCKED: notes unreadable)', 'F21'),
+            ('# Development plan — BLOCKED by missing notes', 'F22'),
+            ('# Development plan (BLOCKED — see below)', 'F23'),
+            ('# Development plan (BLOCKED - see below)', 'F24'),
+            ('# Development plan: BLOCKED by unreadable notes', 'F25'),
+            ('# Development plan: INCOMPLETE: notes unreadable', 'F26'),
+            ('INCOMPLETE: notes unreadable', 'F27'),
+            ('BLOCKED by missing notes', 'F28'),
+            ('BLOCKED, notes unreadable', 'F29'),
+            ('[BLOCKED] Notes could not be read', 'F30'),
+            ('(BLOCKED) Notes could not be read', 'F31'),
+            ('**BLOCKED** — notes unreadable', 'F32'),
+            ('BLOCKED.', 'F33'),
+            ('INCOMPLETE: none of the literature notes could be read', 'F34'),
+            ('BLOCKED: none of the notes are readable', 'F35'),
+            ('PARTIAL: 0 of 5 notes were readable', 'F36'),
+            ('# Development plan — BLOCKED: none of the notes could be read', 'F37'),
+            ('# Development plan (FAILED)', 'F38'),
+            ('FAILED: the notes could not be read', 'F39'),
+            ('**Status:** BLOCKED by unreadable notes', 'F41'),
+            ('# Development plan (BLOCKED; notes unreadable)', 'F42'),
+            ('# Development plan (BLOCKED / PARTIAL)', 'F43'),
+            ('# Development plan — Status: BLOCKED', 'F44'),
+            ('> [!WARNING] BLOCKED', 'F45'),
+            ('# BLOCKED Development plan', 'F47'),
+            ('# Development plan (INCOMPLETE — notes unreadable)', 'F48'),
+            ('# Development plan (PARTIAL - 2 of 5 notes readable)', 'F49'),
+            ('# Development plan (PARTIAL, 2 of 5 notes readable)', 'F50'),
+            ('# Development plan (PARTIAL 2/5 notes)', 'F51'),
+            ('# Development plan (BLOCKED pending readable notes)', 'F52'),
+            ('# Development plan — BLOCKED until the notes are re-read', 'F53'),
+            ('# DEVELOPMENT PLAN (BLOCKED)', 'F55'),
+            ('# DEVELOPMENT PLAN — BLOCKED BY UNREADABLE NOTES', 'F56'),
+            ('# Development plan (PARTIAL / BLOCKED)', 'F57'),
+            ('INCOMPLETE: 0 of 12 claims could be checked; the repository is empty', 'F58'),
+            ('# Development plan — BLOCKED (notes unreadable)', 'F60'),
+            ('## BLOCKED', 'F61'),
+            ('Development plan — BLOCKED', 'F62'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), ("fail", "fail"), f"{cid} {text!r}")
+        for text, cid in [
+            ('# Development plan (Blocked)', 'F10'),
+            ('# Development plan (blocked)', 'F11'),
+            ('# Development plan — Blocked', 'F12'),
+            ('Status: Blocked — the notes are binary', 'F40'),
+            ('# Development plan (status: blocked)', 'F46'),
+            ('# Development Plan: Blocked — Notes Unreadable', 'F54'),
+            ('# Development plan: Incomplete', 'F59'),
+            ('**Partial**: the notes were unreadable', 'bold, title case'),
+            ('# Partial 3q tetrasomy: a case series (Ito 2021)', 'a real title, E1'),
+            ('# Failed by Default: Why RBFE Networks Miss Scaffold Hops (Lee 2024)', 'a real title, E1'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), ("warn", "warn"), f"{cid} {text!r}")
+
+    def test_a_status_reporting_none_is_a_clean_result(self):
+        """"none" must be the whole value: "INCOMPLETE: none of the files could be opened" is a reason."""
+        for text, cid in [
+            ('Blocked: none.', 'P06'),
+            ('BLOCKED: none', 'P08'),
+            ('PARTIAL: none', 'P09'),
+            ('Blocked: nothing. All dependencies are in the tree.', 'P11'),
+            ('Blocked: N/A', 'P12'),
+            ('Blocked: *none*', 'P13'),
+            ('Blocked — none', 'P14'),
+            ('Blocked: no', 'P15'),
+            ('Blocked: (none)', 'P16'),
+            ('# Development plan\n\n## Status\n\nBlocked: none.', 'P25'),
+            ('PARTIAL: 0', 'P31'),
+            ('Blocked: None — everything needed is in the repo', 'P32'),
+            ('Blocked: **none**', 'P36'),
+            ('Blocked: `none`', 'P37'),
+            ('Blocked: 0 items', 'P38'),
+            ('BLOCKED: no', 'P40'),
+            ('# Blocked: none. All dependencies are in the tree.', 'H1'),
+            ('# Plan — PARTIAL: 0', 'H2'),
+            ('INCOMPLETE: nil', 'H3'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
+
+    def test_a_reply_is_judged_on_every_line(self):
+        """Every agent is told to reply INCOMPLETE when it could not read its sources. A real planner
+        put it on line 3, under two lines of prose, and only the first line was read (VERDICT3 N6). A
+        reply is all opening: a marker in capitals at the start of any line fails, and the told word
+        anywhere. "Wrote the plan.\\nBLOCKED: …" was filed until the user chose this rule. A reply that
+        is only a path is not prose: a data directory under …/Failed/ failed every read (E4)."""
+        for text in ("Both literature notes are binary garbage -\nno text survives.\nINCOMPLETE: notes unreadable",
+                     "/x/plan.md.partial\n\n`INCOMPLETE: two notes are empty`",
+                     "Done. I could not open any of the notes, so the plan rests on the repo alone.",
+                     "Wrote the plan.\nBLOCKED: proposal 3 waits for the CUDA build.",
+                     "`INCOMPLETE`: the paper text is symbol noise",
+                     "The extracted text is symbol noise. INCOMPLETE: no sentence survives.",
+                     "Reply: `INCOMPLETE: the paper text is unreadable`"):
+            with self.subTest(text[:40]):
+                self.assertEqual(tier(text, reply=True), "fail", text)
+        for text in ("Wrote /x/plan.md.partial.\n\nSummary:\n- 6 proposals, most valuable first\n- Incomplete: no "
+                     "note gives a baseline for proposal 5, so its test compares against the current sampler.",
+                     "incomplete: the paper text is symbol noise",
+                     "Wrote /x/0.md. I couldn't access the supplementary material, so SI tables are omitted.",
+                     "- `src/ghost.py` -> not found\n- Incomplete: proposal 2 cites the wrong note."):
+            with self.subTest(text[:40]):
+                self.assertEqual(tier(text, reply=True), "warn", text)
+        for text in ("/x/notes/a.md", "/Users/me/Failed/lacuna-data/cache/drafts/read-abc/0.md",
+                     "`/Users/me/BLOCKED/repo/lit/plan.md.partial`",
+                     "Wrote /x/notes/a.md.\n\nPages 3-12 were garbled; the note says which numbers are missing.",
+                     "Wrote it.\nINCOMPLETE-data methods are covered in proposal 2.",
+                     "- `src/a.py` -> exists\n- INCOMPLETE: data for site B -> the note has it (Table 3)",
+                     "I checked 14 claims; 2 failed:\n\n- `src/ghost.py` -> not found",
+                     "No unverifiable claims found."):
+            with self.subTest(text[:40]):
+                self.assertIsNone(tier(text, reply=True), text)
+
+    def test_a_status_word_in_a_name_is_not_a_failure(self):
+        """Real titles: a technique, a finding, a code constant. Discarding them is the false positive
+        this check keeps swinging into, and each one is a paid result thrown away."""
+        for text, cid in [
+            ('# PARTIAL LEAST SQUARES for batch correction', 'P01'),
+            ('# BLOCKED GIBBS SAMPLING (Smith 2020)', 'P02'),
+            ('# INCOMPLETE-DATA METHODS (Rubin 1976)', 'P03'),
+            ('# Development plan (PARTIAL LEAST SQUARES)', 'P04'),
+            ('# Development plan (Partial least squares)', 'P05'),
+            ('Status: no blockers', 'P07'),
+            ('# Development plan\n\nTwo proposals follow.\n\n## Blocked items', 'P10'),
+            ('# Development plan: handling INCOMPLETE, noisy labels', 'P17'),
+            ('# Development plan: when are the data INCOMPLETE?', 'P18'),
+            ('# Arithmetic is INCOMPLETE (Gödel 1931)', 'P19'),
+            ('# PARTIAL / FULL pooling for hierarchical models', 'P20'),
+            ('# Development plan: adopt PARTIAL pooling', 'P21'),
+            ('# PLS (PARTIAL LEAST SQUARES) regression', 'P22'),
+            ('# Why phase III trials FAILED (Smith 2020)', 'P23'),
+            ('# FAILED, PARTIAL and COMPLETE responses in oncology (Lee 2019)', 'P24'),
+            ('# Development plan (v2; PARTIAL rollout)', 'P26'),
+            ('Blocked items: none', 'P27'),
+            ('# Development plan — no blockers', 'P28'),
+            ('# PARTIAL-observation MDPs (Kaelbling 1998)', 'P29'),
+            ('# BLOCKED Gibbs (Smith 2020)', 'P30'),
+            ('# BLOCKED-Gibbs vs. collapsed samplers', 'P33'),
+            ('# ON THE INCOMPLETE BETA FUNCTION (Pearson 1934)', 'P34'),
+            ('# Missing data: complete vs. INCOMPLETE (Little 2002)', 'P35'),
+            ('# Development plan (no blockers; PARTIAL LEAST SQUARES first)', 'P39'),
+            ('# Development plan: from FAILED runs to a working sampler', 'P41'),
+            ('# Status of the sampler: PARTIAL', 'P42'),
+            ('# Development plan: retry jobs stuck in `FAILED`', 'A2 code'),
+            ('# Development plan: handle `JobState.PARTIAL` in the scheduler', 'A2 code'),
+            ('# Development plan (the `BLOCKED` state machine)', 'A2 code'),
+            ('# Development plan: emit `INCOMPLETE` when a batch is cut short', 'A2 code'),
+            ('# `FAILED` jobs and how to retry them', 'code at the start'),
+            ('# Missing data INCOMPLETE (Little 2002)', 'A2 inline'),
+            ('# **Blocked** Gibbs sampling (Smith 2020)', 'a bold name'),
+            ('# Plan\n\n- Port the scorer to CUDA (BLOCKED)\n- Add a --json flag', 'a tag on a proposal'),
+        ]:
+            with self.subTest(cid, text=text[:50]):
+                self.assertEqual(self.judged(text), (None, None), f"{cid} {text!r}")
+
+
+class TestHolds(unittest.TestCase):
+    """One run writes a given note, plan or report at a time. 0.3.1 reserved a path with a "pending"
+    entry in the record, released only on success: a refused reader, Ctrl-C, a missing parser or a
+    kill left it, and every later read of a same-named document was refused for good, --overwrite
+    included. A hold ends with the process that took it, however that process ends."""
 
     def setUp(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
-        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
-        import lit_pipeline
-        self.declared = lit_pipeline.declared_failure
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.addCleanup(L.release_all)
+        self.note = os.path.join(self.d, "main.md")
 
-    def test_a_marker_reporting_none_is_a_clean_result(self):
-        for text in ("# Blocked: none. All dependencies are in the tree.",
-                     "Blocked: none. All dependencies are in the tree.",
-                     "# Plan — PARTIAL: 0", "INCOMPLETE: nil"):
-            with self.subTest(text[:40]):
-                self.assertIsNone(self.declared(text), "a count of none is not a declared failure")
+    def holder(self):
+        """Another process holding the note path until it is killed or told to exit."""
+        code = (f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'scripts', 'lit')!r})\n"
+                f"import lit_pipeline as L\nL.hold({self.note!r}, 'testing')\nprint('held', flush=True)\n"
+                f"sys.stdin.read()\n")
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        p = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             text=True, env={"HOME": home, "LACUNA_DATA": home, "PATH": "/usr/bin:/bin"})
+        self.addCleanup(p.kill)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        return p
 
-    def test_a_standalone_marker_in_a_title_is_a_failure(self):
-        for text in ("# Development plan (BLOCKED)", "# Development plan — BLOCKED",
-                     "# Development plan: BLOCKED", "# Development plan (PARTIAL / BLOCKED)",
-                     "Status: INCOMPLETE — no literature was readable"):
-            with self.subTest(text[:40]):
-                self.assertTrue(self.declared(text), text)
+    def test_a_hold_ends_with_its_process_however_it_ends(self):
+        for how in ("killed", "exits without releasing"):
+            with self.subTest(how):
+                p = self.holder()
+                info = L.hold(self.note, "reading")
+                self.assertEqual((info["pid"], info["doing"]), (p.pid, "testing"), "who holds it, for the message")
+                if how == "killed":
+                    p.kill()
+                else:
+                    p.stdin.close()
+                p.wait()
+                self.assertIsNone(L.hold(self.note, "reading"), "a hold outlived the run that took it")
+                L.release_all()
+        self.assertEqual(os.listdir(self.d), [], "a released hold leaves nothing behind")
 
-    def test_a_marker_inside_a_technique_name_is_not_a_failure(self):
-        """These are real papers. Discarding them is the false positive this keeps swinging into."""
-        for text in ("# PARTIAL LEAST SQUARES for batch correction\n\n## 1. Replace PCA",
-                     "# INCOMPLETE-DATA METHODS (Rubin 1976)\n\n## Claim",
-                     "# BLOCKED GIBBS SAMPLING (Smith 2020)\n\n## Claim",
-                     "# Development plan (PARTIAL LEAST SQUARES)\n\n## 1. Replace PCA"):
-            with self.subTest(text[:40]):
-                self.assertIsNone(self.declared(text), text)
-
-
-class TestReservationRecord(unittest.TestCase):
-    """A reservation is written before the model runs, so it has no checksum yet. Dropping those
-    from the record let two concurrent runs each believe the note path was free."""
-
-    def setUp(self):
-        sys.path.insert(0, os.path.join(ROOT, "scripts", "lit"))
-        import lit_pipeline
-        self.L = lit_pipeline
-
-    def test_a_pending_reservation_survives_a_read_of_the_record(self):
-        with tempfile.TemporaryDirectory() as d:
-            note = os.path.join(d, "main.md")
-            a, b = os.path.join(d, "a.md"), os.path.join(d, "b.md")
-            for f in (a, b):
-                with open(f, "w") as fh:
-                    fh.write("x" * 600)
-            self.assertIsNone(self.L.reserve(note, a), "the first claim must succeed")
-            entries = self.L._owners(d)[0]
-            self.assertIn(self.L.name_key(note), entries,
-                          "a reservation without a checksum must stay in the record")
-            self.assertEqual(self.L.reserve(note, b), a,
-                             "a second document must be told who holds the note path")
-
-    def test_the_same_document_may_re_reserve_its_own_note(self):
-        with tempfile.TemporaryDirectory() as d:
-            note, a = os.path.join(d, "main.md"), os.path.join(d, "a.md")
-            for f, body in ((a, "x" * 600), (note, "n" * 600)):
-                with open(f, "w") as fh:
-                    fh.write(body)
-            self.L.record(note, a)
-            before = self.L._owners(d)[0][self.L.name_key(note)]["sha256"]
-            self.assertIsNone(self.L.reserve(note, a))
-            self.assertEqual(self.L._owners(d)[0][self.L.name_key(note)]["sha256"], before,
-                             "re-reserving must keep the completed record's checksum")
+    def test_a_hold_that_cannot_be_taken_is_not_fatal_and_not_silent(self):
+        """flock fails with EOPNOTSUPP on some network and FUSE mounts, and that was swallowed: nothing
+        was held, two runs into one --out both paid, and one moved the other's plan aside (J4). The
+        run goes on unprotected, says so once per directory, and leaves no lock file behind."""
+        import contextlib, errno
+        warning = f"cannot lock {self.d}; concurrent runs into it are not protected"
+        err = io.StringIO()
+        with mock.patch.object(L.fcntl, "flock", side_effect=OSError(errno.EOPNOTSUPP, "Operation not supported")), \
+                contextlib.redirect_stderr(err):
+            self.assertIsNone(L.hold(self.note, "reading"))
+            self.assertIsNone(L.hold(os.path.join(self.d, "other.md"), "reading"))
+        self.assertEqual(err.getvalue().count(warning), 1, err.getvalue())
+        self.assertEqual(os.listdir(self.d), [], "a lock file nothing holds was left behind")
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file modes")
+        d = tempfile.mkdtemp(dir=self.d)          # no lock file can be made: not held, and said
+        os.chmod(d, 0o555)
+        self.addCleanup(os.chmod, d, 0o755)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(L.hold(os.path.join(d, "main.md"), "reading"))
+        self.assertIn(f"cannot lock {d}", err.getvalue())
 
 
 class TestNameKeyFolding(unittest.TestCase):

@@ -48,12 +48,18 @@ so adding your own is harmless but has no effect.
   },
   "effort":  { "reader": "medium", "digester": "medium", "planner": "medium",
                "verifier": "high", "coder": "medium", "tester": "medium" },
-  "paths":   { "python": "...", "books": "...", "cache": "...", "results": "...", "ledger": "..." },
+  "paths":   { "python": "~/.lacuna/venv/bin/python", "books": "~/.lacuna/books", "cache": "~/.lacuna/cache",
+               "results": "~/.claude/results", "ledger": "~/.lacuna/cost-ledger.jsonl" },
   "after":   { "read": "", "synth": "", "verify": "" },
   "budget_warn_usd": 2.0,
   "idle_minutes": 60
 }
 ```
+
+These `paths` are the defaults (with the default data directory), so copying the block changes nothing.
+`~` and `$VAR` are expanded; a relative path is taken from the data directory (`$LACUNA_DATA`), never
+from the directory you happen to run in. A path must point at what it names: `ledger` is a file,
+the others are directories.
 
 Each model value is passed verbatim to `claude --model`, so an alias (`haiku`, `sonnet`, `opus`,
 `fable`) or a pinned id (`claude-opus-5`) both work. Prefer an alias unless you need a specific
@@ -87,7 +93,7 @@ Write the importer to read its *last* argument, or keep the command argument-fre
 
 **What it is given differs by stage**, so check before writing an importer:
 
-| Hook | `$1` is |
+| Hook | The path argument is |
 |---|---|
 | `after.read` | the notes **directory** — one note per document inside it |
 | `after.synth` | the digest or plan **file** |
@@ -106,9 +112,14 @@ lacuna lit read|synth|verify|estimate|split-book
 lacuna spend | lacuna doctor | lacuna config | lacuna pane | lacuna split
 ```
 
-The exit codes are promised to keep their meanings: **0** ok, **2** bad input, **3** parse failure, **4** the model
-refused or produced nothing. A wrapper can branch on those — for example, retry stage `read` with a
-different model on exit 4.
+The exit codes are promised to keep their meanings: **0** ok, **2** refused, **3** parse failure,
+**4** the model refused or produced nothing. A wrapper can branch on those — for example, retry
+stage `read` with a different model on exit 4. Do not retry on 2 without a change: it is bad input,
+a file Lacuna cannot show it wrote (`--overwrite` replaces it), or a file another run is writing
+(`--overwrite` does not override that), each before any model call; or a file that changed while
+its run was in progress, after the call was paid, with the result kept beside it or, for a note, in
+the cache. A 0 can carry a warning on stderr: an output whose opening only looks like a failure is
+kept, and named, for you to check.
 
 ## 5. Skills that name other skills
 
@@ -119,6 +130,55 @@ is usually enough, and it keeps your project's own rules in your layer rather th
 A private plugin layered on this one typically ships: its own skills (your project's rules, status
 file discipline, a notebook integration as an `after.synth` command), its `books/` corpus, its own
 calibration, and nothing else.
+
+## 6. Adding your own agents to the workflow
+
+Lacuna's own stages are fixed (`read` → `synth` → `verify`), but every point between them is a file
+on disk, so your agents plug in around them rather than inside them. Four ways, lightest first.
+
+**a. Swap the model behind a built-in role.** No new agent at all: `config.json` →
+`"models": {"reader": "sonnet", "planner": "opus"}`. The roles are `reader`, `digester`, `planner`,
+`verifier`, `coder` and `tester` (`lacuna config` lists them and their current values), and
+`"effort"` takes the same keys.
+
+**b. Run your agent after a stage, with `after.*`** (§3). The hook receives the stage's output as its
+last argument, so an agent that reviews every new note, or turns a plan into tickets, is a short
+script:
+
+```bash
+#!/bin/sh
+# my-critic.sh — config.json: { "after": { "read": "/path/to/my-critic.sh" } }
+notes="$1"                                     # after.read is given the notes directory
+out="$(dirname "$notes")/critique.md"          # beside the notes, not in them: synth reads every .md there
+claude -p --model sonnet --agent my-critic --allowedTools "Read Grep Write" \
+  --add-dir "$notes" --add-dir "$(dirname "$notes")" <<EOF
+For each note in $notes, list the claims a domain expert would challenge and why.
+Write the result to $out.
+EOF
+```
+
+`--agent my-critic` names a Claude Code subagent (see c). A hook's failure is reported but never
+undoes the stage before it, and its model calls are not in Lacuna's ledger (`lacuna spend` still
+sees them, because it reads every Claude Code transcript). Keep your agent's output out of the notes
+directory: `synth --notes` reads every `.md` file in it as a note. While the hook runs, the directory
+also holds Lacuna's `.lacuna.json` and a `.lacuna-*.lock` that is removed when the run ends; a hook
+that commits or syncs the folder should ignore both.
+
+**c. Define the agent once, as a Claude Code subagent.** Put `my-critic.md` in your project's
+`.claude/agents/` (or `~/.claude/agents/` for every project). The plugin's own
+[`agents/paper-reader.md`](../agents/paper-reader.md), `coder.md` and `test-author.md` are working
+examples to copy: front matter with `name`, `description`, `tools` and `model`, then the
+instructions. Two rules that are easy to get wrong: `model:` must be a plain alias (`haiku`,
+`sonnet`, `opus`), and `${CLAUDE_PLUGIN_ROOT}` does not expand in front matter.
+
+**d. Chain stages and agents in a skill.** For a workflow you rerun, a project skill can say:
+run `lacuna lit read` on these papers, have the `my-critic` agent read the notes, run
+`lacuna lit synth` with the critique as part of `--objective`, then `lacuna lit verify --target`
+on the result. `verify` fact-checks any markdown file against `--repo` and `--notes`, so it works on
+your agents' output too, not only on Lacuna's plans. Branch on the exit codes (§4), not on the text.
+
+What you cannot do is add a stage *inside* `lacuna lit` or change its agents' prompts: the plugin
+directory is replaced on every update. See the next section.
 
 ## Using a notes app (Obsidian, Heptabase, Logseq, a wiki)
 
@@ -165,14 +225,34 @@ it). It travels with the folder, so moving the vault or deleting the cache chang
 
 When a run would replace a file that fails one of those tests, it exits 2 before any model call
 and names every such file: edited since Lacuna wrote it, not recorded as Lacuna's (your own file,
-or one written before 0.3.0 kept records), or the note for a different document with the same file
-name (`main.pdf` from two papers' folders). Move the file or choose another `--out` to keep it;
-re-run with `--overwrite` to replace it. What an `after.*` hook leaves (frontmatter it prepends, say)
-still counts as Lacuna's output; only edits made after the run make a file yours. If `synth --out`
-changes while the run is in progress, it is moved to `<out>.rejected` rather than deleted. Deleting
-`.lacuna.json` is safe: Lacuna then asks before
-replacing anything it finds, and adopts a note again when it is exactly that document's cached
-note.
+or one written before 0.3.0 kept records), the note for a different document with the same file
+name (`main.pdf` from two papers' folders), the note for a document that has changed since (a new
+download saved over the old one and a revised copy of the same paper look alike, so both ask), or a
+file another stage wrote (a paper named `plan.md` read into the folder that holds your plan). Move
+the file or choose another `--out` to keep it; re-run with `--overwrite` to replace it. What an
+`after.*` hook does to the files its run wrote (frontmatter it prepends, say) still counts as
+Lacuna's output. A change it makes to any other file (an earlier run's note) makes that file yours,
+so the next run that would replace it asks: write such a hook to skip a file it has already
+changed. A note you restore to exactly that document's cached note is Lacuna's again.
+
+A note, plan or report that changes while its run is in progress is never replaced or deleted.
+When the run succeeds, the file is left as it is and the run exits 2 naming it: a plan or report is
+written beside it as `<out>.new.md`; a note is in the cache, so the same command with `--overwrite`
+puts it there for free. When the run fails, the changed file is left where it is (the model may
+have written it, so check it); it is no longer as Lacuna recorded it, so the next run asks before
+replacing it. A run never moves, renames or deletes a file it did not write itself: not an edited
+note, not a report that describes an older version of the document. A `.new.md` never replaces an
+earlier one: the next is `-2`, then `-3`.
+
+Two runs never write one file at once. A run holds each note, plan or report it will write from
+the check above to its last write; another run that needs the same file exits 2 before any model
+call, naming the run that holds it (its process id). A hold ends when its run ends, however it ends
+(a refusal, Ctrl-C, a killed terminal), so nothing a run leaves behind blocks the next one.
+
+Deleting `.lacuna.json` is safe: Lacuna then asks before replacing anything it finds, and adopts a
+note again when it is exactly that document's cached note. A damaged one is kept as
+`.lacuna.json.damaged-<time>` beside it, the run says so, and a new record is started; the same
+then holds, and a later refusal mentions the damaged copy.
 
 ### A note on frontmatter
 
@@ -187,6 +267,8 @@ would change the prompt version and correctly invalidate every cached note you a
 - **Hook ordering.** Plugin hooks are additive but have no guaranteed order; a second plugin's
   `SessionStart` hook must not assume this one ran first. Put anything you depend on in the data
   directory, not in the session environment.
+- **The built-in agents.** The `reader`, `synth` and `verifier` agent definitions live inside
+  `lit_pipeline.py` and are replaced on update. Add your own around them (§6), not instead of them.
 - **The note template and the prompt text.** These change with measurements. When they do,
   `PROMPT_VERSION` in `lit_pipeline.py` is bumped and your note cache correctly misses — so you are
   never silently served notes written under old assumptions.

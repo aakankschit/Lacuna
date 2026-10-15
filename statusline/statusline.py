@@ -44,7 +44,7 @@ def _price_table(doc):
         except (TypeError, ValueError):
             continue
         if not str(k).startswith("_") and len(t) == 5 and all(math.isfinite(x) and x >= 0 for x in t):
-            out[k] = t
+            out[k[len("claude-"):] if k.startswith("claude-") else k] = t   # "claude-opus-5-5" is "opus-5-5"
     return out
 
 
@@ -78,18 +78,29 @@ def dur(sec):
 
 
 def price(model):
-    return next((v for k, v in PRICE.items() if k in (model or "")), PRICE["opus-5-5"])
+    model = model if isinstance(model, str) else ""
+    return next((v for k, v in PRICE.items() if k in model), PRICE["opus-5-5"])
+
+
+def _num(v):
+    """v if it is a finite number (not a bool), else None. stdin JSON is not ours: NaN and Infinity
+    parse, and `round(nan)` raises."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+def _obj(v):
+    return v if isinstance(v, dict) else {}
 
 
 def _n(d, key):
     """A token count from a transcript: a missing, null or non-numeric field is 0."""
-    v = d.get(key) if isinstance(d, dict) else None
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+    v = _num(d.get(key)) if isinstance(d, dict) else None
+    return v if v is not None else 0
 
 
 def cost(u, model):
     """Dollar split of one usage block: (read$, write$, out$, uncached$)."""
-    inp, w5, w1, rd, out = price(model if isinstance(model, str) else None)
+    inp, w5, w1, rd, out = price(model)
     cc = u.get("cache_creation")
     t5, t1 = _n(cc, "ephemeral_5m_input_tokens"), _n(cc, "ephemeral_1h_input_tokens")
     if not (t5 or t1):
@@ -103,17 +114,21 @@ def last_turn(path):
 
     `earlier$` prices the attempts before the last in `usage.iterations` (a refusal, a fallback),
     which the top-level usage leaves out. Whether they were billed is not in the transcript."""
+    # A path that is not a string must never reach open(): `true` is file descriptor 1, and the
+    # `with` would close the status line's own stdout.
+    if not isinstance(path, str) or not path:
+        return None
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
             f.seek(max(0, f.tell() - 1_500_000))
             lines = f.read().decode("utf-8", "ignore").splitlines()
-    except (OSError, TypeError):
+    except (OSError, ValueError):       # ValueError: a NUL byte in the path
         return None
     for ln in reversed(lines):
         try:
             e = json.loads(ln)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(e, dict):           # valid JSON that is not a transcript line
             continue
@@ -132,23 +147,32 @@ def last_turn(path):
 def main():
     try:
         d = json.load(sys.stdin)
-    except ValueError:
+    except (ValueError, RecursionError):
         return          # a status line that prints a traceback is worse than one that prints nothing
+    if not isinstance(d, dict):
+        return
     try:
         cols = int(os.environ.get("COLUMNS") or 120)
     except ValueError:
         cols = 120
-    model = d.get("model") or {}
-    name = model.get("display_name", "?")
+    # Every field is read by type: this is Claude Code's internal JSON, and a field of the wrong
+    # type must blank its segment, not the whole line (or, for a path, close stdout).
+    model = _obj(d.get("model"))
+    name = model.get("display_name")
+    name = name if isinstance(name, str) and name else "?"
     fam = next((k for k in TIER if k in name), "Opus")
-    eff = (d.get("effort") or {}).get("level")
-    cw = d.get("context_window") or {}
-    u = cw.get("current_usage") or {}
-    ctx = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-    win = cw.get("context_window_size") or 1_000_000
-    pc = d.get("prompt_cache") or {}
+    eff = _obj(d.get("effort")).get("level")
+    eff = eff if isinstance(eff, str) else None
+    cw = _obj(d.get("context_window"))
+    u = _obj(cw.get("current_usage"))
+    ctx = sum(_n(u, k) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    win = _num(cw.get("context_window_size"))
+    win = win if win and win > 0 else 1_000_000
+    pc = _obj(d.get("prompt_cache"))
     _, _, w1, _, _ = price(model.get("id"))
-    proj = os.path.basename((d.get("workspace") or {}).get("project_dir") or d.get("cwd") or "")
+    pdir, cwd = _obj(d.get("workspace")).get("project_dir"), d.get("cwd")
+    proj = os.path.basename(next((x for x in (pdir, cwd) if isinstance(x, str) and x), ""))
+    expires = _num(pc.get("expires_at"))
 
     # line 1: who, where, how full, how warm
     l1 = [c(TIER[fam], f"◆ {name}") + (f" {DIM}{eff}{RST}" if eff else "")]
@@ -157,14 +181,15 @@ def main():
     if ctx:
         col = 114 if ctx < 100_000 else 221 if ctx < 200_000 else 203
         l1.append(f"ctx {c(col, bar(ctx / min(win, 400_000)))} {c(col, f'{ctx / 1000:.0f}k')}")
-        left = (pc.get("expires_at") or 0) - time.time()
-        if pc.get("expires_at") and left > 0:
+        left = (expires or 0) - time.time()
+        if expires and left > 0:
             col = 114 if left > 600 else 221
-            ttl = pc.get("ttl", "")
+            ttl = pc.get("ttl")
+            ttl = ttl if isinstance(ttl, str) else ""
             # "1h cache · 42m left", never "1h 42m left" — which reads as a single duration
             l1.append(f"cache {c(col, '●')} " + (f"{ttl} cache · " if ttl else "")
                       + c(col, dur(left) + " left"))
-        elif pc.get("expires_at"):
+        elif expires:
             # We were given an expiry time and it has passed: the cache is cold.
             l1.append(c(203, f"cache ○ cold · next prompt re-caches ≈${ctx * w1 / 1e6:.2f}"))
         # No expiry time (the field is absent before a process's first request, and null when the
@@ -176,7 +201,7 @@ def main():
         l1.append(f"{DIM}ctx -{RST}")
 
     # line 2: what it has cost, what the last turn cost, how much plan is left
-    cost = (d.get("cost") or {}).get("total_cost_usd") or 0
+    cost = _num(_obj(d.get("cost")).get("total_cost_usd")) or 0
     l2 = [f"${cost:.2f} session"]
     lt = last_turn(d.get("transcript_path"))
     if lt:
@@ -185,16 +210,18 @@ def main():
         # Earlier attempts in the same call may or may not have been billed: show both ends.
         fig = f"${low:.3f}–${low + earlier:.3f}" if earlier >= 0.0005 else f"${low:.3f}"
         l2.append(f"last {fig} {DIM}(read {rd:.3f} · write {wr:.3f} · out {out:.3f}){RST}")
-    if pc.get("hit_ratio") is not None:
-        l2.append(f"hit {pc['hit_ratio'] * 100:.0f}%" if pc["hit_ratio"] <= 1 else f"hit {pc['hit_ratio']:.0f}%")
-    rl = d.get("rate_limits") or {}
+    hr = _num(pc.get("hit_ratio"))
+    if hr is not None:
+        l2.append(f"hit {hr * 100:.0f}%" if hr <= 1 else f"hit {hr:.0f}%")
+    rl = _obj(d.get("rate_limits"))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-        w = rl.get(key)
-        if not w or w.get("used_percentage") is None:
+        w = _obj(rl.get(key))
+        p = _num(w.get("used_percentage"))
+        if p is None:
             continue
-        p = w["used_percentage"]
         col = 114 if p < 60 else 221 if p < 85 else 203
-        reset = f" {DIM}↻{dur(w['resets_at'] - time.time())}{RST}" if w.get("resets_at") else ""
+        resets = _num(w.get("resets_at"))
+        reset = f" {DIM}↻{dur(resets - time.time())}{RST}" if resets else ""
         l2.append(f"{label} {c(col, bar(p / 100, 6))} {c(col, f'{p:.0f}%')}{reset}")
 
     sep = f" {DIM}│{RST} "

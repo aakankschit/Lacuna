@@ -16,13 +16,18 @@ lacuna — find the gaps in a literature and build against them
   lacuna doctor [--install-pdf] [--install-fallback] [--install-equations]
         Check the environment, create the data directory, report what is missing.
 
-  lacuna spend [--session PATH|ID] [--days N] [--no-color]
+  lacuna spend [--session PATH|ID] [--days N] [--cwd DIR] [--no-color]
         What this session and recent sessions cost, where the money went, and cache health.
         Reads only the transcripts already on disk — no API calls, nothing to install.
 
   lacuna lit read   <pdf|md> [...] [--out DIR] [--brief TEXT] [--model M] [--no-books]
-  lacuna lit synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT]
-  lacuna lit verify --target FILE --repo DIR [--notes DIR]
+                    [--equations] [--parser pymupdf4llm|docling|marker] [--overwrite]
+  lacuna lit synth  --repo DIR --out FILE [--notes DIR] [--kind digest|plan] [--objective TEXT]
+                    [--digest FILE] [--status FILE] [--model M] [--overwrite]
+  lacuna lit verify --target FILE --repo DIR [--notes DIR] [--model M] [--overwrite]
+        --overwrite replaces a file in your directory that Lacuna cannot show is its own and
+        unedited (a note, digest, plan or report you changed, or one it did not write). Without
+        it such a file is refused before any model call.
   lacuna lit estimate <files> [--per-agent N] [--model M] [--effort E] [--json]
         Cost and wall time before you spend anything. --json for a machine-readable report.
   lacuna lit split-book <pdf> <out-dir>            Chapter files plus a grep-able index.
@@ -31,7 +36,7 @@ lacuna — find the gaps in a literature and build against them
   lacuna pane [FILE|DIR]             Follow a results file in a rendered markdown viewer.
   lacuna split                       Open a tmux results pane beside this session.
 
-Exit codes: 0 ok, 2 bad input, 3 parse failure, 4 model refused or produced nothing.
+Exit codes: 0 ok, 2 stopped for you to decide (usually before spending), 3 parse failure, 4 model refused or produced nothing.
 USAGE
 }
 
@@ -49,7 +54,8 @@ case "$cmd" in
       estimate)          exec "$PY" "$ROOT/scripts/lit/lit_cost.py" "$@" ;;
       split-book)
         # needs pymupdf, which lives in the parser venv rather than the system python
-        BOOKPY="$("$PY" -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import lacuna_config; print(lacuna_config.path('python'))")"
+        # $ROOT goes in as argv, never into the code: a quote in the plugin path was a SyntaxError here
+        BOOKPY="$("$PY" -c "import sys; sys.path.insert(0, sys.argv[1] + '/scripts'); import lacuna_config; print(lacuna_config.path('python'))" "$ROOT")"
         [ -x "$BOOKPY" ] || BOOKPY="$PY"
         exec "$BOOKPY" "$ROOT/scripts/lit/split_book.py" "$@" ;;
       ""|-h|--help)      usage; exit 0 ;;

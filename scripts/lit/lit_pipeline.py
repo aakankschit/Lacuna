@@ -18,7 +18,8 @@ usage:
   lit_pipeline.py synth  --notes DIR --repo DIR --out FILE [--kind digest|plan] [--objective TEXT] [--overwrite]
   lit_pipeline.py verify --target FILE --repo DIR [--notes DIR]
 """
-import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, shutil, subprocess, sys, threading, time
+import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile
+import threading, time
 import unicodedata
 try:
     import fcntl                       # POSIX; elsewhere the record is guarded within one process only
@@ -37,11 +38,11 @@ LEDGER = lacuna_config.path("ledger")
 
 # Bump when the reader prompt or the note template changes: it is part of the cache key, so a
 # changed prompt must miss the cache rather than silently serve notes written under old assumptions.
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "3"
 
 # Bump when prep_md's clean() or validate() changes: the parsed-markdown cache is keyed on this,
 # so without it a change to parsing never reaches a document that has already been parsed.
-PARSE_VERSION = "3"
+PARSE_VERSION = "5"
 
 EX_OK, EX_INPUT, EX_PARSE, EX_MODEL = 0, 2, 3, 4   # exit codes, so callers can branch
 
@@ -56,10 +57,6 @@ What was done, with key parameters, datasets, metrics, baselines.
 ## Key results
 Bullets. Every number with its unit AND a location (section, table, figure).
 
-## Concepts looked up
-Per concept: the concept, the source (book + chapter), the one-line definition taken away.
-"Not found in the supplied sources" is a valid and useful entry. Write "none" if you looked none up.
-
 ## Relevance to the project
 How it bears on the project's problem. Mark anything that is your inference, not the paper's claim.
 
@@ -67,13 +64,27 @@ How it bears on the project's problem. Mark anything that is your inference, not
 Numbered. Each: the gap, the evidence in the paper, what would resolve it. Include gaps the authors do not state.
 """
 
+# Only when textbooks are offered. Books are optional; without them this section filled every note with
+# "Not found in the supplied sources" lines, which a reader took for claims about the paper.
+CONCEPTS_SECTION = """## Concepts looked up
+Per concept: the concept, the source (book + chapter), the one-line definition taken away.
+"Not found in the supplied sources" is a valid and useful entry. Write "none" if you looked none up.
+
+"""
+
+
+def note_template(books_offered):
+    if not books_offered:
+        return NOTE_TEMPLATE
+    return NOTE_TEMPLATE.replace("## Relevance to the project", CONCEPTS_SECTION + "## Relevance to the project", 1)
+
 AGENTS = {
     "reader": {"description": "Reads one paper and writes a structured note",
                "tools": ["Read", "Grep", "Glob", "Write"],
                "prompt": ("You read one research paper (plain text from PDF; equations may be garbled) and write a "
                           "faithful structured note for a colleague who will not see the paper. Every number carries "
-                          "a location. When the paper assumes a concept you cannot state precisely, look it up in the "
-                          "supplied textbooks with Grep and read only the surrounding lines. Never invent a number, a "
+                          "a location. If textbooks are supplied and the paper assumes a concept you cannot state "
+                          "precisely, look it up in them with Grep and read only the surrounding lines. Never invent a number, a "
                           "citation or a section number. Your final reply is only the path you wrote.")},
     "synth": {"description": "Turns notes plus a codebase into a digest or a development plan",
               "tools": ["Read", "Grep", "Glob", "Write"],
@@ -124,8 +135,9 @@ def usd(res):
     return res.get("total_cost_usd") or 0
 
 
-def after(stage, out_path):
-    """Run the user's post-stage command, if configured, with the output path as $1.
+def after(stage, out_path, written):
+    """Run the user's post-stage command, if configured, with the output path as its final argument.
+    `written` is what this run wrote: the files whose changes by the hook are still Lacuna's.
 
     This is the extension seam: a project-specific layer can file the output wherever it keeps
     records without this plugin knowing anything about it.
@@ -136,8 +148,20 @@ def after(stage, out_path):
     cmd = (lacuna_config.CONFIG.get("after") or {}).get(stage)
     if not cmd:
         return
+    # What the hook does to this run's outputs is still Lacuna's: see rerecord().
+    d = out_path if os.path.isdir(out_path) else os.path.dirname(out_path) or "."
+    try:
+        before = {name_key(p): _sha(p) for p in written if os.path.isfile(p) and not os.path.islink(p)}
+    except OSError:
+        before = {}
+    _run_hook(stage, cmd, out_path)
+    rerecord(d, before)
+
+
+def _run_hook(stage, cmd, out_path):
     # Run through a shell so "~", "$VAR" and shell syntax work. The output path is APPENDED as the
-    # final argument: a command with no arguments of its own therefore receives it as "$1".
+    # final argument (it is the command's "$1" only when it has no arguments of its own; the "$1"
+    # in the sh -c string below is this wrapper's).
     try:
         if isinstance(cmd, str):
             argv = ["sh", "-c", cmd + ' "$1"', "sh", out_path]
@@ -192,9 +216,58 @@ def find_status(repo, explicit=None):
     if explicit:
         return explicit if os.path.exists(explicit) else None
     for c in STATUS_CANDIDATES:
-        if os.path.exists(os.path.join(repo, c)):
+        # A guessed file that is empty, binary or unreadable is not a status file: skip it rather
+        # than refuse a run over a file the user never named.
+        if os.path.isfile(os.path.join(repo, c)) and not not_content(os.path.join(repo, c)):
             return os.path.join(repo, c)
     return None
+
+
+def repo_tree(repo):
+    """The file list an agent is given for a codebase: git's, else our own walk. Empty when the
+    repository has no files, or none we are allowed to list."""
+    try:
+        tree = subprocess.run(["git", "-C", repo, "ls-files"], capture_output=True, text=True).stdout
+    except OSError:                            # no git on this machine
+        tree = ""
+    return tree if tree.strip() else "\n".join(walk_files(repo))   # not a git repo: list it ourselves
+
+
+# What a file must be to count as content, whichever subcommand reads it. Every input that is not
+# content was once sent to a paid call and filed as a result (an empty document, a binary .txt, an
+# unreadable --status): the one rule is applied to every input file before any model is called.
+BINARY_RATIO = 0.30       # of the first 64 KB; real text with accents, CJK or symbols is far below it
+
+
+def not_content(path, min_chars=0):
+    """Why the file at `path` cannot be content (a sentence), or None when it can.
+
+    Conservative on purpose: only a NUL byte, or a head that is mostly control characters and
+    undecodable bytes, is called binary, so text in another script or encoding still passes."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(65536)
+    except OSError as e:
+        return f"cannot be read ({e.strerror or e})"
+    if b"\0" in raw:
+        return "is a binary file, not text"
+    text = raw.decode("utf-8", errors="replace")
+    if not text.strip():
+        return "is empty" if not raw else "holds only whitespace"
+    odd = sum(1 for c in text if c == "\ufffd" or (unicodedata.category(c) == "Cc" and c not in "\t\n\r\f\v"))
+    if odd > BINARY_RATIO * len(text):
+        return "is a binary file, not text"
+    if len(text.strip()) < min_chars:
+        return f"holds only {len(text.strip())} characters of text (under {min_chars})"
+    return None
+
+
+def refuse_inputs(problems):
+    """Exit 2, naming every input that is not content and why. Nothing has been sent to a model."""
+    if problems:
+        print("ERROR: these inputs cannot be used:\n" + "\n".join(f"  - {p}" for p in problems)
+              + "\nFix or remove them. Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
 
 
 def need_venv():
@@ -220,13 +293,24 @@ def to_markdown(path, out_dir, equations=False, parser=None):
         sys.exit(EX_INPUT)
     if path.lower().endswith(TEXT_EXTS):
         return path
-    need_venv()
+    # prep_md.py is standard-library only; it needs the default parser's venv to run pymupdf4llm and
+    # for the page and character counts that catch a truncated parse. The marker and docling parsers
+    # live in their own venvs, so `--equations` alone must not demand the default one.
+    own_venv = (parser or ("marker" if equations else "pymupdf4llm")) != "pymupdf4llm"
+    if not own_venv or os.path.exists(VENV):
+        need_venv()
+        py = VENV
+    else:
+        py = sys.executable
+        print(f"  ! no default parser venv at {VENV}: this parse is not checked against the PDF's own "
+              f"text for truncation. `lacuna doctor --install-pdf` adds the check.", file=sys.stderr)
     h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
     os.makedirs(f"{CACHE}/md", exist_ok=True)
     tag = f"_{parser}" if parser else ("_marker" if equations else "")
-    md = f"{CACHE}/md/{os.path.basename(path)[:-4]}_{h}_p{PARSE_VERSION}{tag}.md"
+    md = os.path.join(CACHE, "md", fitted(os.path.basename(path)[:-4], f"_{h}_p{PARSE_VERSION}{tag}.md",
+                                          os.path.join(CACHE, "md"), spare=len(".partial")))   # prep_md's temp
     if not os.path.exists(md) or os.path.getsize(md) == 0:   # 0 bytes: an interrupted parse
-        cmd = [VENV, "-I", f"{HERE}/prep_md.py", path, md]
+        cmd = [py, "-I", f"{HERE}/prep_md.py", path, md]
         if equations:
             cmd.append("--equations")
         if parser:
@@ -245,17 +329,35 @@ def to_markdown(path, out_dir, equations=False, parser=None):
 def cmd_read(a):
     """One slim reader per paper, in parallel. The agent writes into --out (its cwd); Python does the
     caching, so a paper is never read twice and no agent needs write access outside --out."""
+    # Every document must be content before anything is parsed, reserved or paid for, and every bad
+    # one is named: an empty .md, a whitespace-only or binary .txt, an unreadable file.
+    bad = []
+    for p in a.papers:
+        if not os.path.isfile(p):
+            bad.append(f"{p} does not exist" if not os.path.lexists(p) else f"{p} is not a file")
+        elif p.lower().endswith(TEXT_EXTS):
+            why = not_content(p)
+            if why:
+                bad.append(f"{p} {why}")
+        else:
+            try:
+                open(p, "rb").close()
+            except OSError as e:
+                bad.append(f"{p} cannot be read ({e.strerror})")
+    refuse_inputs(bad)
     out_dir = os.path.abspath(a.out)
     if os.path.isfile(out_dir):
         print(f"ERROR: --out {a.out!r} is a file; it must be a directory for notes.", file=sys.stderr)
         sys.exit(EX_INPUT)
     os.makedirs(out_dir, exist_ok=True)
     need_writable(out_dir, "--out")
-    os.makedirs(f"{CACHE}/notes", exist_ok=True)
+    need_bookkeeping(f"{CACHE}/notes", f"{CACHE}/md", os.path.join(CACHE, "drafts"))
+    need_short_names([f"{out_dir}/{os.path.splitext(os.path.basename(p))[0]}.md" for p in a.papers],
+                     "Rename the document, or copy it under a shorter name.")
     # Each document's note is <out>/<its name>.md. Settle every name before anything is parsed or
     # paid for: two documents with one name once shared a note path, and the parallel readers then
     # cached one paper's note under the other's key, permanently.
-    papers, by_note, blocked = [], {}, {}
+    papers, by_note, blocked, before = [], {}, {}, {}
     for src in map(os.path.abspath, a.papers):
         stem = os.path.splitext(os.path.basename(src))[0]
         note = f"{out_dir}/{stem}.md"
@@ -274,20 +376,15 @@ def cmd_read(a):
             print(f"ERROR: {note} is a directory, so {src} has nowhere to put its note. Nothing was sent "
                   f"to a model.", file=sys.stderr)
             sys.exit(EX_INPUT)
+        # Held before it is checked and until this run ends, so that no other run writes it between.
+        need_hold(note, f"reading {src} into")
         # A note may only replace a note this tool wrote for this document and nobody has edited
         # since. Anything else at that path is someone's: a hand-edited note, a file in a vault, or
         # the note for another paper that happens to share this one's file name.
         why = not_ours(note, src)
         if why:
             blocked[note] = why
-        # Reserve only a note we may actually write. Reserving one we are about to refuse
-        # overwrote the rightful owner's record with this run's claim; the document still goes
-        # through, because an unrecorded note may yet be adopted as this document's cached note.
-        taken = reserve(note, src) if a.overwrite or not why else None
-        if taken:
-            print(f"ERROR: another Lacuna run is reading {taken} into {note} right now. Wait for it, "
-                  f"or use a different --out. Nothing was sent to a model.", file=sys.stderr)
-            sys.exit(EX_INPUT)
+        before[note] = file_state(note)
         by_note[name_key(note)] = src
         papers.append((src, stem, note))
     reader_model = a.model or lacuna_config.model("reader")
@@ -300,6 +397,7 @@ def cmd_read(a):
     indexes = "".join(open(t, "rb").read().decode(errors="ignore") for t in idx)
     books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]
     reader_effort = lacuna_config.effort("reader")
+    drafts = tempfile.mkdtemp(prefix="read-", dir=os.path.join(CACHE, "drafts"))
     jobs = []
     for src, stem, note in papers:
         md = to_markdown(src, out_dir, equations=a.equations, parser=a.parser)
@@ -309,13 +407,13 @@ def cmd_read(a):
         key = hashlib.sha256("\0".join(
             [content_h, PROMPT_VERSION, reader_model, reader_effort, a.brief, books_fp]
         ).encode()).hexdigest()[:12]
-        cached = f"{CACHE}/notes/{stem}_{key}.md"
-        # A note from before ownership was recorded (0.2.0), or from a run killed between writing
-        # it and recording it, is still provably this document's when it is exactly this document's
-        # cached note.
-        if blocked.get(note, ("",))[0] == UNRECORDED and same_bytes(note, cached):
+        cached = os.path.join(CACHE, "notes", fitted(stem, f"_{key}.md", os.path.join(CACHE, "notes")))
+        # A note from before ownership was recorded (0.2.0), from a run killed between writing it
+        # and recording it, or restored from a backup over one a hook had changed (B29), is still
+        # provably this document's when it is exactly this document's cached note.
+        if blocked.get(note, ("",))[0] in (UNRECORDED, "edited") and same_bytes(note, cached):
             del blocked[note]
-        jobs.append((src, md, note, cached))
+        jobs.append((src, md, note, cached, os.path.join(drafts, f"{len(jobs)}.md")))
     if blocked and not a.overwrite:
         print(f"ERROR: {len(blocked)} file(s) in {out_dir} would be replaced, and Lacuna cannot show they "
               f"are notes it wrote for these documents:", file=sys.stderr)
@@ -326,27 +424,48 @@ def cmd_read(a):
               "these files anyway, run the same command with --overwrite.", file=sys.stderr)
         sys.exit(EX_INPUT)
 
-    def one(src, md, out, cached):
-        if os.path.islink(out):
-            os.remove(out)                # only with --overwrite; never write through a link
-        if os.path.exists(cached) and os.path.getsize(cached) > 400:
-            shutil.copy(cached, out)      # always refresh: --out may hold another run's note
-            record(out, src)
-            written.append((out, src))
-            return os.path.basename(out), "cached (free)", 0.0
-        # Remove any earlier note first, so "the file exists" can only mean this call wrote it.
-        # Otherwise a refusal on a re-run reports success and caches the stale note under a new key.
-        # (Only ever a note this tool wrote: anything else at this path stopped the run above.)
-        if os.path.exists(out):
-            os.remove(out)
-            forget(out)
+    written = []
+
+    def place(src, out, text):
+        """Put `text` at the note path, unless the note changed while this run was in progress
+        (someone edited it, or something else wrote it): then it is left as it is (B11)."""
+        if changed_since(out, before[out]):
+            return False
+        _atomic_copy(text, out)           # renamed into place: never half-written, never through a link
+        record(out, src)
+        written.append(out)
+        return True
+
+    def one(src, md, out, cached, draft):
+        left = (f"KEPT — {out} changed while this run was in progress, so it was left as it is. This run's "
+                f"note is cached: run the same command with --overwrite to put it there, free")
+        # A hit is judged by today's content check, not by the one that cached it: a note cached before
+        # the check learned a shape (an apology, a status marker) was otherwise served free forever.
+        fresh = os.path.exists(cached) and usable_output(cached, 400, f"cached note for {os.path.basename(out)}",
+                                                         ("## Claim",), then="removed from the cache; reading the "
+                                                         "document again (paid)", name=out)
+        if os.path.exists(cached) and not fresh:
+            try:
+                os.remove(cached)
+            except OSError:
+                pass
+        if fresh:
+            # always refresh: --out may hold another run's note
+            return os.path.basename(out), "cached (free)" if place(src, out, cached) else left, 0.0
+        # The agent writes a draft in a directory of this run's own, never the note path. Judged and
+        # cached at the note path, whatever was there when the agent returned was taken for its note:
+        # an earlier note after a refusal, or another run's note, cached under this document's key.
         prompt = "\n\n".join(x for x in [
             a.brief, books,
             "Read the paper below in full and write its note to the given path, using exactly this template:",
-            NOTE_TEMPLATE, f"Paper:\n- {md} -> {out}", "Keep the note under 1,100 words."] if x)
-        res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, BOOKS_DIR],
+            note_template(bool(idx)), f"Paper:\n- {md} -> {draft}", "Keep the note under 1,100 words.",
+            INCOMPLETE_RULE.format(what="the paper", also=f" and do not write {draft}")] if x)
+        res = claude("reader", reader_model, prompt, [os.path.dirname(md), out_dir, drafts, BOOKS_DIR],
                      effort=lacuna_config.effort("reader"), cwd=out_dir)
-        ok = usable_output(out, 400, "note", must_contain=("## Claim",))
+        # The reader is told the INCOMPLETE rule too, and its reply is read: a haiku given symbol noise
+        # filed a template-shaped "Not recoverable" note, and it was cached (VERDICT3 N5).
+        reply = "" if res.get("is_error") else str(res.get("result") or "").strip()
+        ok = usable_output(draft, 400, "note", must_contain=("## Claim",), reply=reply, name=out)
         # source_tokens makes the calibration recipe in docs/extending.md actually runnable
         # effort and source_tokens are both required by the recalibration recipe in
         # docs/extending.md, which is per model x effort.
@@ -355,145 +474,250 @@ def cmd_read(a):
                 "books": bool(idx), "wrote_note": ok,
                 "source_tokens": round(os.path.getsize(md) / 2.9), "is_error": res.get("is_error")})
         if ok:
-            _atomic_copy(out, cached)
-            record(out, src)
-            written.append((out, src))
-            return os.path.basename(out), f"${usd(res):.4f} {res['wall_s']}s", usd(res)
+            try:
+                _atomic_copy(draft, cached)
+            except OSError as e:      # the note is paid for and good: caching it is only a saving
+                print(f"  ! could not cache the note for {src} ({e}); it will be read again next time",
+                      file=sys.stderr)
+                if changed_since(out, before[out]):
+                    beside = free_name(out, ".new")      # not .md: synth reads every note in --out
+                    _atomic_copy(draft, beside)
+                    left = (f"KEPT — {out} changed while this run was in progress, so it was left as it is. "
+                            f"This run's note is in {beside}")
+            msg = f"${usd(res):.4f} {res['wall_s']}s" if place(src, out, draft) else left
+            return os.path.basename(out), msg, usd(res)
+        said = judge(reply, reply=True)
         why = (str(res.get("result"))[:120] if res.get("is_error") else
-               "the file it wrote is not a note (see above)" if os.path.exists(out) else "agent produced no note file")
-        if os.path.exists(out):
-            os.remove(out)      # an apology left in --out would be read as a note by the next synth
+               f"it replied {said[1][:160]!r}" if said and said[0] == "fail" else
+               "the file it wrote is not a note (see above)" if os.path.exists(draft) else "agent produced no note file")
+        if changed_since(out, before[out]):
+            # The agent wrote the note path instead of its draft, or someone edited it meanwhile. This run
+            # did not write it, so it stays where it is: a user's edit was moved aside once (E11).
+            why += f"; {out} changed during the run and was left as it is: check it before using it"
         return os.path.basename(out), f"FAILED ${usd(res):.4f} — {why}", usd(res)
 
-    t0, total, failed, written = time.time(), 0.0, 0, []
-    with cf.ThreadPoolExecutor(min(8, len(jobs))) as ex:
-        for name, msg, cost in ex.map(lambda j: one(*j), jobs):
-            print(f"  {name:48s} {msg}")
-            total += cost
-            failed += msg.startswith("FAILED")
-    print(f"{len(jobs) - failed}/{len(jobs)} notes written, ${total:.3f}, {round(time.time() - t0)}s wall -> {out_dir}")
+    t0, total, failed, kept = time.time(), 0.0, 0, 0
+    try:
+        with cf.ThreadPoolExecutor(min(8, len(jobs))) as ex:
+            for name, msg, cost in ex.map(lambda j: one(*j), jobs):
+                print(f"  {name:48s} {msg}")
+                total += cost
+                failed += msg.startswith("FAILED")
+                kept += msg.startswith("KEPT")
+    finally:
+        shutil.rmtree(drafts, ignore_errors=True)
+    print(f"{len(jobs) - failed - kept}/{len(jobs)} notes written, ${total:.3f}, {round(time.time() - t0)}s wall "
+          f"-> {out_dir}")
     if failed:
         print(f"ERROR: {failed} document(s) produced no note. Nothing downstream should run on this "
               f"directory, and no partial note was cached.", file=sys.stderr)
         sys.exit(EX_MODEL)
-    after("read", out_dir)
-    for out, src in written:
-        rerecord(out, src)
+    if kept:
+        print(f"ERROR: {kept} note(s) changed while this run was in progress and were left as they are; "
+              f"see above.", file=sys.stderr)
+        sys.exit(EX_INPUT)
+    after("read", out_dir, written)
 
 
-# Phrases a model writes when it could not do the job. A file of apologies passes any size check,
-# which is how a blocked run came to report success and fire the user's after.* hook.
-REFUSAL_MARKERS = (
-    "not completed", "cannot complete", "could not complete", "unable to complete",
-    "i can't help", "i cannot help", "i'm unable to", "i am unable to", "no files were found",
-    "unable to read", "could not read any", "i don't have access",
-    "could not check any", "cannot check any", "unable to check any", "could not verify any",
-)
-
-
-# A model writes "I could not read any…", not "could not read any…", and a curly apostrophe is
-# what most of them actually emit. Normalise both away before matching, or the phrase list only
-# catches the one phrasing someone happened to paste into it.
-_LEAD = re.compile(r"^(?:unfortunately|sorry|apologies|note)\b[,:\s]*|^(?:i|we)\s+(?:am\s+|'m\s+)?")
+# ---- did the model say it could not do the job?
+#
+# Every agent is told to reply `INCOMPLETE: <reason>` rather than write a document about failing
+# (INCOMPLETE_RULE), and real failing models did, in capitals, each time it was tried. This check
+# swung between filing failures and discarding paid results four times, each time by adding or
+# removing phrases; so it has three outcomes, and only an unambiguous declaration fails a stage.
+#
+#   fail   exit 4, nothing filed or cached. In a document's OPENING (the headings above its first
+#          statement, and that statement, past any frontmatter and furniture: a callout tag, a quote
+#          mark, a list number, a code fence, "Status:"), or on any line of a reply:
+#          - a status word IN CAPITALS set off as the document's state: "INCOMPLETE: …", "(BLOCKED)",
+#            "— PARTIAL", "**FAILED**" (the rule is above _status_word);
+#          - the agent saying it could not do the job as a whole: "I" or no subject, an inability, a
+#            verb for the job, and the whole input as its object (_WHOLE): "I couldn't open any of
+#            the notes", "Unable to read the supplied directory", "As an AI, I cannot open PDF files
+#            directly", "I'm sorry, but I can't help with that"; or "The paper could not be read".
+#          And a reply that holds the told `INCOMPLETE:` anywhere: "… symbol noise. INCOMPLETE: none".
+#   warn   kept and filed, with one line on stderr naming the file: the same shapes where a program
+#          cannot tell a failure from a finding. The status word in lower or title case ("# Partial
+#          3D shape matching", "Incomplete: no baseline for proposal 5"), or on a list item with a
+#          reason after it ("- **BLOCKED** until the CUDA build lands"); an inability about a part
+#          ("I could not access the Supporting Information", "two of the five notes", "Table 3");
+#          an apology ("I'm sorry, but …"); and any of these below the opening.
+#   clean  everything else: the words inside a sentence ("37 had not completed follow-up", "the
+#          authors were unable to read 5 records", "We could not complete follow-up": in a note "we"
+#          are the paper's authors), in a name, and a verify finding (`claim -> what you found`).
+#
+# A failure phrased outside these shapes is filed, so the reply is the channel to rely on.
+_LEAD_IN = re.compile(r"^(?:(?:unfortunately|regrettably|sadly|however|note|sorry|(?:my )?apologies"
+                      r"|i am (?:very |so |really )?sorry|i am afraid|i apologi[sz]e|as an ai(?: language model)?)"
+                      r"\b[^\w]*(?:but\b[^\w]*)?)+")
+_SORRY = re.compile(r"(?:sorry|(?:my )?apologies|i am (?:very |so |really )?sorry|i am afraid|i apologi[sz]e|as an ai)\b")
+_UNABLE = (r"(?:(?:am|was|were|have been|had been)\s+)?(?:unable|not able)\s+to|cannot|can not|could not"
+           r"|did not manage to|(?:do|did) not have the (?:ability|means) to")
+_JOB = (r"help|assist|complete|finish|fulfil|fulfill|comply|proceed|continue|summari[sz]e|write|produce|generate"
+        r"|provide|perform|do|open|read|access|load|parse|process|view|retrieve|extract|decode|find|see")
+_NP = (r"(?:(?:the|this|these|those|your|any|all|either)\s+)?(?:(?:provided|supplied|given|attached|uploaded|input"
+       r"|source|literature|whole|entire|pdf)\s+)*(?:papers?|pdfs?|documents?|articles?|notes?|files?|text|inputs?"
+       r"|literature|sources?|directory|codebase|repository|request|task)")
+# The whole input, not a part of it: "any of the notes", not "two of the five notes", "the notes
+# directory", "the paper's SI" or "the text of Table 3" — the phrase must end where the noun does.
+_WHOLE = rf"(?:(?:any|all|either|each|none|both)\s+of\s+(?:them|{_NP})|{_NP})"
+_END = r"(?=\s*(?:[^\w\s'-]|$)|\s+(?:so|because|since|as|and|or|you|i|that|directly)\b)"
+_CANNOT = re.compile(rf"(?:i\s+)?(?:(?:{_UNABLE})\s+(?:{_JOB})\b|(?:do|did) not have access\b|(?:have|had) no access\b)")
+_GIVES_UP = re.compile(
+    rf"(?:i\s+)?(?:(?:{_UNABLE})\s+(?:{_JOB})|(?:do|did) not have access to|(?:have|had) no access to)\s+{_WHOLE}{_END}"
+    rf"|i\s+(?:{_UNABLE})\s+(?:help|assist|comply)\b"
+    rf"|(?:i\s+)?(?:{_UNABLE})\s+(?:check|verify|confirm|fact-check)\s+(?:any|a single)\b"
+    rf"|{_WHOLE}\s+(?:could not|cannot|can not)\s+be\s+(?:read|opened|accessed|parsed|processed|loaded|decoded)\b"
+    r"|no (?:files?|notes?|documents?) (?:were|was|could be) found\b")
+_TOLD = re.compile(r"(?<![\w-])INCOMPLETE[`*_]*:")
 
 
 def _norm(text):
-    return text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    """Lower case, straight apostrophes and contractions spelled out, so the grammar has one form of each
+    phrase: a curly apostrophe is what most models emit, and "couldn't" is as common as "could not"."""
+    t = text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    t = re.sub(r"\bcan't\b", "cannot", t)
+    t = re.sub(r"\bwon't\b", "will not", t)
+    t = re.sub(r"n't\b", " not", t)
+    return re.sub(r"\bi'm\b", "i am", t)
 
 
-def _opens_with_apology(low):
-    for _ in range(3):                       # "Unfortunately, I could not…"
-        stripped = _LEAD.sub("", low, count=1)
-        hit = next((m for m in REFUSAL_MARKERS if low.startswith(m) or stripped.startswith(m)), None)
-        if hit:
-            return hit
-        if stripped == low:
+def _inability(clause):
+    """"fail", "warn" or None for one clause (normalised) that opens a statement (rule above)."""
+    rest = _LEAD_IN.sub("", clause, count=1)
+    if _GIVES_UP.match(rest):
+        return "fail"
+    return "warn" if _CANNOT.match(rest) or _SORRY.match(clause) else None
+
+
+_FENCE = re.compile(r"\s*(?:```|~~~)")
+_ITEM = re.compile(r"\s*(?:[-*+]|\d+[.)])\s")
+_YAML_KEY = re.compile(r"[a-z_][\w-]*:(?:\s|$)")
+
+
+def _furniture_only(line):
+    return _FENCE.match(line) or not re.search(r"\w", _FURNITURE.sub("", line, count=1))
+
+
+def _lines(text):
+    """`text` by line as a reader meets it: past any YAML frontmatter, and with each line that is only
+    furniture blanked — a callout's `> [!WARNING]` on a line of its own, a code fence, a rule — so that
+    what follows it is the opening, as it is on the page. Without this, the callout tag alone and the
+    frontmatter's first key were each taken for the opening, and a `PARTIAL:` under them was filed."""
+    lines = text.splitlines()[:80]
+    top = next((i for i, l in enumerate(lines) if l.strip()), 0)
+    if lines and lines[top].strip() == "---" and top + 1 < len(lines) and _YAML_KEY.match(lines[top + 1]):
+        end = next((j for j in range(top + 2, len(lines)) if lines[j].strip() in ("---", "...")), None)
+        if end is not None:
+            lines = lines[end + 1:]
+    return ["" if _furniture_only(l) else l for l in lines]
+
+
+def judge(text, reply=False):
+    """("fail" or "warn", the line it turned on) for the head of a document or for a model's reply, or
+    None (the rule is above). A statement runs to a blank line, a heading or the next list item, so an
+    apology wrapped over two lines is read whole. A reply is all opening, line by line; one that is
+    only a path, which is what an agent that did the job replies, is not prose, whatever its
+    directories are called (…/Failed/notes/0.md)."""
+    if reply:
+        if "\n" not in text.strip() and os.path.isabs(text.strip().strip("`")):
             return None
-        low = stripped
+        for line in text.splitlines():
+            told = _TOLD.search(line)
+            if told and "->" not in line and not _NONE_VALUE.match(line, told.end() - 1):
+                return "fail", line.strip()
+    blocks, block = [], None
+    for line in _lines(text):
+        if not line.strip():
+            block = None
+        elif reply or not block or block[0].lstrip().startswith("#") or line.lstrip().startswith("#") \
+                or _ITEM.match(line):
+            block = [line]
+            blocks.append(block)
+        else:
+            block.append(line)
+    opening, doubt = True, None
+    for block in blocks:
+        first = block[0]
+        heading = first.lstrip().startswith("#")
+        if "->" not in first:              # `claim -> what you found`: a verify finding, graded or not
+            said = _norm(" ".join(_FURNITURE.sub("", l, count=1) for l in block))
+            found = {_status_word(first, item=not heading and bool(_ITEM.match(first)))}
+            found |= {_inability(c) for c in re.split(r"(?<=[.!?:;])\s+", said)}
+            if "fail" in found and (opening or reply):
+                return "fail", first.strip()
+            if found - {None}:
+                doubt = doubt or ("warn", first.strip())
+        opening = opening and heading
+    return doubt
+
+
+def warn(name, line):
+    print(f"  ! {name}: the opening reads like it may not have done the job: \"{line[:160]}\" — check it "
+          f"before relying on it.", file=sys.stderr)
+
+
+# A status word in the opening — BLOCKED, PARTIAL, INCOMPLETE or FAILED — declares the document's
+# state, or is part of a name. In capitals it is a failure; in any other case a doubt (rule above).
+#
+#   It is SET OFF: at the start (after furniture and a `Status:` label), or after an opening bracket,
+#   a dash, a colon, semicolon, comma, slash, an emphasis mark or an emoji: "(BLOCKED)", "— Blocked",
+#   ": INCOMPLETE", "**BLOCKED**", "_INCOMPLETE_", "🚫 BLOCKED".
+#   And it then ENDS, or gives a reason: punctuation ("BLOCKED.", "(PARTIAL, 2 of 5 readable)",
+#   "BLOCKED - see below"), a word that introduces one ("by", "until", "pending"), a count ("PARTIAL
+#   2/5 notes"), or the document's own name ("BLOCKED Development plan") — after any list of other
+#   status words ("(PARTIAL / BLOCKED)").
+#
+# Otherwise it is part of a name: inline in running text ("Arithmetic is INCOMPLETE", "adopt PARTIAL
+# pooling", "complete vs. INCOMPLETE"), in code ("`FAILED`", "`JobState.PARTIAL`"), joined by a hyphen
+# ("INCOMPLETE-DATA", "BLOCKED-Gibbs"), or followed by another word ("PARTIAL LEAST SQUARES", "BLOCKED
+# Gibbs", "Blocked items: none", "FAILED, PARTIAL and COMPLETE responses"). A value that is none
+# ("Blocked: none.", "PARTIAL: 0", "Blocked — N/A") is a clean result, but "none of the notes could be
+# read" is a reason. "Status of the sampler: PARTIAL" is the sampler's status, not the document's.
+# A list item is one entry, a proposal or a finding: there only the word at the item's start counts,
+# and with a reason after it only as a doubt: "- **BLOCKED** until the CUDA build lands: port the
+# scorer" is that proposal's precondition as often as it is the document's state.
+_STATUS_WORD = re.compile(r"(?i)(?<![^\W_])(blocked|partial|incomplete|failed)(?![^\W_])")
+_NOT_SET_OFF = "`'\".)]"          # code, a quotation, `JobState.PARTIAL` or "vs.", a closing bracket
+_REASON = re.compile(r"(?i)(?:by|until|till|pending|because|due|on|as|since|awaiting|for|while|without|after)\b"
+                     r"|\d|(?:development\s+)?(?:plan|digest|note|report|draft)\b")
+_ALSO = re.compile(r"\s*(?:[/&]|vs\.?)\s*[*_]*[A-Za-z][\w-]*[*_]*|\s*(?:,|\band\b|\bor\b)\s*[*_]*[A-Z]{2,}\b[*_]*")
+_NONE_VALUE = re.compile(r"(?i)\s*[:=\u2013\u2014-]?\s*[*_`(\[]*(?:none|nil|nothing|no|n/a|0)[*_`)\]]*(?:\s+items?)?"
+                         r"\s*(?:$|[.;,!?)\]\u2013\u2014]|-\s)")
+_FURNITURE = re.compile(r"^(?:\[![^\]]*\]|\d+[.)](?=\s)|[\W_])*(?:status\s*[:\u2013\u2014-][\W_]*)?", re.I)
+
+
+def _status_word(line, item=False):
+    """"fail", "warn" or None for the status word `line` sets off as the document's state (rule above)."""
+    text = _FURNITURE.sub("", line, count=1)
+    for m in _STATUS_WORD.finditer(text):
+        before = text[:m.start()].rstrip()
+        if item and before:
+            continue                    # on a list item, only the item's own status line counts
+        last = before[-1:]
+        if last and (last.isalnum() or last in _NOT_SET_OFF or last == "-" and not before[-2:-1].isspace()):
+            continue                    # running text, code, a quotation, "vs.", a hyphenated word
+        if re.search(r"(?i)\bstatus\s+of\b", before):
+            continue                    # "Status of the sampler: PARTIAL"
+        after = text[m.end():]
+        if re.match(r"-\w|`", after):
+            continue                    # INCOMPLETE-DATA, BLOCKED-Gibbs; `FAILED` in code
+        after = after.lstrip("*_")
+        also = _ALSO.match(after)
+        while also and also.group(0):
+            after = after[also.end():]
+            also = _ALSO.match(after)
+        if _NONE_VALUE.match(after):
+            continue                    # "Blocked: none." is a clean result, not a failure
+        rest = after.lstrip()
+        if not rest or not rest[0].isalnum() or _REASON.match(rest):
+            return "fail" if m.group(1).isupper() and not (item and rest[:1].isalnum()) else "warn"
     return None
-
-
-def refusal(head):
-    """The apology in the opening of a document, or None.
-
-    Position, not presence. A model that could not do the job *opens a block* with the apology:
-    "Not completed. I could not read any of the notes." A correct document contains the same words
-    inside a sentence: "37 had not completed follow-up", "cannot complete in polynomial time".
-
-    So each block in the opening is tested at its START, after stripping markdown furniture. That
-    catches an apology under a heading or as a list item — the earlier version only looked before
-    the first heading, which let `## Status` + an apology be filed as a plan — without discarding a
-    finding that merely mentions the words.
-    """
-    for block in re.split(r"\n\s*\n", head[:1500])[:6]:
-        stripped = re.sub(r"^(?:[#>\s]*|\s*(?:[-*+]|\d+[.)])\s*)+", "", block).strip()
-        if not stripped:
-            continue
-        low = _norm(stripped)
-        hit = _opens_with_apology(low)
-        if hit:
-            return hit
-        # The apology may follow one short lead-in sentence in the same block.
-        first_sentence = re.split(r"(?<=[.!?])\s", low, 1)[0]
-        if len(first_sentence) < 90:
-            hit = _opens_with_apology(low[len(first_sentence):].lstrip())
-            if hit:
-                return hit
-    return declared_failure(head)
-
-
-# A status marker opening a document or a reply: BLOCKED, as a blocked agent writes it, or PARTIAL: /
-# INCOMPLETE:, as a real digester titled its file ("PARTIAL: literature notes unreadable", filed as a
-# digest, exit 0) and as the agents are told to reply (INCOMPLETE_RULE). Only the OPENING line counts
-# — the first line that is not a heading, and any headings above it. Matched anywhere at a line
-# start, it discarded correct output: a `BLOCKED` status tag on a proposal, a constant in a code
-# block, an "INCOMPLETE-data" theme. The word must stand alone (a colon, a spaced dash, a full stop
-# or the end of the line after it), so "Blocked Gibbs sampling" and "PARTIAL LEAST SQUARES" are
-# titles. The furniture a model puts around it — backticks echoing the prompt, quotes, a list number,
-# an emoji, a callout, "Status:" — is stripped first.
-STATUS_MARKER = re.compile(r"(?i)^(BLOCKED(?=\**\s*(?:$|[:.\u2013\u2014-]))"
-                           r"|(?:PARTIAL|INCOMPLETE)\**(?=\s*[:.]|\s+[\u2013\u2014-]\s|\s*$))")
-# A heading that ENDS in a bracketed marker, as a real planner titled one: "# Development plan (PARTIAL /
-# BLOCKED)". The marker must be followed by a separator, so "(PARTIAL LEAST SQUARES)" is a title.
-# A status word SHOUTED in a title is a declared failure however it is punctuated: "(BLOCKED)",
-# "— BLOCKED", ": BLOCKED", "(PARTIAL / BLOCKED)". The previous pattern demanded a bracket, a
-# separator AND a second bracket, so it caught only the one form that happened to be in a test —
-# the third time narrowing this check let a refusal through.
-# A status marker stands alone: it ends the title or is followed by punctuation. When another word
-# follows it, it is part of a technique's name — PARTIAL LEAST SQUARES, BLOCKED GIBBS SAMPLING,
-# INCOMPLETE-DATA METHODS — and discarding those papers is the false positive this check keeps
-# swinging back into.
-_TITLE_MARKER = re.compile(r"\b(BLOCKED|PARTIAL|INCOMPLETE|FAILED)\b(?!\s*[-\w])")
-# ...unless the title is reporting that there were none: "Blocked: none", "PARTIAL: 0".
-_MARKER_NEGATED = re.compile(r"(?i)\s*[:=]?\s*(none|nil|0)\b")
-_FURNITURE = re.compile(r"^(?:\[![^\]]*\]|\d+[.)](?=\s)|[^\w])*(?:status\s*[:\u2013\u2014-](?:[^\w])*)?", re.I)
 
 # An honest model that could not read its sources says so; it must say so where a program can see
 # it, not in a fluent document that passes every check.
 INCOMPLETE_RULE = ("If you could not read {what}, do not write a document explaining why{also}: reply with "
                    "one line, `INCOMPLETE: <what you could not read>`, and nothing else.")
-
-
-def declared_failure(text):
-    """The status marker a document or reply opens with (BLOCKED, PARTIAL, INCOMPLETE), or None."""
-    for line in text.splitlines()[:40]:
-        if not line.strip():
-            continue
-        heading = line.lstrip().startswith("#")
-        # "claim -> what you found" is the verify report's format: a finding graded PARTIAL is a finding.
-        stripped = _FURNITURE.sub("", line, count=1)
-        m = None if "->" in line else STATUS_MARKER.match(stripped)
-        if m and _MARKER_NEGATED.match(stripped[m.end():]):
-            m = None                          # "Blocked: none" is a clean result, not a failure
-        m2 = _TITLE_MARKER.search(line) if heading else None
-        if m2 and _MARKER_NEGATED.match(line[m2.end():]):
-            m2 = None
-        m = m or m2
-        if m:
-            return m.group(1).rstrip("*").upper()
-        if not heading:
-            return None                       # the opening line was not a marker
-    return None
 
 
 # ---- ownership: which files in the user's directories Lacuna may replace
@@ -518,7 +742,9 @@ def _atomic_copy(src, dst):
     a truncated note that the next run served as a free hit — the same defect already fixed for the
     parse cache, in its sibling path.
     """
-    tmp = f"{dst}.{os.getpid()}.part"
+    # A short temporary name: "<dst>.<pid>.part" was 11 bytes longer than a name that fits, so a
+    # document with a 230-239 byte name failed here, after its reader had been paid (B13).
+    tmp = os.path.join(os.path.dirname(dst), f".{os.getpid()}.{threading.get_ident()}.part")
     try:
         shutil.copyfile(src, tmp)
         os.replace(tmp, dst)
@@ -535,6 +761,65 @@ def name_key(path):
     """One key per file that the filesystem treats as one. macOS folds case (Paper.md is paper.md)
     and Unicode normalisation (café typed and café pasted from a PDF are one name)."""
     return unicodedata.normalize("NFC", os.path.basename(path)).casefold()
+
+
+def name_max(d):
+    """The longest file name directory `d` (or its nearest existing parent) holds, in bytes."""
+    while not os.path.isdir(d) and os.path.dirname(d) != d:
+        d = os.path.dirname(d)
+    try:
+        n = os.pathconf(d, "PC_NAME_MAX")
+    except (OSError, ValueError, AttributeError):
+        n = None
+    return n if n and n > 0 else 255
+
+
+def fitted(stem, suffix, d, spare=0):
+    """stem + suffix, the stem cut short enough for directory `d` (with `spare` bytes over, for a
+    temporary name built on it). Only for names that carry a hash (the caches): cutting the stem
+    cannot make two of them one. A name that already fits is kept, so no cache entry moves."""
+    room = name_max(d) - len(os.fsencode(suffix)) - spare
+    if len(os.fsencode(stem)) > room:
+        stem = os.fsencode(stem)[:max(room, 0)].decode("utf-8", "ignore")
+    return stem + suffix
+
+
+def need_short_names(paths, how):
+    """Exit 2 unless every file name Lacuna will create fits its directory. Checked before any model
+    call: a name the filesystem refused after the call cost the call and wrote nothing (B13, B14)."""
+    long = [p for p in paths if len(os.fsencode(os.path.basename(p))) > name_max(os.path.dirname(p))]
+    if long:
+        print("ERROR: these file names would be longer than their directory allows "
+              f"({name_max(os.path.dirname(long[0]))} bytes):\n" + "\n".join(f"  - {p}" for p in long)
+              + f"\n{how} Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
+
+
+def free_name(path, tag, ext=""):
+    """path+tag+ext, or path+tag-2+ext, -3 …, whichever does not exist yet. What an earlier run set
+    aside for the user to look at is never replaced by a later one. The name of `path` is cut to
+    fit the directory if it must be, never the tag: these names are made after the model call, and
+    one too long to create cost the call."""
+    d, name = os.path.split(path)
+    base = os.path.join(d, fitted(name, "", d, spare=len(os.fsencode(tag + ext)) + 4) + tag)
+    n = 1
+    while os.path.lexists(f"{base}-{n}{ext}" if n > 1 else f"{base}{ext}"):
+        n += 1
+    return f"{base}-{n}{ext}" if n > 1 else f"{base}{ext}"
+
+
+def file_state(path):
+    """What is at `path`: its sha256, "" for something that is not a regular file, None for nothing."""
+    if not os.path.lexists(path):
+        return None
+    return _sha(path) if os.path.isfile(path) else ""
+
+
+def changed_since(path, before):
+    """True when `path` is not what it was when the run started (`before`, from file_state). A plan
+    or report changed during a run is the user's, or someone else's; one deleted meanwhile is not."""
+    now = file_state(path)
+    return now is not None and now != before
 
 
 def _sha(path):
@@ -571,12 +856,44 @@ def _owners(d):
         return {}, f"{OWNERS} could not be read ({type(e).__name__})"
     good = {}
     for k, v in files.items():
-        # A completed entry carries the note's checksum. A reservation, written before the model
-        # runs, cannot: the note does not exist yet. Dropping those silently let two concurrent
-        # runs each believe the path was free.
-        if isinstance(v, dict) and (isinstance(v.get("sha256"), str) or v.get("pending") is True):
-            good[k] = {**v, "source": v["source"] if isinstance(v.get("source"), str) else None}
+        # Only an entry with a checksum describes a file Lacuna wrote. 0.3.1 also kept "pending"
+        # reservations here, released only on success: one left by a refused, failed or killed run
+        # refused every later read of a same-named document, --overwrite included (A4), and made the
+        # note such a run left read as "edited since" (A7). Runs hold paths now (hold()); old
+        # reservations are ignored.
+        if isinstance(v, dict) and isinstance(v.get("sha256"), str):
+            good[k] = {**{x: y for x, y in v.items() if x != "pending"},
+                       "source": v["source"] if isinstance(v.get("source"), str) else None}
     return good, None
+
+
+WHAT = {"read": "a note", "synth": "a plan or digest", "verify": "a verify report"}
+
+
+def _stage(entry):
+    """The stage that wrote a recorded file. A plan and a note are not interchangeable: a paper
+    named plan.md once replaced the plan recorded beside it (B15). Records written before the stage
+    was recorded do not say; a synth output was the only file recorded without a source, and a
+    verify report is named after the document it checked."""
+    if entry.get("stage") in WHAT:
+        return entry["stage"]
+    if not entry.get("source"):
+        return "synth"
+    return "verify" if entry.get("name") == os.path.basename(entry["source"]) + ".unverified.md" else "read"
+
+
+def _owners_to_update(d):
+    """The record, for a writer that holds the lock. A damaged one is set aside, never silently
+    replaced: it was the only evidence of which files here are Lacuna's, and rewriting it with this
+    run's entries alone left every later refusal unable to say why (B28)."""
+    files, damaged = _owners(d)
+    if damaged:
+        kept = free_name(os.path.join(d, OWNERS), f".damaged-{time.strftime('%Y%m%d-%H%M%S')}")
+        os.replace(os.path.join(d, OWNERS), kept)
+        print(f"  ! {damaged}; it was kept as {kept} and a new record started. Files it listed are no "
+              f"longer known to be Lacuna's, so a later run asks (--overwrite) before replacing them.",
+              file=sys.stderr)
+    return files
 
 
 class _locked:
@@ -602,6 +919,23 @@ class _locked:
         _owners_lock.release()
 
 
+def need_bookkeeping(*dirs):
+    """Exit 2 unless the ledger can be appended to and each cache directory in `dirs` made and written.
+    Both are written after the paid call: a paths.ledger naming a directory paid, then crashed (J5)."""
+    try:
+        os.makedirs(os.path.dirname(LEDGER) or ".", exist_ok=True)
+        open(LEDGER, "a").close()
+        for d in dirs:
+            os.makedirs(d, exist_ok=True)
+        why = next((f"{d}: not writable" for d in dirs if not os.access(d, os.W_OK)), None)
+    except OSError as e:
+        why = f"{e.filename or LEDGER}: {e.strerror or e}"
+    if why:
+        print(f"ERROR: Lacuna cannot write its own records ({why}). Check paths.ledger and paths.cache in "
+              f"`lacuna config`. Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
+
+
 def need_writable(d, what):
     if not os.access(d, os.W_OK):
         print(f"ERROR: {what} {d} is not writable. Nothing was sent to a model.", file=sys.stderr)
@@ -617,47 +951,119 @@ def _save_owners(d, files):
     os.replace(tmp, os.path.join(d, OWNERS))
 
 
-def reserve(path, source):
-    """Claim `path` for `source` before any model call, atomically across processes.
+_held = {}             # lock file -> fd, for every path this process holds
 
-    Returns the source that already holds it, or None on success. The collision guard and the
-    ownership check both ran before any lock, so two concurrent `read`s of same-named documents
-    into one --out each cached whatever was at the note path when its own agent returned: one
-    note silently replaced the other, and one paper's cache key could end up holding the other
-    paper's note, served free from then on.
-    """
-    d = os.path.dirname(path)
-    try:
-        with _locked(d):
-            files = _owners(d)[0]
-            held = files.get(name_key(path))
-            if held and held.get("source") and os.path.realpath(held["source"]) != os.path.realpath(source):
-                if held.get("pending"):
-                    return held["source"]          # another process is reading it right now
-            entry = dict(held) if held and held.get("source") and \
-                os.path.realpath(held["source"]) == os.path.realpath(source) else \
-                {"name": os.path.basename(path), "source": source,
-                 "written": time.strftime("%Y-%m-%d %H:%M")}
-            entry["pending"] = True          # keep sha256 etc. so a re-read of the same document
-            files[name_key(path)] = entry    # is not locked out of its own note
-            _save_owners(d, files)
-    except OSError:
-        return None          # cannot reserve: fall through to the existing per-run guard
+
+def hold(path, doing):
+    """Hold `path` until this process exits. Returns None, or what the run that holds it is doing.
+
+    One process writes a given note, plan or report at a time, from its ownership check to its final
+    write. 0.3.1 reserved a path with a "pending" entry in the record, released only on success: a
+    refused reader, Ctrl-C, a missing parser or a kill left it there, and every later read of a
+    same-named document was refused for good, --overwrite included (A4). A re-read dropped its own
+    reservation before its model call (A5), and the same document under two cache keys was let
+    through (A6): two agents wrote one path, and one paper's note was cached under another's key.
+    Two synths into one --out deleted each other's .partial (A11).
+
+    A hold is an flock on a lock file beside the record. The kernel ends it when the process ends,
+    however it ends (SIGKILL, a reused pid), so a hold can never go stale. The file says who holds
+    it, for the message. Without fcntl a path is not held; nor where it cannot be locked, and then the
+    run says so (_not_held)."""
+    if fcntl is None:
+        return None
+    lock = os.path.join(os.path.dirname(path),
+                        f".lacuna-{hashlib.sha256(name_key(path).encode()).hexdigest()[:16]}.lock")
+    if lock in _held:
+        return None
+    for _ in range(5):
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            return _not_held(path)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                info = json.loads(os.read(fd, 4096) or b"{}")
+            except (OSError, ValueError):
+                info = {}
+            os.close(fd)
+            return {**(info if isinstance(info, dict) else {}), "lock": lock}
+        except OSError:
+            os.close(fd)
+            try:
+                os.unlink(lock)          # nothing holds it, so nothing is left behind
+            except OSError:
+                pass
+            return _not_held(path)
+        try:      # released and unlinked between our open and our lock: hold the file now at the path
+            ours = os.path.samestat(os.fstat(fd), os.stat(lock))
+        except OSError:
+            ours = False
+        if ours:
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps({"pid": os.getpid(), "host": socket.gethostname(),
+                                     "since": time.strftime("%Y-%m-%d %H:%M"), "doing": doing}).encode())
+            _held[lock] = fd
+            return None
+        os.close(fd)
     return None
 
 
-def record(path, source=None):
-    """Record that Lacuna wrote `path`, as it is now, from the document `source`.
+_unlockable = set()    # directories already reported
+
+
+def _not_held(path):
+    """No hold on `path`: its filesystem cannot lock (EOPNOTSUPP on some network and FUSE mounts), or no
+    lock file can be made there. The run goes on, and says so once per directory: in silence, two runs
+    into one --out both paid, and one moved the other's plan aside (J4)."""
+    d = os.path.dirname(path)
+    if d not in _unlockable:
+        _unlockable.add(d)
+        print(f"  ! cannot lock {d}; concurrent runs into it are not protected", file=sys.stderr)
+    return None
+
+
+def need_hold(path, doing):
+    """Hold `path`, or exit 2 before any model call naming the run that holds it."""
+    info = hold(path, doing)
+    if info is None:
+        return
+    who = " ".join(str(x) for x in (f"pid {info.get('pid')}" if info.get("pid") else "",
+                                    f"on {info.get('host')}" if info.get("host") else "",
+                                    f"since {info.get('since')}" if info.get("since") else "") if x)
+    print(f"ERROR: another Lacuna run{f' ({who})' if who else ''} is {info.get('doing') or 'writing'} {path} "
+          f"right now. Wait for it to finish, or write somewhere else. Nothing was sent to a model. A run "
+          f"holds a path only while it runs, however it ends; if that run is gone and this persists, "
+          f"delete {info['lock']}.", file=sys.stderr)
+    sys.exit(EX_INPUT)
+
+
+def release_all():
+    """End every hold this process has. Unlinked before it is unlocked; hold() checks it still has
+    the file at the path, so a run that opened it meanwhile does not hold a file nobody can see."""
+    for lock, fd in list(_held.items()):
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+        os.close(fd)
+        del _held[lock]
+
+
+def record(path, source=None, stage="read"):
+    """Record that Lacuna's `stage` wrote `path`, as it is now, from the document `source`.
 
     The stage has already succeeded and been paid for, so this never raises: a record that cannot
     be written costs a question (--overwrite) on the next run, not this run's output."""
     d = os.path.dirname(path)
     try:
-        entry = {"name": os.path.basename(path), "sha256": _sha(path), "written": time.strftime("%Y-%m-%d %H:%M")}
+        entry = {"name": os.path.basename(path), "sha256": _sha(path), "stage": stage,
+                 "written": time.strftime("%Y-%m-%d %H:%M")}
         if source:
             entry.update(source=source, source_sha256=_sha(source))
         with _locked(d):
-            files = _owners(d)[0]
+            files = _owners_to_update(d)
             files[name_key(path)] = entry
             _save_owners(d, files)
     except OSError as e:
@@ -665,67 +1071,95 @@ def record(path, source=None):
               file=sys.stderr)
 
 
-def forget(path):
-    d = os.path.dirname(path)
+def rerecord(d, before):
+    """After an after.* hook: the hook is part of the user's pipeline, so what it does to this run's
+    outputs (`before`, {key: sha256} as they were when it started) is still Lacuna's. A hook that
+    prepended frontmatter, as docs/extending.md suggests, otherwise made every later run refuse the
+    note as edited. Only this run's outputs, and only those still as recorded: any other file that
+    changed while the hook ran — an earlier run's note, edited by the user meanwhile — became
+    Lacuna's, and the next read replaced the user's edit (F1). A hook that changes other files makes
+    them the user's, so the next run asks. A hook that moved a file away takes it out of the record."""
+    if not before:
+        return
     try:
         with _locked(d):
-            files = _owners(d)[0]
-            if files.pop(name_key(path), None) is not None:
+            files, changed = _owners_to_update(d), False
+            for k, sha in before.items():
+                e = files.get(k)
+                if not e or e.get("sha256") != sha:
+                    continue                  # edited since it was written, or re-recorded by another run
+                p = os.path.join(d, e["name"])
+                if os.path.islink(p) or not os.path.isfile(p):
+                    del files[k]
+                    changed = True
+                elif _sha(p) != sha:
+                    files[k] = {**e, "sha256": _sha(p)}
+                    changed = True
+            if changed:
                 _save_owners(d, files)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"  ! could not re-record what the hook changed in {d} ({e}); the next run may ask before "
+              f"replacing those files", file=sys.stderr)
 
 
-def rerecord(path, source=None):
-    """After an after.* hook: the hook is part of the user's pipeline, so what it leaves is still
-    Lacuna's output. A hook that prepended frontmatter, as docs/extending.md suggests, otherwise made
-    every later run refuse the note as edited. A hook that moved the file away takes it out of the
-    record."""
-    if os.path.isfile(path):
-        record(path, source)
-    else:
-        forget(path)
+def not_ours(path, source=None, stage="read"):
+    """None when Lacuna's `stage` may replace `path`; otherwise (kind, why), `why` a sentence for the user.
 
-
-def not_ours(path, source=None, namespaced=False):
-    """None when Lacuna may replace `path`; otherwise (kind, why), `why` a sentence for the user.
-
-    `source` is the document the new file is written from. When given, a file Lacuna wrote from a
-    *different* document is not ours to replace either. A document is the same one when it is at
-    the same path (and may have changed) or has the same bytes (and may have moved).
-    `namespaced` is for names only Lacuna makes (plan.md.unverified.md): an unrecorded file there
-    was written by an earlier Lacuna, so only an edit since it was recorded makes it the user's."""
+    Only the stage that wrote a file replaces it: a note is never written over a plan or a report,
+    nor a plan over a note. `source` is the document a note is written from; a note Lacuna wrote
+    from a *different* document is not ours to replace either. A document is the same one when it
+    has the same bytes, wherever it is now. Same path, different bytes is not enough: a new
+    download saved as fulltext.pdf over the last one is another paper, and its note silently
+    replaced the first paper's (B1); a revised copy of the same paper asks too.
+    A file with no record is not ours either, whatever its name: a report annotated by hand was
+    replaced once its record was deleted (B12)."""
     if not os.path.lexists(path):
         return None
     if os.path.islink(path) or not os.path.isfile(path):
         return "other", f"{path} is a {'symbolic link' if os.path.islink(path) else 'directory'}, not a file Lacuna wrote."
-    files, damaged = _owners(os.path.dirname(path))
+    d = os.path.dirname(path)
+    files, damaged = _owners(d)
     entry = files.get(name_key(path))
     if not isinstance(entry, dict):
-        if namespaced:
-            return None
+        try:
+            kept = sorted(f for f in os.listdir(d) if f.startswith(f"{OWNERS}.damaged-"))
+        except OSError:
+            kept = []
         return UNRECORDED, (f"{path} has no record in {OWNERS} of being written by Lacuna"
-                            + (f" ({damaged})" if damaged else "") + ". It may be your own file, one "
-                            f"written before Lacuna kept that record (0.2.0 and earlier), or one left by an "
-                            f"interrupted run.")
+                            + (f" ({damaged})" if damaged else
+                               f" (an earlier record here was damaged, and was kept as {kept[-1]})" if kept else "")
+                            + ". It may be your own file, one written before Lacuna kept that record (0.2.0 and "
+                            "earlier), or one left by an interrupted run.")
+    theirs = _stage(entry)
+    if theirs != stage:
+        return "other", f"{path} is {WHAT[theirs]} written by `lacuna lit {theirs}`, not {WHAT[stage]}."
     if entry.get("sha256") != _sha(path):
         return "edited", (f"{path} was written by Lacuna on {entry.get('written', 'an earlier run')}, and has "
                           f"been edited since.")
-    theirs = entry.get("source")
-    if source and theirs and not (os.path.realpath(source) == os.path.realpath(theirs)
-                                  or (os.path.isfile(source) and _sha(source) == entry.get("source_sha256"))):
-        return "other", (f"{path} is the note for {theirs}; {source} is a different file with the same name "
+    was = entry.get("source")
+    if source and was and os.path.isfile(source):
+        here = os.path.realpath(source) == os.path.realpath(was)
+        recorded = entry.get("source_sha256")
+        if (_sha(source) == recorded) if isinstance(recorded, str) else here:
+            return None
+        if here:
+            return "other", (f"{path} is the note for {was}, which has changed since that note was written: it "
+                             f"may now be another document saved under the same name, and reading it would "
+                             f"replace that note.")
+        return "other", (f"{path} is the note for {was}; {source} is a different file with the same name "
                          f"(another document, or a changed copy of that one elsewhere), and reading it would "
                          f"replace that note.")
     return None
 
 
-def usable_output(path, min_bytes, what, must_contain=()):
-    """True when a stage produced real output, not a short file or an explanation of failure.
+def usable_output(path, min_bytes, what, must_contain=(), then="treating it as a failed run, not output",
+                  reply="", name=None):
+    """True when a stage produced real output, not a short file or a declaration of failure.
 
     Size alone is not evidence: a model that cannot do the job writes a fluent paragraph saying so.
     Structure is the strongest evidence: a note that lacks the template's headings is not a note,
-    whatever it says. After that, see refusal().
+    whatever it says. After that, judge() reads its opening and the model's `reply`: a failure in
+    either is no output; a doubt is output, kept, with one warning naming `name` (what the user sees).
     """
     if not os.path.exists(path) or os.path.getsize(path) < min_bytes:
         return False
@@ -733,13 +1167,15 @@ def usable_output(path, min_bytes, what, must_contain=()):
         head = f.read(1200)
     missing = next((m for m in must_contain if m not in head), None)
     if missing:
-        print(f"  ! the {what} has no {missing!r} section — treating it as a failed run, not output", file=sys.stderr)
+        print(f"  ! the {what} has no {missing!r} section — {then}", file=sys.stderr)
         return False
-    hit = refusal(head)
+    found = [v for v in (judge(head), judge(reply, reply=True) if reply else None) if v]
+    hit = next((v for v in found if v[0] == "fail"), found[0] if found else None)
+    if hit and hit[0] == "fail":
+        print(f"  ! the {what} says it could not do the job: {hit[1][:160]!r} — {then}", file=sys.stderr)
+        return False
     if hit:
-        print(f"  ! the {what} opens with {hit!r} — treating it as a failed run, not output",
-              file=sys.stderr)
-        return False
+        warn(name or path, hit[1])
     return True
 
 
@@ -767,6 +1203,10 @@ def cmd_synth(a):
         need_file(a.digest, "--digest")
     if a.status:
         need_file(a.status, "--status")    # silently ignored, a dead end would be proposed again
+        refuse_inputs([f"--status {a.status} {why}" for why in [not_content(a.status)] if why])
+    repo_files = repo_tree(a.repo)
+    if not repo_files.strip():
+        refuse_inputs([f"--repo {a.repo} has no files (or none Lacuna can list), so there is no codebase to read"])
     # The agent runs with cwd set to the output directory, so relative inputs would resolve
     # against the wrong place and it would silently read nothing.
     if os.path.isdir(a.out):
@@ -775,9 +1215,15 @@ def cmd_synth(a):
         sys.exit(EX_INPUT)
     a.repo = os.path.abspath(a.repo)
     a.out = os.path.abspath(a.out)
+    need_short_names([a.out, f"{a.out}.filelist.txt"], "Choose a shorter --out.")
+    out_dir = os.path.dirname(a.out)
+    os.makedirs(out_dir, exist_ok=True)
+    need_writable(out_dir, "the directory of --out")
+    need_hold(a.out, "writing a plan or digest to")     # its .filelist.txt with it
+    need_bookkeeping()
     # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
     # plan was once replaced without a word: the ownership rule covered read's notes only.
-    why = not_ours(a.out)
+    why = not_ours(a.out, stage="synth")
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it "
               f"or choose another --out; to replace it anyway, run the same command with --overwrite.",
@@ -794,8 +1240,19 @@ def cmd_synth(a):
         if not os.path.isdir(a.notes):
             print(f"ERROR: notes directory {a.notes!r} does not exist. Run `read` first.", file=sys.stderr)
             sys.exit(EX_INPUT)
-        notes = sorted(f"{a.notes}/{f}" for f in os.listdir(a.notes)
-                       if f.endswith(".md") and os.path.getsize(f"{a.notes}/{f}") > 400)
+        try:
+            names = sorted(f for f in os.listdir(a.notes) if f.endswith(".md"))
+        except OSError as e:
+            refuse_inputs([f"notes directory {a.notes} cannot be listed ({e.strerror})"])
+        bad = []
+        for f in names:
+            p = f"{a.notes}/{f}"
+            try:
+                if os.path.getsize(p) > 400:       # a stub is no note; skipped, as before
+                    notes.append(p)
+            except OSError as e:                   # a dangling link, a note in an unreadable place
+                bad.append(f"{p} cannot be read ({'a symbolic link to nothing' if os.path.islink(p) else e.strerror})")
+        refuse_inputs(bad)
     if not notes and not a.digest:
         print(f"ERROR: no usable notes in {a.notes!r} and no --digest. Run `read` first.", file=sys.stderr)
         sys.exit(EX_INPUT)
@@ -803,31 +1260,28 @@ def cmd_synth(a):
     # the call, by the same test its output will face: a plan from it is paid for and empty.
     # One that cannot be read is refused too: the agent could not read it either, and a real
     # digester given unreadable notes was paid to file "PARTIAL: literature notes unreadable".
+    # A digest shorter than a note is no digest ("hi"); a note that is binary is no note.
+    checks = [(a.digest, not_content(a.digest, 400))] if a.digest else []
+    refuse_inputs([f"{f} {why}" for f, why in checks + [(n, not_content(n)) for n in notes] if why])
     empty = []
     for f in ([a.digest] if a.digest else []) + notes:
         try:
             with open(f, errors="ignore") as fh:
-                hit = refusal(fh.read(1200))
+                hit = judge(fh.read(1200))
         except OSError as e:
             empty.append(f"{f} cannot be read ({e.strerror})")
             continue
-        if hit:
-            empty.append(f"{f} opens with {hit!r}: it says it holds no literature")
+        if hit and hit[0] == "fail":
+            empty.append(f"{f} says it holds no literature: {hit[1][:160]!r}")
+        elif hit:
+            warn(f, hit[1])
     if empty:
         print("ERROR: these inputs cannot be used as literature:\n" + "\n".join(f"  - {e}" for e in empty)
               + "\nFix their permissions, remove them, or run the stage that wrote them again. Nothing was "
                 "sent to a model.",
               file=sys.stderr)
         sys.exit(EX_INPUT)
-    out_dir = os.path.dirname(os.path.abspath(a.out)) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    need_writable(out_dir, "the directory of --out")
-    try:
-        tree = subprocess.run(["git", "-C", a.repo, "ls-files"], capture_output=True, text=True).stdout
-    except OSError:                            # no git on this machine
-        tree = ""
-    if not tree.strip():
-        tree = "\n".join(walk_files(a.repo))   # not a git repo: list it ourselves
+    tree = repo_files
     status = find_status(a.repo, a.status)
     tree_path = f"{a.out}.filelist.txt"
     if os.path.islink(tree_path):
@@ -835,10 +1289,10 @@ def cmd_synth(a):
     open(tree_path, "w").write(tree)
     # The agent writes beside --out, never over it. Judged at --out, an earlier run's plan passed for
     # this run's when the model refused; and an apology written there was taken as input by the next
-    # command. --out is replaced only by output that passed the content check.
-    part = f"{a.out}.partial"
-    if os.path.exists(part):
-        os.remove(part)      # left by an interrupted run; never this run's output
+    # command. --out is replaced only by output that passed the content check. The name is this run's
+    # own: a shared <out>.partial was deleted by a concurrent run (J4), and written by a killed run's
+    # model after a retry had started (F2), so another run's output passed for this one's.
+    part = os.path.join(out_dir, f".lacuna-{os.getpid()}-{os.urandom(4).hex()}.partial")
     role = "digester" if a.kind == "digest" else "planner"
     model = a.model or lacuna_config.model(role)
 
@@ -873,15 +1327,11 @@ def cmd_synth(a):
                                also=f" and do not write {part}")])
     dirs = [a.repo, out_dir] + ([a.notes] if a.notes else []) + \
            ([os.path.dirname(os.path.abspath(a.digest))] if a.digest else [])
-    before = _sha(a.out) if os.path.isfile(a.out) else None
+    before = file_state(a.out)
     res = claude("synth", model, prompt, dirs, effort=lacuna_config.effort(role), cwd=out_dir)
-    ok = usable_output(part, 800, a.kind)
     # A model that could not read its sources may say so in its reply and still leave a document
     # behind; a real digester filed "PARTIAL: literature notes unreadable", exit 0. Its own word wins.
-    said = declared_failure(str(res.get("result") or ""))
-    if ok and said:
-        print(f"  ! the model reported {said!r} — treating it as a failed run, not output", file=sys.stderr)
-        ok = False
+    ok = usable_output(part, 800, a.kind, reply=str(res.get("result") or ""), name=a.out)
     ledger({"stage": "synth", "kind": a.kind, "model": model, "effort": lacuna_config.effort(role),
             "notes": len(notes),
             "from_digest": bool(a.digest), "cost": usd(res), "wall_s": res["wall_s"], "wrote": ok,
@@ -891,43 +1341,64 @@ def cmd_synth(a):
         for f in (part, tree_path):
             if os.path.exists(f):
                 os.remove(f)
-        if os.path.isfile(a.out) and _sha(a.out) != before:
-            # --out changed during the run: the model wrote it rather than the .partial it was
-            # given, or someone edited it meanwhile. Either way it is not an earlier run's plan,
-            # and the next command must not read it as one; moved aside, never deleted.
-            os.replace(a.out, f"{a.out}.rejected")
-            forget(a.out)
-            kept = (f"{a.out} changed during this run (the model wrote it directly, or it was edited), so it "
-                    f"is not a checked plan. It was moved to {a.out}.rejected for you to inspect.")
+        if changed_since(a.out, before):
+            # --out changed during the run: the model wrote it rather than the file it was given, or
+            # someone edited it meanwhile. This run did not write it, so it stays where it is: a
+            # concurrent run's plan was moved aside by this path once (J4).
+            kept = (f"{a.out} changed during this run (the model may have written it, or it was edited), so it "
+                    f"is not a checked plan; it was left as it is.")
         else:
             kept = (f"{a.out} was left as it was, and holds an earlier run's output, not this one's."
                     if os.path.exists(a.out) else "Nothing was written.")
         print(f"ERROR: {model} wrote no usable output. {kept}\n{str(res.get('result'))[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
+    if changed_since(a.out, before):
+        # Edited while the model ran (or written by something else): checked before the call, it
+        # was replaced on success all the same, and the edit was lost (B11). Keep both.
+        new = free_name(a.out, ".new", ".md")
+        os.replace(part, new)
+        record(new, stage="synth")
+        print(f"ERROR: {a.out} changed while this run was in progress, so it was left as it is. This run's "
+              f"{a.kind} is in {new}: compare the two, and move it over {a.out} to use it.", file=sys.stderr)
+        sys.exit(EX_INPUT)
     if os.path.islink(a.out):
         os.remove(a.out)     # only with --overwrite; replacing the link, not writing through it
     os.replace(part, a.out)
-    record(a.out)
-    after("synth", a.out)
-    rerecord(a.out)
+    record(a.out, stage="synth")
+    after("synth", a.out, [a.out])
 
 
 def cmd_verify(a):
     """Cheap grep-based fact check. The verifier reports in its final message; we save that."""
-    need_file(a.target, "--target")
     need_dir(a.repo, "--repo")
     if a.notes:
         need_dir(a.notes, "--notes")
+        try:
+            os.listdir(a.notes)
+        except OSError as e:
+            refuse_inputs([f"--notes {a.notes} cannot be listed ({e.strerror})"])
+    # Missing, a directory, unreadable, empty or binary: --target is refused here, before any model call.
+    refuse_inputs([f"--target {a.target} {why}" for why in [not_content(a.target)] if why])
+    if not repo_tree(a.repo).strip():
+        refuse_inputs([f"--repo {a.repo} has no files (or none Lacuna can list), so there is no codebase to check against"])
     # The prompt is all the verifier knows: a relative path there checked nothing and exited 0.
     a.target, a.repo = os.path.abspath(a.target), os.path.abspath(a.repo)
     if a.notes:
         a.notes = os.path.abspath(a.notes)
     out = f"{a.target}.unverified.md"
-    why = not_ours(out, namespaced=True)       # a report annotated by hand is the user's
+    need_short_names([out], "Rename --target, or copy it under a shorter name.")
+    need_hold(out, "writing a verify report to")
+    need_bookkeeping()
+    if os.path.isdir(out) and not os.path.islink(out):      # read and synth refuse one too
+        print(f"ERROR: {out} is a directory, so the report has nowhere to go. Nothing was sent to a model.",
+              file=sys.stderr)
+        sys.exit(EX_INPUT)
+    why = not_ours(out, stage="verify")       # a report annotated by hand is the user's
     if why and not a.overwrite:
         print(f"ERROR: {why[1]} This run would replace it. Nothing was sent to a model. To keep it, move it; "
               f"to replace it anyway, run the same command with --overwrite.", file=sys.stderr)
         sys.exit(EX_INPUT)
+    status = find_status(a.repo)       # absolute: the agent runs in another directory
     with open(a.target, "rb") as f:
         checked = f"sha256 {hashlib.sha256(f.read()).hexdigest()[:12]}"
     prompt = "\n\n".join([
@@ -935,7 +1406,7 @@ def cmd_verify(a):
         f"Codebase: {a.repo}" + (f"\nSource notes: {a.notes}" if a.notes else ""),
         "For every claim of these three kinds, verify it mechanically and report ONLY failures:",
         "1. A named file, directory, class or function: grep the codebase. Report any that does not exist.",
-        "2. A quoted number: grep the notes and research/STATUS.md for it. Report any you cannot find at its "
+        "2. A quoted number: grep the notes" + (f" and {status}" if status else "") + " for it. Report any you cannot find at its "
         "claimed source, and give the value you did find.",
         "3. An attribution to a paper: check it against the note for that paper. Report mismatches.",
         "Reply with a markdown list: one line per failure, as `claim -> what you found`. "
@@ -944,6 +1415,7 @@ def cmd_verify(a):
         INCOMPLETE_RULE.format(what="the document or the codebase", also="")])
     dirs = [a.repo, os.path.dirname(os.path.abspath(a.target))] + ([a.notes] if a.notes else [])
     vmodel = a.model or lacuna_config.model("verifier")
+    before = file_state(out)
     res = claude("verifier", vmodel, prompt, dirs, effort=lacuna_config.effort("verifier"))
     ledger({"stage": "verify", "model": vmodel, "effort": lacuna_config.effort("verifier"),
             "target": os.path.basename(a.target), "cost": usd(res),
@@ -951,38 +1423,47 @@ def cmd_verify(a):
     report = str(res.get("result") or "")
 
     def failed(why):
-        # An earlier report may stay only while the document is still the version it checked.
+        # An earlier report is never removed, even one that describes another version of the document:
+        # this run did not write it, and it may be the user's annotated copy (F4).
         stale = os.path.exists(out) and checked not in open(out, errors="ignore").read(400)
-        if stale:
-            os.remove(out)
         print(f"ERROR: the verifier ({vmodel}) {why}. Nothing was written, and "
               f"{os.path.basename(a.target)} has NOT been fact-checked."
-              + (" The earlier report described another version of it and was removed." if stale else "")
+              + (f" {out} describes another version of it." if stale else "")
               + f"\n{report[:400]}", file=sys.stderr)
         sys.exit(EX_MODEL)
 
     if res.get("is_error") or not report.strip():
         failed("returned no usable report")
-    hit = refusal(report)     # a reply that checked nothing arrives with is_error: false
-    if hit:
-        failed(f"replied with {hit!r} rather than a report")
+    hit = judge(report, reply=True)     # a reply that checked nothing arrives with is_error: false
+    if hit and hit[0] == "fail":
+        failed(f"replied {hit[1][:160]!r} rather than a report")
+    # A report edited while the verifier ran is never replaced; this run's goes beside it (B11).
+    clash = changed_since(out, before)
+    dst = free_name(out, ".new", ".md") if clash else out
     try:
-        if os.path.islink(out):
-            os.remove(out)     # only with --overwrite; never write through a link
-        open(out, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n"
+        if os.path.islink(dst):
+            os.remove(dst)     # only with --overwrite; never write through a link
+        open(dst, "w").write(f"# Unverified claims in {os.path.basename(a.target)}\n\n"
                              f"_Checked the version with {checked}._\n\n{report}\n")
-        record(out, a.target)
-        where = out
+        record(dst, a.target, stage="verify")
+        where = dst
     except OSError:
         where = "(not saved; printed below)"
     print(f"verify: ${usd(res):.4f}, {res['wall_s']}s -> {where}\n")
     print(report[:3000])
+    if hit:
+        warn(dst, hit[1])
+    if clash:
+        print(f"ERROR: {out} changed while this run was in progress, so it was left as it is. This run's "
+              + (f"report is in {dst}: compare the two, and move it over {out} to use it." if where == dst
+                 else "report is printed above."), file=sys.stderr)
+        sys.exit(EX_INPUT)
     if where != "(not saved; printed below)":
-        after("verify", out)
-        rerecord(out, a.target)
+        after("verify", out, [out])
 
 
 def main():
+    lacuna_config.warn_config_errors()   # a config.json that was not used as written, before any money is spent
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("read")
@@ -1015,9 +1496,13 @@ def main():
     v.add_argument("--repo", required=True)
     v.add_argument("--notes")
     v.add_argument("--model", help="override the verifier model for this run")
-    v.add_argument("--overwrite", action="store_true", help="replace the report even if it has been edited")
+    v.add_argument("--overwrite", action="store_true",
+                   help="replace the report even if Lacuna cannot show it wrote it (edited, or not recorded)")
     a = ap.parse_args()
-    {"read": cmd_read, "synth": cmd_synth, "verify": cmd_verify}[a.cmd](a)
+    try:
+        {"read": cmd_read, "synth": cmd_synth, "verify": cmd_verify}[a.cmd](a)
+    finally:
+        release_all()
 
 
 if __name__ == "__main__":
