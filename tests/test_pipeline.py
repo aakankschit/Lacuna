@@ -711,6 +711,30 @@ class TestMoneyGuarantees(Pipeline):
                 self.assertEqual(r.returncode, 2, f"{label}: {r.stdout}{r.stderr}")
                 self.assertNotIn("Traceback", r.stderr, f"{label}: bad input must be a message, not a crash")
                 self.assertEqual(self.calls(), [], f"{label} reached a model, which costs real money")
+        # Lacuna's own files are written after the paid call: one it cannot write stops the run first (J5).
+        ledger_dir, cache_file = self.p("ledger-is-a-dir"), write(self.p("cache-is-a-file"), "x")
+        os.makedirs(ledger_dir)
+        sealed_cache = self.p("sealed-cache")
+        for d in (os.path.join(sealed_cache, sub) for sub in ("notes", "md", "drafts")):
+            os.makedirs(d)
+            os.chmod(d, 0o555)
+            self.addCleanup(os.chmod, d, 0o755)
+        for label, argv, env in [
+            ("a ledger that is a directory: read", ("lit", "read", self.alpha, "--out", self.notes),
+             {"LACUNA_LEDGER": ledger_dir}),
+            ("a ledger that is a directory: synth", ("lit", "synth", "--notes", self.notes, "--repo", self.repo,
+                                                     "--out", plan), {"LACUNA_LEDGER": ledger_dir}),
+            ("a ledger that is a directory: verify", ("lit", "verify", "--target", self.alpha, "--repo", self.repo),
+             {"LACUNA_LEDGER": ledger_dir}),
+            ("a cache that is a file", ("lit", "read", self.alpha, "--out", self.notes), {"LACUNA_CACHE": cache_file}),
+            ("a cache it cannot write", ("lit", "read", self.alpha, "--out", self.notes), {"LACUNA_CACHE": sealed_cache}),
+        ]:
+            if "cannot write" in label and os.geteuid() == 0:
+                continue                      # root ignores file modes
+            with self.subTest(label):
+                r = self.lacuna(*argv, **env)
+                self.assertEqual((r.returncode, self.calls()), (2, []), f"{label}: {r.stdout}{r.stderr}")
+                self.assertIn("cannot write its own records", r.stderr)
         self.assertEqual(read(vault_note), "# My own alpha notes\n", "a user's file in --out was overwritten")
         self.assertEqual(read(hand_plan), "# My plan, written by hand\n", "a hand-written plan was overwritten")
         self.assertFalse(os.path.lexists(self.p("elsewhere.md")), "a note was written through a symlink")

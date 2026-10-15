@@ -341,7 +341,7 @@ def cmd_read(a):
         sys.exit(EX_INPUT)
     os.makedirs(out_dir, exist_ok=True)
     need_writable(out_dir, "--out")
-    os.makedirs(f"{CACHE}/notes", exist_ok=True)
+    need_bookkeeping(f"{CACHE}/notes", f"{CACHE}/md", os.path.join(CACHE, "drafts"))
     need_short_names([f"{out_dir}/{os.path.splitext(os.path.basename(p))[0]}.md" for p in a.papers],
                      "Rename the document, or copy it under a shorter name.")
     # Each document's note is <out>/<its name>.md. Settle every name before anything is parsed or
@@ -387,7 +387,6 @@ def cmd_read(a):
     indexes = "".join(open(t, "rb").read().decode(errors="ignore") for t in idx)
     books_fp = hashlib.sha256((books + indexes).encode()).hexdigest()[:8]
     reader_effort = lacuna_config.effort("reader")
-    os.makedirs(os.path.join(CACHE, "drafts"), exist_ok=True)
     drafts = tempfile.mkdtemp(prefix="read-", dir=os.path.join(CACHE, "drafts"))
     jobs = []
     for src, stem, note in papers:
@@ -910,6 +909,23 @@ class _locked:
         _owners_lock.release()
 
 
+def need_bookkeeping(*dirs):
+    """Exit 2 unless the ledger can be appended to and each cache directory in `dirs` made and written.
+    Both are written after the paid call: a paths.ledger naming a directory paid, then crashed (J5)."""
+    try:
+        os.makedirs(os.path.dirname(LEDGER) or ".", exist_ok=True)
+        open(LEDGER, "a").close()
+        for d in dirs:
+            os.makedirs(d, exist_ok=True)
+        why = next((f"{d}: not writable" for d in dirs if not os.access(d, os.W_OK)), None)
+    except OSError as e:
+        why = f"{e.filename or LEDGER}: {e.strerror or e}"
+    if why:
+        print(f"ERROR: Lacuna cannot write its own records ({why}). Check paths.ledger and paths.cache in "
+              f"`lacuna config`. Nothing was sent to a model.", file=sys.stderr)
+        sys.exit(EX_INPUT)
+
+
 def need_writable(d, what):
     if not os.access(d, os.W_OK):
         print(f"ERROR: {what} {d} is not writable. Nothing was sent to a model.", file=sys.stderr)
@@ -1194,6 +1210,7 @@ def cmd_synth(a):
     os.makedirs(out_dir, exist_ok=True)
     need_writable(out_dir, "the directory of --out")
     need_hold(a.out, "writing a plan or digest to")     # its .filelist.txt with it
+    need_bookkeeping()
     # --out is often a file the user keeps (lit/plan.md in a repo, a page in a vault). A hand-edited
     # plan was once replaced without a word: the ownership rule covered read's notes only.
     why = not_ours(a.out, stage="synth")
@@ -1361,6 +1378,7 @@ def cmd_verify(a):
     out = f"{a.target}.unverified.md"
     need_short_names([out], "Rename --target, or copy it under a shorter name.")
     need_hold(out, "writing a verify report to")
+    need_bookkeeping()
     if os.path.isdir(out) and not os.path.islink(out):      # read and synth refuse one too
         print(f"ERROR: {out} is a directory, so the report has nowhere to go. Nothing was sent to a model.",
               file=sys.stderr)

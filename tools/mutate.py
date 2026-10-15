@@ -378,6 +378,11 @@ MUTANTS = [
     # ---- guards that survived their own revert at 0.3.1 (round-1 "unguarded" R/Y/V/O)
     ("cache-written-in-place", PIPE, "                _atomic_copy(draft, cached)", "                shutil.copy(draft, cached)"),
     ("note-path-directory-accepted", PIPE, "        if os.path.isdir(note) and not os.path.islink(note):", "        if False:"),
+    # J5: the ledger and the cache are written after the paid call; a path that cannot be crashed there
+    ("ledger-checked-after-paying", PIPE, '        open(LEDGER, "a").close()\n', ""),
+    ("cache-unwritable-accepted", PIPE, '        why = next((f"{d}: not writable" for d in dirs', '        why = None and next((f"{d}: not writable" for d in dirs'),
+    ("bookkeeping-error-escapes", PIPE, '    except OSError as e:\n        why = f"{e.filename or LEDGER}',
+     '    except ZeroDivisionError as e:\n        why = f"{e.filename or LEDGER}'),
     ("synth-out-dir-not-checked", PIPE, '    need_writable(out_dir, "the directory of --out")\n', "\n"),
     ("verify-writes-through-symlink", PIPE, "        if os.path.islink(dst):\n            os.remove(dst)",
      "        if False:\n            os.remove(dst)"),
